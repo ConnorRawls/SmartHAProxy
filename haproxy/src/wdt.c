@@ -13,7 +13,6 @@
 #include <time.h>
 
 #include <haproxy/api.h>
-#include <haproxy/clock.h>
 #include <haproxy/debug.h>
 #include <haproxy/errors.h>
 #include <haproxy/global.h>
@@ -26,14 +25,7 @@
  * It relies on timer_create() and timer_settime() which are only available in
  * this case.
  */
-#if defined(USE_RT) && defined(_POSIX_TIMERS) && (_POSIX_TIMERS > 0) && defined(_POSIX_THREAD_CPUTIME)
-
-/* define a dummy value to designate "no timer". Use only 32 bits. */
-#ifndef TIMER_INVALID
-#define TIMER_INVALID ((timer_t)(unsigned long)(0xfffffffful))
-#endif
-
-static timer_t per_thread_wd_timer[MAX_THREADS];
+#if defined(USE_RT) && (_POSIX_TIMERS > 0) && defined(_POSIX_THREAD_CPUTIME)
 
 /* Setup (or ping) the watchdog timer for thread <thr>. Returns non-zero on
  * success, zero on failure. It interrupts once per second of CPU time. It
@@ -46,7 +38,7 @@ int wdt_ping(int thr)
 
 	its.it_value.tv_sec    = 1; its.it_value.tv_nsec    = 0;
 	its.it_interval.tv_sec = 0; its.it_interval.tv_nsec = 0;
-	return timer_settime(per_thread_wd_timer[thr], 0, &its, NULL) == 0;
+	return timer_settime(ha_thread_info[thr].wd_timer, 0, &its, NULL) == 0;
 }
 
 /* This is the WDTSIG signal handler */
@@ -71,8 +63,8 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 		if (thr < 0 || thr >= global.nbthread)
 			break;
 
-		p = ha_thread_ctx[thr].prev_cpu_time;
-		n = now_cpu_time_thread(thr);
+		p = ha_thread_info[thr].prev_cpu_time;
+		n = now_cpu_time_thread(&ha_thread_info[thr]);
 
 		/* not yet reached the deadline of 1 sec */
 		if (n - p < 1000000000UL)
@@ -92,33 +84,23 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 		 * certain that we're not witnessing an exceptional spike of
 		 * CPU usage due to a configuration issue (like running tens
 		 * of thousands of tasks in a single loop), we'll check if the
-		 * scheduler is still alive by setting the TH_FL_STUCK flag
+		 * scheduler is still alive by setting the TI_FL_STUCK flag
 		 * that the scheduler clears when switching to the next task.
 		 * If it's already set, then it's our second call with no
 		 * progress and the thread is dead.
 		 */
-		if (!(ha_thread_ctx[thr].flags & TH_FL_STUCK)) {
-			_HA_ATOMIC_OR(&ha_thread_ctx[thr].flags, TH_FL_STUCK);
+		if (!(ha_thread_info[thr].flags & TI_FL_STUCK)) {
+			_HA_ATOMIC_OR(&ha_thread_info[thr].flags, TI_FL_STUCK);
 			goto update_and_leave;
 		}
 
 		/* No doubt now, there's no hop to recover, die loudly! */
 		break;
-
-#if defined(USE_THREAD) && defined(SI_TKILL) /* Linux uses this */
-
+#ifdef USE_THREAD
 	case SI_TKILL:
 		/* we got a pthread_kill, stop on it */
 		thr = tid;
 		break;
-
-#elif defined(USE_THREAD) && defined(SI_LWP) /* FreeBSD uses this */
-
-	case SI_LWP:
-		/* we got a pthread_kill, stop on it */
-		thr = tid;
-		break;
-
 #endif
 	default:
 		/* unhandled other conditions */
@@ -132,7 +114,7 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 	 */
 #ifdef USE_THREAD
 	if (thr != tid)
-		ha_tkill(thr, sig);
+		pthread_kill(ha_thread_info[thr].pthread, sig);
 	else
 #endif
 		ha_panic();
@@ -144,7 +126,22 @@ void wdt_handler(int sig, siginfo_t *si, void *arg)
 
 int init_wdt_per_thread()
 {
-	if (!clock_setup_signal_timer(&per_thread_wd_timer[tid], WDTSIG, tid))
+	struct sigevent sev = { };
+	sigset_t set;
+
+	/* unblock the WDTSIG signal we intend to use */
+	sigemptyset(&set);
+	sigaddset(&set, WDTSIG);
+	ha_sigmask(SIG_UNBLOCK, &set, NULL);
+
+	/* this timer will signal WDTSIG when it fires, with tid in the si_int
+	 * field (important since any thread will receive the signal).
+	 */
+	sev.sigev_notify          = SIGEV_SIGNAL;
+	sev.sigev_signo           = WDTSIG;
+	sev.sigev_value.sival_int = tid;
+	if (timer_create(ti->clock_id, &sev, &ti->wd_timer) == -1 &&
+	    timer_create(CLOCK_REALTIME, &sev, &ti->wd_timer) == -1)
 		goto fail1;
 
 	if (!wdt_ping(tid))
@@ -153,17 +150,17 @@ int init_wdt_per_thread()
 	return 1;
 
  fail2:
-	timer_delete(per_thread_wd_timer[tid]);
+	timer_delete(ti->wd_timer);
  fail1:
-	per_thread_wd_timer[tid] = TIMER_INVALID;
+	ti->wd_timer = TIMER_INVALID;
 	ha_warning("Failed to setup watchdog timer for thread %u, disabling lockup detection.\n", tid);
 	return 1;
 }
 
 void deinit_wdt_per_thread()
 {
-	if (per_thread_wd_timer[tid] != TIMER_INVALID)
-		timer_delete(per_thread_wd_timer[tid]);
+	if (ti->wd_timer != TIMER_INVALID)
+		timer_delete(ti->wd_timer);
 }
 
 /* registers the watchdog signal handler and returns 0. This sets up the signal

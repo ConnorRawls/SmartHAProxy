@@ -362,7 +362,7 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 		if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE,
 		               rx->settings->interface,
 		               strlen(rx->settings->interface) + 1) == -1) {
-			memprintf(errmsg, "cannot bind receiver to device '%s' (%s)", rx->settings->interface, strerror(errno));
+			memprintf(errmsg, "cannot bind receiver to device (%s)", strerror(errno));
 			err |= ERR_WARN;
 		}
 	}
@@ -391,7 +391,7 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 	rx->fd = fd;
 	rx->flags |= RX_F_BOUND;
 
-	fd_insert(fd, rx->owner, rx->iocb, thread_mask(rx->bind_thread) & all_threads_mask);
+	fd_insert(fd, rx->owner, rx->iocb, thread_mask(rx->settings->bind_thread) & all_threads_mask);
 
 	/* for now, all regularly bound TCP listeners are exportable */
 	if (!(rx->flags & RX_F_INHERITED))
@@ -402,7 +402,7 @@ int sock_inet_bind_receiver(struct receiver *rx, char **errmsg)
 		char pn[INET6_ADDRSTRLEN];
 
 		addr_to_str(&addr_inet, pn, sizeof(pn));
-		memprintf(errmsg, "%s for [%s:%d]", *errmsg, pn, get_host_port(&addr_inet));
+		memprintf(errmsg, "%s [%s:%d]", *errmsg, pn, get_host_port(&addr_inet));
 	}
 	return err;
 

@@ -18,6 +18,15 @@
 __attribute__((format (printf, 3, 4)))
 void hexdump(const void *buf, size_t buflen, const char *title_fmt, ...);
 
+/* Initial salt depending on QUIC version to derive client/server initial secrets.
+ * This one is for draft-29 QUIC version.
+ */
+unsigned char initial_salt[20] = {
+	0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c,
+	0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0,
+	0x43, 0x90, 0xa8, 0x99
+};
+
 /* Dump the RX/TX secrets of <secs> QUIC TLS secrets. */
 void quic_tls_keys_hexdump(struct buffer *buf, struct quic_tls_secrets *secs)
 {
@@ -52,7 +61,7 @@ void quic_tls_secret_hexdump(struct buffer *buf,
 int quic_hkdf_extract(const EVP_MD *md,
                       unsigned char *buf, size_t *buflen,
                       const unsigned char *key, size_t keylen,
-                      const unsigned char *salt, size_t saltlen)
+                      unsigned char *salt, size_t saltlen)
 {
 	return HKDF_extract(buf, buflen, md, key, keylen, salt, saltlen);
 }
@@ -68,7 +77,7 @@ int quic_hkdf_expand(const EVP_MD *md,
 int quic_hkdf_extract(const EVP_MD *md,
                       unsigned char *buf, size_t *buflen,
                       const unsigned char *key, size_t keylen,
-                      const unsigned char *salt, size_t saltlen)
+                      unsigned char *salt, size_t saltlen)
 {
     EVP_PKEY_CTX *ctx;
 
@@ -209,12 +218,11 @@ int quic_tls_derive_keys(const EVP_CIPHER *aead, const EVP_CIPHER *hp,
  * Returns the size of the derived secret if succeeded, 0 if not.
  */
 int quic_derive_initial_secret(const EVP_MD *md,
-                               const unsigned char *initial_salt, size_t initial_salt_sz,
                                unsigned char *initial_secret, size_t initial_secret_sz,
                                const unsigned char *secret, size_t secret_sz)
 {
 	if (!quic_hkdf_extract(md, initial_secret, &initial_secret_sz, secret, secret_sz,
-	                       initial_salt, initial_salt_sz))
+	                       initial_salt, sizeof initial_salt))
 		return 0;
 
 	return 1;

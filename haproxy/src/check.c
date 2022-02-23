@@ -1117,7 +1117,7 @@ struct task *process_chk_conn(struct task *t, void *context, unsigned int state)
 		 * is disabled.
 		 */
 		if (((check->state & (CHK_ST_ENABLED | CHK_ST_PAUSED)) != CHK_ST_ENABLED) ||
-		    (proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED))) {
+		    proxy->disabled) {
 			TRACE_STATE("health-check paused or disabled", CHK_EV_TASK_WAKE, check);
 			goto reschedule;
 		}
@@ -1296,7 +1296,7 @@ struct buffer *check_get_buf(struct check *check, struct buffer *bptr)
 	    unlikely((buf = b_alloc(bptr)) == NULL)) {
 		check->buf_wait.target = check;
 		check->buf_wait.wakeup_cb = check_buf_available;
-		LIST_APPEND(&th_ctx->buffer_wq, &check->buf_wait.list);
+		LIST_APPEND(&ti->buffer_wq, &check->buf_wait.list);
 	}
 	return buf;
 }
@@ -1388,14 +1388,13 @@ int start_check_task(struct check *check, int mininter,
 			    int nbcheck, int srvpos)
 {
 	struct task *t;
+	unsigned long thread_mask = MAX_THREADS_MASK;
 
-	/* task for the check. Process-based checks exclusively run on thread 1. */
 	if (check->type == PR_O2_EXT_CHK)
-		t = task_new_on(0);
-	else
-		t = task_new_anywhere();
+		thread_mask = 1;
 
-	if (!t) {
+	/* task for the check */
+	if ((t = task_new(thread_mask)) == NULL) {
 		ha_alert("Starting [%s:%s] check: out of memory.\n",
 			 check->server->proxy->id, check->server->id);
 		return 0;
@@ -1419,6 +1418,38 @@ int start_check_task(struct check *check, int mininter,
 	return 1;
 }
 
+/* updates the server's weight during a warmup stage. Once the final weight is
+ * reached, the task automatically stops. Note that any server status change
+ * must have updated s->last_change accordingly.
+ */
+struct task *server_warmup(struct task *t, void *context, unsigned int state)
+{
+	struct server *s = context;
+
+	/* by default, plan on stopping the task */
+	t->expire = TICK_ETERNITY;
+	if ((s->next_admin & SRV_ADMF_MAINT) ||
+	    (s->next_state != SRV_ST_STARTING))
+		return t;
+
+	HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
+
+	/* recalculate the weights and update the state */
+	server_recalc_eweight(s, 1);
+
+	/* probably that we can refill this server with a bit more connections */
+	pendconn_grab_from_px(s);
+
+	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
+
+	/* get back there in 1 second or 1/20th of the slowstart interval,
+	 * whichever is greater, resulting in small 5% steps.
+	 */
+	if (s->next_state == SRV_ST_STARTING)
+		t->expire = tick_add(now_ms, MS_TO_TICKS(MAX(1000, s->slowstart / 20)));
+	return t;
+}
+
 /*
  * Start health-check.
  * Returns 0 if OK, ERR_FATAL on error, and prints the error in this case.
@@ -1428,6 +1459,7 @@ static int start_checks()
 
 	struct proxy *px;
 	struct server *s;
+	struct task *t;
 	int nbcheck=0, mininter=0, srvpos=0;
 
 	/* 0- init the dummy frontend used to create all checks sessions */
@@ -1449,6 +1481,22 @@ static int start_checks()
 	 */
 	for (px = proxies_list; px; px = px->next) {
 		for (s = px->srv; s; s = s->next) {
+			if (s->slowstart) {
+				if ((t = task_new(MAX_THREADS_MASK)) == NULL) {
+					ha_alert("Starting [%s:%s] check: out of memory.\n", px->id, s->id);
+					return ERR_ALERT | ERR_FATAL;
+				}
+				/* We need a warmup task that will be called when the server
+				 * state switches from down to up.
+				 */
+				s->warmup = t;
+				t->process = server_warmup;
+				t->context = s;
+				/* server can be in this state only because of */
+				if (s->next_state == SRV_ST_STARTING)
+					task_schedule(s->warmup, tick_add(now_ms, MS_TO_TICKS(MAX(1000, (now.tv_sec - s->last_change)) / 20)));
+			}
+
 			if (s->check.state & CHK_ST_CONFIGURED) {
 				nbcheck++;
 				if ((srv_getinter(&s->check) >= SRV_CHK_INTER_THRES) &&

@@ -292,7 +292,7 @@ flt_init_all()
 	int err_code = ERR_NONE;
 
 	for (px = proxies_list; px; px = px->next) {
-		if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) {
+		if (px->disabled) {
 			flt_deinit(px);
 			continue;
 		}
@@ -315,7 +315,7 @@ flt_init_all_per_thread()
 	int err_code = 0;
 
 	for (px = proxies_list; px; px = px->next) {
-		if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+		if (px->disabled)
 			continue;
 
 		err_code = flt_init_per_thread(px);
@@ -475,7 +475,7 @@ flt_stream_start(struct stream *s)
 	}
 	if (strm_li(s) && (strm_li(s)->analysers & AN_REQ_FLT_START_FE)) {
 		s->req.flags |= CF_FLT_ANALYZE;
-		s->req.analysers |= AN_REQ_FLT_END;
+		s->req.analysers |= AN_RES_FLT_END;
 	}
 	return 0;
 }
@@ -537,7 +537,7 @@ flt_set_stream_backend(struct stream *s, struct proxy *be)
 	}
 	if (be->be_req_ana & AN_REQ_FLT_START_BE) {
 		s->req.flags |= CF_FLT_ANALYZE;
-		s->req.analysers |= AN_REQ_FLT_END;
+		s->req.analysers |= AN_RES_FLT_END;
 	}
 	if ((strm_fe(s)->fe_rsp_ana | be->be_rsp_ana) & (AN_RES_FLT_START_FE|AN_RES_FLT_START_BE)) {
 		s->res.flags |= CF_FLT_ANALYZE;
@@ -712,7 +712,7 @@ flt_start_analyze(struct stream *s, struct channel *chn, unsigned int an_bit)
 
 	/* Set flag on channel to tell that the channel is filtered */
 	chn->flags |= CF_FLT_ANALYZE;
-	chn->analysers |= ((chn->flags & CF_ISRESP) ? AN_RES_FLT_END : AN_REQ_FLT_END);
+	chn->analysers |= AN_RES_FLT_END;
 
 	RESUME_FILTER_LOOP(s, chn) {
 		if (!(chn->flags & CF_ISRESP)) {

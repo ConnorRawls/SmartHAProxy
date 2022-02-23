@@ -19,11 +19,10 @@
 
 #include <haproxy/activity.h>
 #include <haproxy/api.h>
-#include <haproxy/clock.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
-#include <haproxy/task.h>
 #include <haproxy/ticks.h>
+#include <haproxy/time.h>
 
 
 #ifndef POLLRDHUP
@@ -202,10 +201,11 @@ static void _do_poll(struct poller *p, int exp, int wake)
 
 	/* now let's wait for events */
 	wait_time = wake ? 0 : compute_poll_timeout(exp);
-	clock_entering_poll();
+	tv_entering_poll();
+	activity_count_runtime();
 	status = poll(poll_events, nbfd, wait_time);
-	clock_update_date(wait_time, status);
-	clock_leaving_poll(wait_time, status);
+	tv_update_date(wait_time, status);
+	tv_leaving_poll(wait_time, status);
 
 	thread_harmless_end();
 	thread_idle_end();

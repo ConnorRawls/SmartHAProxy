@@ -35,7 +35,6 @@
 #include <haproxy/pool.h>
 #include <haproxy/sample.h>
 #include <haproxy/stream.h>
-#include <haproxy/stream_interface.h>
 #include <haproxy/tools.h>
 #include <haproxy/version.h>
 
@@ -121,13 +120,7 @@ static int get_http_auth(struct sample *smp, struct htx *htx)
 	if (chunk_initlen(&auth_method, ctx.value.ptr, 0, len) != 1)
 		return 0;
 
-	/* According to RFC7235, there could be multiple spaces between the
-	 * scheme and its value, we must skip all of them.
-	 */
-	while (p < istend(ctx.value) && *p == ' ')
-		++p;
-
-	chunk_initlen(&txn->auth.method_data, p, 0, istend(ctx.value) - p);
+	chunk_initlen(&txn->auth.method_data, p + 1, 0, ctx.value.len - len - 1);
 
 	if (!strncasecmp("Basic", auth_method.area, auth_method.data)) {
 		struct buffer *http_auth = get_trash_chunk();
@@ -152,9 +145,6 @@ static int get_http_auth(struct sample *smp, struct htx *htx)
 		txn->auth.pass = p+1;
 
 		txn->auth.method = HTTP_AUTH_BASIC;
-		return 1;
-	} else if (!strncasecmp("Bearer", auth_method.area, auth_method.data)) {
-		txn->auth.method = HTTP_AUTH_BEARER;
 		return 1;
 	}
 
@@ -874,7 +864,7 @@ static int smp_fetch_hdr_names(const struct arg *args, struct sample *smp, const
 
 		if (temp->data)
 			temp->area[temp->data++] = del;
-		chunk_istcat(temp, n);
+		chunk_memcat(temp, n.ptr, n.len);
 	}
 
 	smp->data.type = SMP_T_STR;
@@ -1186,10 +1176,10 @@ static int smp_fetch_base32(const struct arg *args, struct sample *smp, const ch
  */
 static int smp_fetch_base32_src(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	const struct sockaddr_storage *src = (smp->strm ? si_src(&smp->strm->si[0]) : NULL);
 	struct buffer *temp;
+	struct connection *cli_conn = objt_conn(smp->sess->origin);
 
-	if (!src)
+	if (!cli_conn || !conn_get_src(cli_conn))
 		return 0;
 
 	if (!smp_fetch_base32(args, smp, kw, private))
@@ -1199,16 +1189,16 @@ static int smp_fetch_base32_src(const struct arg *args, struct sample *smp, cons
 	*(unsigned int *) temp->area = htonl(smp->data.u.sint);
 	temp->data += sizeof(unsigned int);
 
-	switch (src->ss_family) {
+	switch (cli_conn->src->ss_family) {
 	case AF_INET:
 		memcpy(temp->area + temp->data,
-		       &((struct sockaddr_in *)src)->sin_addr,
+		       &((struct sockaddr_in *)cli_conn->src)->sin_addr,
 		       4);
 		temp->data += 4;
 		break;
 	case AF_INET6:
 		memcpy(temp->area + temp->data,
-		       &((struct sockaddr_in6 *)src)->sin6_addr,
+		       &((struct sockaddr_in6 *)cli_conn->src)->sin6_addr,
 		       16);
 		temp->data += 16;
 		break;
@@ -1301,10 +1291,6 @@ static int smp_fetch_http_auth_type(const struct arg *args, struct sample *smp, 
 			smp->data.u.str.area = "Digest";
 			smp->data.u.str.data = 6;
 			break;
-		case HTTP_AUTH_BEARER:
-			smp->data.u.str.area = "Bearer";
-			smp->data.u.str.data = 6;
-			break;
 		default:
 			return 0;
 	}
@@ -1327,7 +1313,7 @@ static int smp_fetch_http_auth_user(const struct arg *args, struct sample *smp, 
 		return 0;
 
 	txn = smp->strm->txn;
-	if (!get_http_auth(smp, htx) || txn->auth.method != HTTP_AUTH_BASIC)
+	if (!get_http_auth(smp, htx))
 		return 0;
 
 	smp->data.type = SMP_T_STR;
@@ -1350,54 +1336,12 @@ static int smp_fetch_http_auth_pass(const struct arg *args, struct sample *smp, 
 		return 0;
 
 	txn = smp->strm->txn;
-	if (!get_http_auth(smp, htx) || txn->auth.method != HTTP_AUTH_BASIC)
+	if (!get_http_auth(smp, htx))
 		return 0;
 
 	smp->data.type = SMP_T_STR;
 	smp->data.u.str.area = txn->auth.pass;
 	smp->data.u.str.data = strlen(txn->auth.pass);
-	smp->flags = SMP_F_CONST;
-	return 1;
-}
-
-static int smp_fetch_http_auth_bearer(const struct arg *args, struct sample *smp, const char *kw, void *private)
-{
-	struct channel *chn = SMP_REQ_CHN(smp);
-	struct htx *htx = smp_prefetch_htx(smp, chn, NULL, 1);
-	struct http_txn *txn;
-	struct buffer bearer_val = {};
-
-	if (!htx)
-		return 0;
-
-	if (args->type == ARGT_STR) {
-		struct http_hdr_ctx ctx;
-		struct ist hdr_name = ist2(args->data.str.area, args->data.str.data);
-
-		ctx.blk = NULL;
-		if (http_find_header(htx, hdr_name, &ctx, 0)) {
-			struct ist type = istsplit(&ctx.value, ' ');
-
-			/* There must be "at least" one space character between
-			 * the scheme and the following value so ctx.value might
-			 * still have leading spaces here (see RFC7235).
-			 */
-			ctx.value = istskip(ctx.value, ' ');
-
-			if (isteqi(type, ist("Bearer")) && istlen(ctx.value))
-				chunk_initlen(&bearer_val, istptr(ctx.value), 0, istlen(ctx.value));
-		}
-	}
-	else {
-		txn = smp->strm->txn;
-		if (!get_http_auth(smp, htx) || txn->auth.method != HTTP_AUTH_BEARER)
-			return 0;
-
-		bearer_val = txn->auth.method_data;
-	}
-
-	smp->data.type = SMP_T_STR;
-	smp->data.u.str = bearer_val;
 	smp->flags = SMP_F_CONST;
 	return 1;
 }
@@ -1413,7 +1357,7 @@ static int smp_fetch_http_auth(const struct arg *args, struct sample *smp, const
 
 	if (!htx)
 		return 0;
-	if (!get_http_auth(smp, htx) || smp->strm->txn->auth.method != HTTP_AUTH_BASIC)
+	if (!get_http_auth(smp, htx))
 		return 0;
 
 	smp->data.type = SMP_T_BOOL;
@@ -1433,7 +1377,7 @@ static int smp_fetch_http_auth_grp(const struct arg *args, struct sample *smp, c
 
 	if (!htx)
 		return 0;
-	if (!get_http_auth(smp, htx) || smp->strm->txn->auth.method != HTTP_AUTH_BASIC)
+	if (!get_http_auth(smp, htx))
 		return 0;
 
 	/* if the user does not belong to the userlist or has a wrong password,
@@ -2053,10 +1997,10 @@ static int smp_fetch_url32(const struct arg *args, struct sample *smp, const cha
  */
 static int smp_fetch_url32_src(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	const struct sockaddr_storage *src = (smp->strm ? si_src(&smp->strm->si[0]) : NULL);
 	struct buffer *temp;
+	struct connection *cli_conn = objt_conn(smp->sess->origin);
 
-	if (!src)
+	if (!cli_conn || !conn_get_src(cli_conn))
 		return 0;
 
 	if (!smp_fetch_url32(args, smp, kw, private))
@@ -2066,16 +2010,16 @@ static int smp_fetch_url32_src(const struct arg *args, struct sample *smp, const
 	*(unsigned int *) temp->area = htonl(smp->data.u.sint);
 	temp->data += sizeof(unsigned int);
 
-	switch (src->ss_family) {
+	switch (cli_conn->src->ss_family) {
 	case AF_INET:
 		memcpy(temp->area + temp->data,
-		       &((struct sockaddr_in *)src)->sin_addr,
+		       &((struct sockaddr_in *)cli_conn->src)->sin_addr,
 		       4);
 		temp->data += 4;
 		break;
 	case AF_INET6:
 		memcpy(temp->area + temp->data,
-		       &((struct sockaddr_in6 *)src)->sin6_addr,
+		       &((struct sockaddr_in6 *)cli_conn->src)->sin6_addr,
 		       16);
 		temp->data += 16;
 		break;
@@ -2153,7 +2097,6 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "http_auth_type",     smp_fetch_http_auth_type,     0,                NULL,    SMP_T_STR,  SMP_USE_HRQHV },
 	{ "http_auth_user",     smp_fetch_http_auth_user,     0,                NULL,    SMP_T_STR,  SMP_USE_HRQHV },
 	{ "http_auth_pass",     smp_fetch_http_auth_pass,     0,                NULL,    SMP_T_STR,  SMP_USE_HRQHV },
-	{ "http_auth_bearer",   smp_fetch_http_auth_bearer,   ARG1(0,STR),      NULL,    SMP_T_STR,  SMP_USE_HRQHV },
 	{ "http_auth",          smp_fetch_http_auth,          ARG1(1,USR),      NULL,    SMP_T_BOOL, SMP_USE_HRQHV },
 	{ "http_auth_group",    smp_fetch_http_auth_grp,      ARG1(1,USR),      NULL,    SMP_T_STR,  SMP_USE_HRQHV },
 	{ "http_first_req",     smp_fetch_http_first_req,     0,                NULL,    SMP_T_BOOL, SMP_USE_HRQHP },

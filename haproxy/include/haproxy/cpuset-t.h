@@ -9,7 +9,6 @@
 #ifdef __FreeBSD__
 #include <sys/_cpuset.h>
 #include <sys/cpuset.h>
-#include <strings.h>
 #endif
 #endif
 

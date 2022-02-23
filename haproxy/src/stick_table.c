@@ -40,7 +40,7 @@
 #include <haproxy/stream_interface.h>
 #include <haproxy/task.h>
 #include <haproxy/tcp_rules.h>
-#include <haproxy/ticks.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 
 
@@ -648,13 +648,13 @@ int stktable_init(struct stktable *t)
 
 		t->exp_next = TICK_ETERNITY;
 		if ( t->expire ) {
-			t->exp_task = task_new_anywhere();
+			t->exp_task = task_new(MAX_THREADS_MASK);
 			if (!t->exp_task)
 				return 0;
 			t->exp_task->process = process_table_expire;
 			t->exp_task->context = (void *)t;
 		}
-		if (t->peers.p && t->peers.p->peers_fe && !(t->peers.p->peers_fe->flags & (PR_FL_DISABLED|PR_FL_STOPPED))) {
+		if (t->peers.p && t->peers.p->peers_fe && !t->peers.p->peers_fe->disabled) {
 			peers_retval = peers_register_table(t->peers.p, t);
 		}
 
@@ -1145,7 +1145,7 @@ struct stktable_data_type stktable_data_types[STKTABLE_DATA_TYPES] = {
 	[STKTABLE_DT_GPC0_RATE]     = { .name = "gpc0_rate",      .std_type = STD_T_FRQP, .arg_type = ARG_T_DELAY  },
 	[STKTABLE_DT_CONN_CNT]      = { .name = "conn_cnt",       .std_type = STD_T_UINT  },
 	[STKTABLE_DT_CONN_RATE]     = { .name = "conn_rate",      .std_type = STD_T_FRQP, .arg_type = ARG_T_DELAY  },
-	[STKTABLE_DT_CONN_CUR]      = { .name = "conn_cur",       .std_type = STD_T_UINT, .is_local = 1 },
+	[STKTABLE_DT_CONN_CUR]      = { .name = "conn_cur",       .std_type = STD_T_UINT  },
 	[STKTABLE_DT_SESS_CNT]      = { .name = "sess_cnt",       .std_type = STD_T_UINT  },
 	[STKTABLE_DT_SESS_RATE]     = { .name = "sess_rate",      .std_type = STD_T_FRQP, .arg_type = ARG_T_DELAY  },
 	[STKTABLE_DT_HTTP_REQ_CNT]  = { .name = "http_req_cnt",   .std_type = STD_T_UINT  },
@@ -4411,8 +4411,7 @@ static int table_process_entry_per_key(struct appctx *appctx, char **args)
 		static_table_key.key = &uint32_key;
 		break;
 	case SMP_T_IPV6:
-		if (inet_pton(AF_INET6, args[4], ip6_key) <= 0)
-			return cli_err(appctx, "Invalid key\n");
+		inet_pton(AF_INET6, args[4], ip6_key);
 		static_table_key.key = &ip6_key;
 		break;
 	case SMP_T_SINT:

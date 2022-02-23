@@ -110,8 +110,11 @@ void ha_cpuset_assign(struct hap_cpuset *dst, const struct hap_cpuset *src)
 
 int ha_cpuset_size()
 {
-#if defined(CPUSET_USE_CPUSET) || defined(CPUSET_USE_FREEBSD_CPUSET)
+#if defined(CPUSET_USE_CPUSET)
 	return CPU_SETSIZE;
+
+#elif defined(CPUSET_USE_FREEBSD_CPUSET)
+	return MAXCPU;
 
 #elif defined(CPUSET_USE_ULONG)
 	return LONGBITS;

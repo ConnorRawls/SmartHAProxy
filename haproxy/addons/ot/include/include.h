@@ -27,7 +27,6 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/acl.h>
 #include <haproxy/cli.h>
-#include <haproxy/clock.h>
 #include <haproxy/filters.h>
 #include <haproxy/http_htx.h>
 #include <haproxy/http_rules.h>

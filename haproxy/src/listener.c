@@ -19,9 +19,7 @@
 
 #include <haproxy/acl.h>
 #include <haproxy/api.h>
-#include <haproxy/activity.h>
 #include <haproxy/cfgparse.h>
-#include <haproxy/cli-t.h>
 #include <haproxy/connection.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
@@ -35,7 +33,7 @@
 #include <haproxy/sample.h>
 #include <haproxy/stream.h>
 #include <haproxy/task.h>
-#include <haproxy/ticks.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 
 
@@ -663,53 +661,6 @@ int create_listeners(struct bind_conf *bc, const struct sockaddr_storage *ss,
 	return 1;
 }
 
-/* clones listener <src> and returns the new one. All dynamically allocated
- * fields are reallocated (name for now). The new listener is inserted before
- * the original one in the bind_conf and frontend lists. This allows it to be
- * duplicated while iterating over the current list. The original listener must
- * only be in the INIT or ASSIGNED states, and the new listener will only be
- * placed into the INIT state. The counters are always set to NULL. Maxsock is
- * updated. Returns NULL on allocation error.
- */
-struct listener *clone_listener(struct listener *src)
-{
-	struct listener *l;
-
-	l = calloc(1, sizeof(*l));
-	if (!l)
-		goto oom1;
-	memcpy(l, src, sizeof(*l));
-
-	if (l->name) {
-		l->name = strdup(l->name);
-		if (!l->name)
-			goto oom2;
-	}
-
-	l->rx.owner = l;
-	l->state = LI_INIT;
-	l->counters = NULL;
-	l->extra_counters = NULL;
-
-	LIST_APPEND(&src->by_fe,   &l->by_fe);
-	LIST_APPEND(&src->by_bind, &l->by_bind);
-
-	MT_LIST_INIT(&l->wait_queue);
-
-	l->rx.proto->add(l->rx.proto, l);
-
-	HA_SPIN_INIT(&l->lock);
-	_HA_ATOMIC_INC(&jobs);
-	_HA_ATOMIC_INC(&listeners);
-	global.maxsock++;
-	return l;
-
- oom2:
-	free(l);
- oom1:
-	return NULL;
-}
-
 /* Delete a listener from its protocol's list of listeners. The listener's
  * state is automatically updated from LI_ASSIGNED to LI_INIT. The protocol's
  * number of listeners is updated, as well as the global number of listeners
@@ -953,7 +904,7 @@ void listener_accept(struct listener *l)
 
 
 #if defined(USE_THREAD)
-		mask = thread_mask(l->rx.bind_thread) & all_threads_mask;
+		mask = thread_mask(l->rx.settings->bind_thread) & all_threads_mask;
 		if (atleast2(mask) && (global.tune.options & GTUNE_LISTENER_MQ) && !stopping) {
 			struct accept_queue_ring *ring;
 			unsigned int t, t0, t1, t2;
@@ -1094,7 +1045,7 @@ void listener_accept(struct listener *l)
 		}
 #endif
 
-		th_ctx->flags &= ~TH_FL_STUCK; // this thread is still running
+		ti->flags &= ~TI_FL_STUCK; // this thread is still running
 	} /* end of for (max_accept--) */
 
  end:
@@ -1183,7 +1134,7 @@ void listener_release(struct listener *l)
 /* Initializes the listener queues. Returns 0 on success, otherwise ERR_* flags */
 static int listener_queue_init()
 {
-	global_listener_queue_task = task_new_anywhere();
+	global_listener_queue_task = task_new(MAX_THREADS_MASK);
 	if (!global_listener_queue_task) {
 		ha_alert("Out of memory when initializing global listener queue\n");
 		return ERR_FATAL|ERR_ABORT;
@@ -1330,65 +1281,6 @@ const char *bind_find_best_kw(const char *word)
 		best_ptr = NULL;
 
 	return best_ptr;
-}
-
-/* allocate an bind_conf struct for a bind line, and chain it to the frontend <fe>.
- * If <arg> is not NULL, it is duplicated into ->arg to store useful config
- * information for error reporting. NULL is returned on error.
- */
-struct bind_conf *bind_conf_alloc(struct proxy *fe, const char *file,
-                                  int line, const char *arg, struct xprt_ops *xprt)
-{
-	struct bind_conf *bind_conf = calloc(1, sizeof(*bind_conf));
-
-	if (!bind_conf)
-		goto err;
-
-	bind_conf->file = strdup(file);
-	if (!bind_conf->file)
-		goto err;
-	bind_conf->line = line;
-	if (arg) {
-		bind_conf->arg = strdup(arg);
-		if (!bind_conf->arg)
-			goto err;
-	}
-
-	LIST_APPEND(&fe->conf.bind, &bind_conf->by_fe);
-	bind_conf->settings.ux.uid = -1;
-	bind_conf->settings.ux.gid = -1;
-	bind_conf->settings.ux.mode = 0;
-	bind_conf->settings.shards = 1;
-	bind_conf->xprt = xprt;
-	bind_conf->frontend = fe;
-	bind_conf->severity_output = CLI_SEVERITY_NONE;
-#ifdef USE_OPENSSL
-	HA_RWLOCK_INIT(&bind_conf->sni_lock);
-	bind_conf->sni_ctx = EB_ROOT;
-	bind_conf->sni_w_ctx = EB_ROOT;
-#endif
-	LIST_INIT(&bind_conf->listeners);
-	return bind_conf;
-
-  err:
-	if (bind_conf) {
-		ha_free(&bind_conf->file);
-		ha_free(&bind_conf->arg);
-	}
-	ha_free(&bind_conf);
-	return NULL;
-}
-
-const char *listener_state_str(const struct listener *l)
-{
-	static const char *states[8] = {
-		"NEW", "INI", "ASS", "PAU", "LIS", "RDY", "FUL", "LIM",
-	};
-	unsigned int st = l->state;
-
-	if (st >= sizeof(states) / sizeof(*states))
-		return "INVALID";
-	return states[st];
 }
 
 /************************************************************************/
@@ -1611,12 +1503,8 @@ static int bind_parse_process(char **args, int cur_arg, struct proxy *px, struct
 		*slash = '/';
 	}
 
-	conf->bind_thread |= thread;
-
-	memprintf(err, "'process %s' on 'bind' lines is deprecated and will be removed in 2.7.", args[cur_arg+1]);
-	if (slash)
-		memprintf(err, "%s Please use 'thread %s' instead.", *err, slash + 1);
-	return ERR_WARN;
+	conf->settings.bind_thread |= thread;
+	return 0;
 }
 
 /* parse the "proto" bind keyword */
@@ -1635,68 +1523,6 @@ static int bind_parse_proto(char **args, int cur_arg, struct proxy *px, struct b
 		memprintf(err, "'%s' :  unknown MUX protocol '%s'", args[cur_arg], args[cur_arg+1]);
 		return ERR_ALERT | ERR_FATAL;
 	}
-	return 0;
-}
-
-/* parse the "shards" bind keyword. Takes an integer or "by-thread" */
-static int bind_parse_shards(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
-{
-	int val;
-
-	if (!*args[cur_arg + 1]) {
-		memprintf(err, "'%s' : missing value", args[cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	if (strcmp(args[cur_arg + 1], "by-thread") == 0) {
-		val = MAX_THREADS; /* will be trimmed later anyway */
-	} else {
-		val = atol(args[cur_arg + 1]);
-		if (val < 1 || val > MAX_THREADS) {
-			memprintf(err, "'%s' : invalid value %d, allowed range is %d..%d or 'by-thread'", args[cur_arg], val, 1, MAX_THREADS);
-			return ERR_ALERT | ERR_FATAL;
-		}
-	}
-
-	conf->settings.shards = val;
-	return 0;
-}
-
-/* parse the "thread" bind keyword */
-static int bind_parse_thread(char **args, int cur_arg, struct proxy *px, struct bind_conf *conf, char **err)
-{
-	char *sep = NULL;
-	ulong thread = 0;
-	long tgroup = 0;
-
-	tgroup = strtol(args[cur_arg + 1], &sep, 10);
-	if (*sep == '/') {
-		/* a thread group was present */
-		if (tgroup < 1 || tgroup > MAX_TGROUPS) {
-			memprintf(err, "'%s' thread-group number must be between 1 and %d (was %ld)", args[cur_arg + 1], MAX_TGROUPS, tgroup);
-			return ERR_ALERT | ERR_FATAL;
-		}
-		sep++;
-	}
-	else {
-		/* no thread group */
-		tgroup = 0;
-		sep = args[cur_arg + 1];
-	}
-
-	if ((conf->bind_tgroup || conf->bind_thread) &&
-	    conf->bind_tgroup != tgroup) {
-		memprintf(err, "'%s' multiple thread-groups are not supported", args[cur_arg + 1]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-	
-	if (parse_process_number(sep, &thread, MAX_THREADS, NULL, err)) {
-		memprintf(err, "'%s' : %s", sep, *err);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	conf->bind_thread |= thread;
-	conf->bind_tgroup  = tgroup;
 	return 0;
 }
 
@@ -1757,8 +1583,6 @@ static struct bind_kw_list bind_kws = { "ALL", { }, {
 	{ "nice",         bind_parse_nice,         1 }, /* set nice of listening socket */
 	{ "process",      bind_parse_process,      1 }, /* set list of allowed process for this socket */
 	{ "proto",        bind_parse_proto,        1 }, /* set the proto to use for all incoming connections */
-	{ "shards",       bind_parse_shards,       1 }, /* set number of shards */
-	{ "thread",       bind_parse_thread,       1 }, /* set list of allowed threads for this socket */
 	{ /* END */ },
 }};
 

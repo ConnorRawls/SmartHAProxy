@@ -24,7 +24,8 @@
 
 #include <sys/time.h>
 
-#include <import/ebtree-t.h>
+#include <import/eb32sctree.h>
+#include <import/eb32tree.h>
 
 #include <haproxy/api-t.h>
 #include <haproxy/thread-t.h>
@@ -58,9 +59,14 @@
 #define TASK_F_USR1       0x00010000  /* preserved user flag 1, application-specific, def:0 */
 /* unused: 0x20000..0x80000000 */
 
-/* These flags are persistent across scheduler calls */
-#define TASK_PERSISTENT   (TASK_SHARED_WQ | TASK_SELF_WAKING | TASK_KILLED | \
-                           TASK_HEAVY | TASK_F_TASKLET | TASK_F_USR1)
+
+enum {
+	TL_URGENT = 0,   /* urgent tasklets (I/O callbacks) */
+	TL_NORMAL = 1,   /* normal tasks */
+	TL_BULK   = 2,   /* bulk task/tasklets, streaming I/Os */
+	TL_HEAVY  = 3,   /* heavy computational tasklets (e.g. TLS handshakes) */
+	TL_CLASSES       /* must be last */
+};
 
 struct notification {
 	struct list purge_me; /* Part of the list of signals to be purged in the
@@ -70,6 +76,30 @@ struct notification {
 	struct task *task; /* The task to be wake if an event occurs. */
 	__decl_thread(HA_SPINLOCK_T lock);
 };
+
+/* force to split per-thread stuff into separate cache lines */
+struct task_per_thread {
+	// first and second cache lines on 64 bits: thread-local operations only.
+	struct eb_root timers;  /* tree constituting the per-thread wait queue */
+	struct eb_root rqueue;  /* tree constituting the per-thread run queue */
+	struct task *current;   /* current task (not tasklet) */
+	unsigned int rqueue_ticks; /* Insertion counter for the run queue */
+	int current_queue;      /* points to current tasklet list being run, -1 if none */
+	unsigned int nb_tasks;  /* number of tasks allocated on this thread */
+	uint8_t tl_class_mask;  /* bit mask of non-empty tasklets classes */
+
+	// 11 bytes hole here
+	ALWAYS_ALIGN(2*sizeof(void*));
+	struct list tasklets[TL_CLASSES]; /* tasklets (and/or tasks) to run, by class */
+
+	// third cache line here on 64 bits: accessed mostly using atomic ops
+	ALWAYS_ALIGN(64);
+	struct mt_list shared_tasklet_list; /* Tasklet to be run, woken up by other threads */
+	unsigned int rq_total;  /* total size of the run queue, prio_tree + tasklets */
+	int tasks_in_list;      /* Number of tasks in the per-thread tasklets list */
+	ALWAYS_ALIGN(128);
+};
+
 
 #ifdef DEBUG_TASK
 #define TASK_DEBUG_STORAGE                   \
@@ -131,6 +161,22 @@ struct tasklet {
  * expire timer. The scheduler will requeue the task at the proper location.
  */
 
+
+/* A work_list is a thread-safe way to enqueue some work to be run on another
+ * thread. It consists of a list, a task and a general-purpose argument.
+ * A work is appended to the list by atomically adding a list element to the
+ * list and waking up the associated task, which is done using work_add(). The
+ * caller must be careful about how operations are run as it will definitely
+ * happen that the element being enqueued is processed by the other thread
+ * before the call returns. Some locking conventions between the caller and the
+ * callee might sometimes be necessary. The task is always woken up with reason
+ * TASK_WOKEN_OTHER and a context pointing to the work_list entry.
+ */
+struct work_list {
+	struct mt_list head;
+	struct task *task;
+	void *arg;
+};
 
 #endif /* _HAPROXY_TASK_T_H */
 

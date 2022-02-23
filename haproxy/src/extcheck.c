@@ -36,9 +36,9 @@
 #include <haproxy/proxy.h>
 #include <haproxy/server.h>
 #include <haproxy/signal.h>
-#include <haproxy/stream-t.h>
 #include <haproxy/task.h>
 #include <haproxy/thread.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 
 
@@ -494,7 +494,7 @@ struct task *process_chk_proc(struct task *t, void *context, unsigned int state)
 		 * is disabled.
 		 */
 		if (((check->state & (CHK_ST_ENABLED | CHK_ST_PAUSED)) != CHK_ST_ENABLED) ||
-		    (s->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
+		    s->proxy->disabled)
 			goto reschedule;
 
 		/* we'll initiate a new check */

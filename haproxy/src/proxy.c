@@ -146,7 +146,6 @@ void free_proxy(struct proxy *p)
 	if (!p)
 		return;
 
-	proxy_unref_defaults(p);
 	free(p->conf.file);
 	free(p->id);
 	free(p->cookie_name);
@@ -1365,7 +1364,7 @@ void init_new_proxy(struct proxy *p)
 void proxy_preset_defaults(struct proxy *defproxy)
 {
 	defproxy->mode = PR_MODE_TCP;
-	defproxy->flags = 0;
+	defproxy->disabled = 0;
 	if (!(defproxy->cap & PR_CAP_INT)) {
 		defproxy->maxconn = cfg_maxpconn;
 		defproxy->conn_retries = CONN_RETRIES;
@@ -1417,8 +1416,6 @@ void proxy_preset_defaults(struct proxy *defproxy)
  */
 void proxy_free_defaults(struct proxy *defproxy)
 {
-	struct acl *acl, *aclb;
-
 	ha_free(&defproxy->id);
 	ha_free(&defproxy->conf.file);
 	ha_free(&defproxy->check_command);
@@ -1436,20 +1433,6 @@ void proxy_free_defaults(struct proxy *defproxy)
 	ha_free(&defproxy->fwdfor_hdr_name); defproxy->fwdfor_hdr_len = 0;
 	ha_free(&defproxy->orgto_hdr_name); defproxy->orgto_hdr_len = 0;
 	ha_free(&defproxy->server_id_hdr_name); defproxy->server_id_hdr_len = 0;
-
-	list_for_each_entry_safe(acl, aclb, &defproxy->acl, list) {
-		LIST_DELETE(&acl->list);
-		prune_acl(acl);
-		free(acl);
-	}
-
-	free_act_rules(&defproxy->tcp_req.inspect_rules);
-	free_act_rules(&defproxy->tcp_rep.inspect_rules);
-	free_act_rules(&defproxy->tcp_req.l4_rules);
-	free_act_rules(&defproxy->tcp_req.l5_rules);
-	free_act_rules(&defproxy->http_req_rules);
-	free_act_rules(&defproxy->http_res_rules);
-	free_act_rules(&defproxy->http_after_res_rules);
 
 	if (defproxy->conf.logformat_string != default_http_log_format &&
 	    defproxy->conf.logformat_string != default_tcp_log_format &&
@@ -1488,55 +1471,20 @@ void proxy_destroy_defaults(struct proxy *px)
 		return;
 	if (!(px->cap & PR_CAP_DEF))
 		return;
-	BUG_ON(px->conf.refcount != 0);
 	ebpt_delete(&px->conf.by_name);
 	proxy_free_defaults(px);
 	free(px);
 }
 
-/* delete all unreferenced default proxies. A default proxy is unreferenced if
- * its refcount is equal to zero.
- */
-void proxy_destroy_all_unref_defaults()
+void proxy_destroy_all_defaults()
 {
 	struct ebpt_node *n;
 
-	n = ebpt_first(&defproxy_by_name);
-	while (n) {
+	while ((n = ebpt_first(&defproxy_by_name))) {
 		struct proxy *px = container_of(n, struct proxy, conf.by_name);
 		BUG_ON(!(px->cap & PR_CAP_DEF));
-		n = ebpt_next(n);
-		if (!px->conf.refcount)
-			proxy_destroy_defaults(px);
+		proxy_destroy_defaults(px);
 	}
-}
-
-/* Add a reference on the default proxy <defpx> for the proxy <px> Nothing is
- * done if <px> already references <defpx>. Otherwise, the default proxy
- * refcount is incremented by one. For now, this operation is not thread safe
- * and is perform during init stage only.
- */
-void proxy_ref_defaults(struct proxy *px, struct proxy *defpx)
-{
-	if (px->defpx == defpx)
-		return;
-	BUG_ON(px->defpx != NULL);
-	px->defpx = defpx;
-	defpx->conf.refcount++;
-}
-
-/* proxy <px> removes its reference on its default proxy. The default proxy
- * refcount is decremented by one. If it was the last reference, the
- * corresponding default proxy is destroyed. For now this operation is not
- * thread safe and is performed during deinit staged only.
-*/
-void proxy_unref_defaults(struct proxy *px)
-{
-	if (px->defpx == NULL)
-		return;
-	if (!--px->defpx->conf.refcount)
-		proxy_destroy_defaults(px->defpx);
-	px->defpx = NULL;
 }
 
 /* Allocates a new proxy <name> of type <cap>.
@@ -1584,7 +1532,7 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	/* set default values from the specified default proxy */
 	memcpy(&curproxy->defsrv, &defproxy->defsrv, sizeof(curproxy->defsrv));
 
-	curproxy->flags = (defproxy->flags & PR_FL_DISABLED); /* Only inherit from disabled flag */
+	curproxy->disabled = defproxy->disabled;
 	curproxy->options = defproxy->options;
 	curproxy->options2 = defproxy->options2;
 	curproxy->no_options = defproxy->no_options;
@@ -1592,8 +1540,6 @@ static int proxy_defproxy_cpy(struct proxy *curproxy, const struct proxy *defpro
 	curproxy->except_xff_net = defproxy->except_xff_net;
 	curproxy->except_xot_net = defproxy->except_xot_net;
 	curproxy->retry_type = defproxy->retry_type;
-	curproxy->tcp_req.inspect_delay = defproxy->tcp_req.inspect_delay;
-	curproxy->tcp_rep.inspect_delay = defproxy->tcp_rep.inspect_delay;
 
 	if (defproxy->fwdfor_hdr_len) {
 		curproxy->fwdfor_hdr_len  = defproxy->fwdfor_hdr_len;
@@ -1865,19 +1811,19 @@ struct proxy *parse_new_proxy(const char *name, unsigned int cap,
 }
 
 /* to be called under the proxy lock after stopping some listeners. This will
- * automatically update the p->flags flag after stopping the last one, and
+ * automatically update the p->disabled flag after stopping the last one, and
  * will emit a log indicating the proxy's condition. The function is idempotent
  * so that it will not emit multiple logs; a proxy will be disabled only once.
  */
 void proxy_cond_disable(struct proxy *p)
 {
-	if (p->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+	if (p->disabled)
 		return;
 
 	if (p->li_ready + p->li_paused > 0)
 		return;
 
-	p->flags |= PR_FL_STOPPED;
+	p->disabled = PR_STOPPED;
 
 	/* Note: syslog proxies use their own loggers so while it's somewhat OK
 	 * to report them being stopped as a warning, we must not spam their log
@@ -1917,7 +1863,7 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 	 */
 
 	/* first, let's check if we need to stop the proxy */
-	if (unlikely(stopping && !(p->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))) {
+	if (unlikely(stopping && !p->disabled)) {
 		int t;
 		t = tick_remain(now_ms, p->stop_time);
 		if (t == 0) {
@@ -1937,7 +1883,7 @@ struct task *manage_proxy(struct task *t, void *context, unsigned int state)
 	 * be in neither list. Any entry being dumped will have ref_cnt > 0.
 	 * However we protect tables that are being synced to peers.
 	 */
-	if (unlikely(stopping && (p->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) && p->table && p->table->current)) {
+	if (unlikely(stopping && p->disabled && p->table && p->table->current)) {
 
 		if (!p->table->refcnt) {
 			/* !table->refcnt means there
@@ -2071,7 +2017,7 @@ struct task *hard_stop(struct task *t, void *context, unsigned int state)
 	thread_isolate();
 
 	for (thr = 0; thr < global.nbthread; thr++) {
-		list_for_each_entry(s, &ha_thread_ctx[thr].streams, list) {
+		list_for_each_entry(s, &ha_thread_info[thr].streams, list) {
 			stream_shutdown(s, SF_ERR_KILLED);
 		}
 	}
@@ -2093,7 +2039,7 @@ static void do_soft_stop_now()
 
 	/* schedule a hard-stop after a delay if needed */
 	if (tick_isset(global.hard_stop_after)) {
-		task = task_new_anywhere();
+		task = task_new(MAX_THREADS_MASK);
 		if (task) {
 			task->process = hard_stop;
 			task_schedule(task, tick_add(now_ms, global.hard_stop_after));
@@ -2131,7 +2077,7 @@ void soft_stop(void)
 	stopping = 1;
 
 	if (tick_isset(global.grace_delay)) {
-		task = task_new_anywhere();
+		task = task_new(MAX_THREADS_MASK);
 		if (task) {
 			ha_notice("Scheduling a soft-stop in %u ms.\n", global.grace_delay);
 			send_log(NULL, LOG_WARNING, "Scheduling a soft-stop in %u ms.\n", global.grace_delay);
@@ -2157,7 +2103,7 @@ int pause_proxy(struct proxy *p)
 {
 	struct listener *l;
 
-	if (!(p->cap & PR_CAP_FE) || (p->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) || !p->li_ready)
+	if (!(p->cap & PR_CAP_FE) || p->disabled || !p->li_ready)
 		return 1;
 
 	list_for_each_entry(l, &p->conf.listeners, by_fe)
@@ -2176,7 +2122,7 @@ int pause_proxy(struct proxy *p)
  * to be called when going down in order to release the ports so that another
  * process may bind to them. It must also be called on disabled proxies at the
  * end of start-up. If all listeners are closed, the proxy is set to the
- * PR_STOPPED state. The function takes the proxy's lock so it's safe to
+ * PR_STSTOPPED state. The function takes the proxy's lock so it's safe to
  * call from multiple places.
  */
 void stop_proxy(struct proxy *p)
@@ -2188,9 +2134,9 @@ void stop_proxy(struct proxy *p)
 	list_for_each_entry(l, &p->conf.listeners, by_fe)
 		stop_listener(l, 1, 0, 0);
 
-	if (!(p->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) && !p->li_ready) {
+	if (!p->disabled && !p->li_ready) {
 		/* might be just a backend */
-		p->flags |= PR_FL_STOPPED;
+		p->disabled |= PR_STOPPED;
 	}
 
 	HA_RWLOCK_WRUNLOCK(PROXY_LOCK, &p->lock);
@@ -2206,7 +2152,7 @@ int resume_proxy(struct proxy *p)
 	struct listener *l;
 	int fail;
 
-	if ((p->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) || !p->li_paused)
+	if (p->disabled || !p->li_paused)
 		return 1;
 
 	fail = 0;
@@ -2426,7 +2372,7 @@ void proxy_adjust_all_maxconn()
 	struct switching_rule *swrule1, *swrule2;
 
 	for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
-		if (curproxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+		if (curproxy->disabled)
 			continue;
 
 		if (!(curproxy->cap & PR_CAP_FE))
@@ -2470,7 +2416,7 @@ void proxy_adjust_all_maxconn()
 	 * loop above because cross-references are not yet fully resolved.
 	 */
 	for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
-		if (curproxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+		if (curproxy->disabled)
 			continue;
 
 		/* If <fullconn> is not set, let's set it to 10% of the sum of
@@ -2929,7 +2875,7 @@ static int cli_parse_shutdown_frontend(char **args, char *payload, struct appctx
 	if (!px)
 		return 1;
 
-	if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+	if (px->disabled)
 		return cli_msg(appctx, LOG_NOTICE, "Frontend was already shut down.\n");
 
 	stop_proxy(px);
@@ -2952,7 +2898,7 @@ static int cli_parse_disable_frontend(char **args, char *payload, struct appctx 
 	if (!px)
 		return 1;
 
-	if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+	if (px->disabled)
 		return cli_msg(appctx, LOG_NOTICE, "Frontend was previously shut down, cannot disable.\n");
 
 	if (!px->li_ready)
@@ -2984,7 +2930,7 @@ static int cli_parse_enable_frontend(char **args, char *payload, struct appctx *
 	if (!px)
 		return 1;
 
-	if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+	if (px->disabled)
 		return cli_err(appctx, "Frontend was previously shut down, cannot enable.\n");
 
 	if (px->li_ready == px->li_all)

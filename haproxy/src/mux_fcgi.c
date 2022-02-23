@@ -11,8 +11,6 @@
  */
 
 #include <import/ist.h>
-#include <import/eb32tree.h>
-#include <import/ebmbtree.h>
 
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
@@ -30,6 +28,7 @@
 #include <haproxy/proxy.h>
 #include <haproxy/regex.h>
 #include <haproxy/session-t.h>
+#include <haproxy/ssl_sock.h>
 #include <haproxy/stream.h>
 #include <haproxy/stream_interface.h>
 #include <haproxy/trace.h>
@@ -612,7 +611,7 @@ static inline struct buffer *fcgi_get_buf(struct fcgi_conn *fconn, struct buffer
 	    unlikely((buf = b_alloc(bptr)) == NULL)) {
 		fconn->buf_wait.target = fconn;
 		fconn->buf_wait.wakeup_cb = fcgi_buf_available;
-		LIST_APPEND(&th_ctx->buffer_wq, &fconn->buf_wait.list);
+		LIST_APPEND(&ti->buffer_wq, &fconn->buf_wait.list);
 	}
 	return buf;
 }
@@ -735,7 +734,7 @@ static int fcgi_init(struct connection *conn, struct proxy *px, struct session *
 	fconn->app = app;
 	fconn->task = NULL;
 	if (tick_isset(fconn->timeout)) {
-		t = task_new_here();
+		t = task_new(tid_bit);
 		if (!t) {
 			TRACE_ERROR("fconn task allocation failure", FCGI_EV_FCONN_NEW|FCGI_EV_FCONN_END|FCGI_EV_FCONN_ERR);
 			goto fail;
@@ -1229,8 +1228,6 @@ static int fcgi_set_default_param(struct fcgi_conn *fconn, struct fcgi_strm *fst
 				  struct fcgi_strm_params *params)
 {
 	struct connection *cli_conn = objt_conn(fstrm->sess->origin);
-	const struct sockaddr_storage *src = si_src(si_opposite(fstrm->cs->data));
-	const struct sockaddr_storage *dst = si_dst(si_opposite(fstrm->cs->data));
 	struct ist p;
 
 	if (!sl)
@@ -1242,23 +1239,23 @@ static int fcgi_set_default_param(struct fcgi_conn *fconn, struct fcgi_strm *fst
 	if (!(params->mask & FCGI_SP_REQ_METH)) {
 		p  = htx_sl_req_meth(sl);
 		params->meth = ist2(b_tail(params->p), p.len);
-		chunk_istcat(params->p, p);
+		chunk_memcat(params->p, p.ptr, p.len);
 	}
 	if (!(params->mask & FCGI_SP_REQ_URI)) {
 		p = h1_get_uri(sl);
 		params->uri = ist2(b_tail(params->p), p.len);
-		chunk_istcat(params->p, p);
+		chunk_memcat(params->p, p.ptr, p.len);
 	}
 	if (!(params->mask & FCGI_SP_SRV_PROTO)) {
 		p  = htx_sl_req_vsn(sl);
 		params->vsn = ist2(b_tail(params->p), p.len);
-		chunk_istcat(params->p, p);
+		chunk_memcat(params->p, p.ptr, p.len);
 	}
 	if (!(params->mask & FCGI_SP_SRV_PORT)) {
 		char *end;
 		int port = 0;
-		if (dst)
-			port = get_host_port(dst);
+		if (cli_conn && conn_get_dst(cli_conn))
+			port = get_host_port(cli_conn->dst);
 		end = ultoa_o(port, b_tail(params->p), b_room(params->p));
 		if (!end)
 			goto error;
@@ -1271,8 +1268,8 @@ static int fcgi_set_default_param(struct fcgi_conn *fconn, struct fcgi_strm *fst
 		if (!istlen(params->srv_name)) {
 			char *ptr = NULL;
 
-			if (dst)
-				if (addr_to_str(dst, b_tail(params->p), b_room(params->p)) != -1)
+			if (cli_conn && conn_get_dst(cli_conn))
+				if (addr_to_str(cli_conn->dst, b_tail(params->p), b_room(params->p)) != -1)
 					ptr = b_tail(params->p);
 			if (ptr) {
 				params->srv_name = ist(ptr);
@@ -1283,8 +1280,8 @@ static int fcgi_set_default_param(struct fcgi_conn *fconn, struct fcgi_strm *fst
 	if (!(params->mask & FCGI_SP_REM_ADDR)) {
 		char *ptr = NULL;
 
-		if (src)
-			if (addr_to_str(src, b_tail(params->p), b_room(params->p)) != -1)
+		if (cli_conn && conn_get_src(cli_conn))
+			if (addr_to_str(cli_conn->src, b_tail(params->p), b_room(params->p)) != -1)
 				ptr = b_tail(params->p);
 		if (ptr) {
 			params->rem_addr = ist(ptr);
@@ -1294,8 +1291,8 @@ static int fcgi_set_default_param(struct fcgi_conn *fconn, struct fcgi_strm *fst
 	if (!(params->mask & FCGI_SP_REM_PORT)) {
 		char *end;
 		int port = 0;
-		if (src)
-			port = get_host_port(src);
+		if (cli_conn && conn_get_src(cli_conn))
+			port = get_host_port(cli_conn->src);
 		end = ultoa_o(port, b_tail(params->p), b_room(params->p));
 		if (!end)
 			goto error;
@@ -1322,12 +1319,12 @@ static int fcgi_set_default_param(struct fcgi_conn *fconn, struct fcgi_strm *fst
 		params->cont_len = ist2(b_tail(params->p), end - b_tail(params->p));
 		params->p->data += params->cont_len.len;
 	}
-
+#ifdef USE_OPENSSL
 	if (!(params->mask & FCGI_SP_HTTPS)) {
 		if (cli_conn)
-			params->https = conn_is_ssl(cli_conn);
+			params->https = ssl_sock_is_ssl(cli_conn);
 	}
-
+#endif
 	if ((params->mask & FCGI_SP_URI_MASK) != FCGI_SP_URI_MASK) {
 		/* one of scriptname, pathinfo or query_string is no set */
 		struct http_uri_parser parser = http_uri_parser_init(params->uri);
@@ -1361,7 +1358,7 @@ static int fcgi_set_default_param(struct fcgi_conn *fconn, struct fcgi_strm *fst
 		/* Decode the path. it must first be copied to keep the URI
 		 * untouched.
 		 */
-		chunk_istcat(params->p, path);
+		chunk_memcat(params->p, path.ptr, path.len);
 		path.ptr = b_tail(params->p) - path.len;
 		len = url_decode(ist0(path), 0);
 		if (len < 0)
@@ -1415,7 +1412,7 @@ static int fcgi_set_default_param(struct fcgi_conn *fconn, struct fcgi_strm *fst
 			struct ist sn = params->scriptname;
 
 			params->scriptname = ist2(b_tail(params->p), len+fconn->app->index.len);
-			chunk_istcat(params->p, sn);
+			chunk_memcat(params->p, sn.ptr, sn.len);
 			chunk_memcat(params->p, fconn->app->index.ptr, fconn->app->index.len);
 		}
 	}
@@ -2031,15 +2028,6 @@ static size_t fcgi_strm_send_params(struct fcgi_conn *fconn, struct fcgi_strm *f
 				else {
 					if (isteq(p.n, ist("host")))
 						params.srv_name = p.v;
-					else if (isteq(p.n, ist("te"))) {
-						/* "te" may only be sent with "trailers" if this value
-						 * is present, otherwise it must be deleted.
-						 */
-						p.v = istist(p.v, ist("trailers"));
-						if (!isttest(p.v) || (p.v.len > 8 && p.v.ptr[8] != ','))
-							break;
-						p.v = ist("trailers");
-					}
 
 					/* Skip header if same name is used to add the server name */
 					if (fconn->proxy->server_id_hdr_name &&
@@ -3090,7 +3078,7 @@ static int fcgi_process(struct fcgi_conn *fconn)
 	}
 	fcgi_send(fconn);
 
-	if (unlikely(fconn->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED))) {
+	if (unlikely(fconn->proxy->disabled)) {
 		/* frontend is stopping, reload likely in progress, let's try
 		 * to announce a graceful shutdown if not yet done. We don't
 		 * care if it fails, it will be tried again later.
@@ -3347,20 +3335,6 @@ static size_t fcgi_strm_parse_headers(struct fcgi_strm *fstrm, struct h1m *h1m, 
 			fcgi_strm_error(fstrm);
 			fcgi_strm_capture_bad_message(fstrm->fconn, fstrm, h1m, buf);
 		}
-		goto end;
-	}
-
-	/* Reject any message with an unknown transfer-encoding. In fact if any
-	 * encoding other than "chunked". A 422-Unprocessable-Content is
-	 * returned for an invalid request, a 502-Bad-Gateway for an invalid
-	 * response.
-	 */
-	if (h1m->flags & H1_MF_TE_OTHER) {
-		htx->flags |= HTX_FL_PARSING_ERROR;
-		TRACE_ERROR("Unknown transfer-encoding", FCGI_EV_RSP_DATA|FCGI_EV_RSP_HDRS|FCGI_EV_FSTRM_ERR, fstrm->fconn->conn, fstrm);
-		fcgi_strm_error(fstrm);
-		fcgi_strm_capture_bad_message(fstrm->fconn, fstrm, h1m, buf);
-		ret = 0;
 		goto end;
 	}
 
@@ -3936,18 +3910,7 @@ static int fcgi_unsubscribe(struct conn_stream *cs, int event_type, struct wait_
 	return 0;
 }
 
-/* Called from the upper layer, to receive data
- *
- * The caller is responsible for defragmenting <buf> if necessary. But <flags>
- * must be tested to know the calling context. If CO_RFL_BUF_FLUSH is set, it
- * means the caller wants to flush input data (from the mux buffer and the
- * channel buffer) to be able to use kernel splicing or any kind of mux-to-mux
- * xfer. If CO_RFL_KEEP_RECV is set, the mux must always subscribe for read
- * events before giving back. CO_RFL_BUF_WET is set if <buf> is congested with
- * data scheduled for leaving soon. CO_RFL_BUF_NOT_STUCK is set to instruct the
- * mux it may optimize the data copy to <buf> if necessary. Otherwise, it should
- * copy as much data as possible.
- */
+/* Called from the upper layer, to receive data */
 static size_t fcgi_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
 {
 	struct fcgi_strm *fstrm = cs->ctx;
@@ -4250,7 +4213,7 @@ static int fcgi_takeover(struct connection *conn, int orig_tid)
 		__ha_barrier_store();
 		task_kill(task);
 
-		fcgi->task = task_new_here();
+		fcgi->task = task_new(tid_bit);
 		if (!fcgi->task) {
 			fcgi_release(fcgi);
 			return -1;

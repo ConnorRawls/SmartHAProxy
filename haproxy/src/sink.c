@@ -642,7 +642,7 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 	if (sft->srv->log_proto == SRV_LOG_PROTO_OCTET_COUNTING)
 		applet = &sink_forward_oc_applet;
 
-	appctx = appctx_new(applet);
+	appctx = appctx_new(applet, tid_bit);
 	if (!appctx)
 		goto out_close;
 
@@ -661,7 +661,7 @@ static struct appctx *sink_forward_session_create(struct sink *sink, struct sink
 
 
 	s->target = &sft->srv->obj_type;
-	if (!sockaddr_alloc(&s->si[1].dst, &sft->srv->addr, sizeof(sft->srv->addr)))
+	if (!sockaddr_alloc(&s->target_addr, &sft->srv->addr, sizeof(sft->srv->addr)))
 		goto out_free_strm;
 	s->flags = SF_ASSIGNED|SF_ADDR_SET;
 	s->si[1].flags |= SI_FL_NOLINGER;
@@ -731,7 +731,7 @@ static struct task *process_sink_forward(struct task * task, void *context, unsi
  */
 int sink_init_forward(struct sink *sink)
 {
-	sink->forward_task = task_new_anywhere();
+	sink->forward_task = task_new(MAX_THREADS_MASK);
 	if (!sink->forward_task)
 		return 0;
 

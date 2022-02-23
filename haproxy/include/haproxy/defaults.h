@@ -27,12 +27,9 @@
  * but may be lowered to save resources on embedded systems.
 */
 #ifndef USE_THREAD
-/* threads disabled, 1 thread max, 1 group max (note: group ids start at 1) */
+/* threads disabled, 1 thread max */
 #define MAX_THREADS 1
 #define MAX_THREADS_MASK 1
-
-#define MAX_TGROUPS 1
-#define MAX_THREADS_PER_GROUP 1
 
 #else
 /* threads enabled, max_threads defaults to long bits */
@@ -40,12 +37,6 @@
 #define MAX_THREADS LONGBITS
 #endif
 #define MAX_THREADS_MASK (~0UL >> (LONGBITS - MAX_THREADS))
-
-/* still limited to 1 group for now by default (note: group ids start at 1) */
-#ifndef MAX_TGROUPS
-#define MAX_TGROUPS 1
-#endif
-#define MAX_THREADS_PER_GROUP LONGBITS
 #endif
 
 /*
@@ -174,23 +165,6 @@
 // value will cause lots of calls, and too high a value may cause high latency.
 #ifndef MAX_POLL_EVENTS
 #define MAX_POLL_EVENTS 200
-#endif
-
-/* eternity when exprimed in timeval */
-#ifndef TV_ETERNITY
-#define TV_ETERNITY     (~0UL)
-#endif
-
-/* eternity when exprimed in ms */
-#ifndef TV_ETERNITY_MS
-#define TV_ETERNITY_MS  (-1)
-#endif
-
-/* we want to be able to detect time jumps. Fix the maximum wait time to a low
- * value so that we know the time has changed if we wait longer.
- */
-#ifndef MAX_DELAY_MS
-#define MAX_DELAY_MS    60000
 #endif
 
 // The maximum number of connections accepted at once by a thread for a single
@@ -385,23 +359,6 @@
 #define MEM_USABLE_RATIO 0.97
 #endif
 
-/* Pools are always enabled unless explicitly disabled. When disabled, the
- * calls are directly passed to the underlying OS functions.
- */
-#if !defined(DEBUG_NO_POOLS) && !defined(DEBUG_UAF) && !defined(DEBUG_FAIL_ALLOC)
-#define CONFIG_HAP_POOLS
-#endif
-
-/* On modern architectures with many threads, a fast memory allocator, and
- * local pools, the global pools with their single list can be way slower than
- * the standard allocator which already has its own per-thread arenas. In this
- * case we disable global pools. The global pools may still be enforced
- * using CONFIG_HAP_GLOBAL_POOLS though.
- */
-#if defined(USE_THREAD) && defined(HA_HAVE_FAST_MALLOC) && !defined(CONFIG_HAP_GLOBAL_POOLS)
-#define CONFIG_HAP_NO_GLOBAL_POOLS
-#endif
-
 /* default per-thread pool cache size when enabled */
 #ifndef CONFIG_HAP_POOL_CACHE_SIZE
 #define CONFIG_HAP_POOL_CACHE_SIZE 1048576
@@ -445,6 +402,13 @@
 /* maximum number of pollers that may be registered */
 #ifndef MAX_POLLERS
 #define MAX_POLLERS	10
+#endif
+
+/* Make all xxhash functions inline, with implementations being directly
+ * included within xxhash.h.
+ */
+#ifndef XXH_INLINE_ALL
+#define XXH_INLINE_ALL
 #endif
 
 /* system sysfs directory */

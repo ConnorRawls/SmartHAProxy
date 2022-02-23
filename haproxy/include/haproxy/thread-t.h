@@ -23,6 +23,10 @@
 #ifndef _HAPROXY_THREAD_T_H
 #define _HAPROXY_THREAD_T_H
 
+#ifdef USE_THREAD
+#include <pthread.h>
+#endif
+
 #include <haproxy/defaults.h>
 
 /* Note: this file mainly contains 3 sections:

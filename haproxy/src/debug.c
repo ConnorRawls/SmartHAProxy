@@ -23,18 +23,15 @@
 #include <haproxy/api.h>
 #include <haproxy/buf.h>
 #include <haproxy/cli.h>
-#include <haproxy/clock.h>
 #include <haproxy/debug.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
 #include <haproxy/hlua.h>
-#include <haproxy/http_ana.h>
 #include <haproxy/log.h>
 #include <haproxy/net_helper.h>
 #include <haproxy/stream_interface.h>
 #include <haproxy/task.h>
 #include <haproxy/thread.h>
-#include <haproxy/time.h>
 #include <haproxy/tools.h>
 #include <import/ist.h>
 
@@ -150,26 +147,25 @@ void ha_backtrace_to_stderr()
 void ha_thread_dump(struct buffer *buf, int thr, int calling_tid)
 {
 	unsigned long thr_bit = 1UL << thr;
-	unsigned long long p = ha_thread_ctx[thr].prev_cpu_time;
-	unsigned long long n = now_cpu_time_thread(thr);
-	int stuck = !!(ha_thread_ctx[thr].flags & TH_FL_STUCK);
+	unsigned long long p = ha_thread_info[thr].prev_cpu_time;
+	unsigned long long n = now_cpu_time_thread(&ha_thread_info[thr]);
+	int stuck = !!(ha_thread_info[thr].flags & TI_FL_STUCK);
 
 	chunk_appendf(buf,
 	              "%c%cThread %-2u: id=0x%llx act=%d glob=%d wq=%d rq=%d tl=%d tlsz=%d rqsz=%d\n"
-	              "     %2u/%-2u   stuck=%d prof=%d",
+	              "             stuck=%d prof=%d",
 	              (thr == calling_tid) ? '*' : ' ', stuck ? '>' : ' ', thr + 1,
 		      ha_get_pthread_id(thr),
 		      thread_has_tasks(),
 	              !!(global_tasks_mask & thr_bit),
-	              !eb_is_empty(&ha_thread_ctx[thr].timers),
-	              !eb_is_empty(&ha_thread_ctx[thr].rqueue),
-	              !(LIST_ISEMPTY(&ha_thread_ctx[thr].tasklets[TL_URGENT]) &&
-			LIST_ISEMPTY(&ha_thread_ctx[thr].tasklets[TL_NORMAL]) &&
-			LIST_ISEMPTY(&ha_thread_ctx[thr].tasklets[TL_BULK]) &&
-			MT_LIST_ISEMPTY(&ha_thread_ctx[thr].shared_tasklet_list)),
-	              ha_thread_ctx[thr].tasks_in_list,
-	              ha_thread_ctx[thr].rq_total,
-		      ha_thread_info[thr].tg->tgid, ha_thread_info[thr].ltid + 1,
+	              !eb_is_empty(&task_per_thread[thr].timers),
+	              !eb_is_empty(&task_per_thread[thr].rqueue),
+	              !(LIST_ISEMPTY(&task_per_thread[thr].tasklets[TL_URGENT]) &&
+			LIST_ISEMPTY(&task_per_thread[thr].tasklets[TL_NORMAL]) &&
+			LIST_ISEMPTY(&task_per_thread[thr].tasklets[TL_BULK]) &&
+			MT_LIST_ISEMPTY(&task_per_thread[thr].shared_tasklet_list)),
+	              task_per_thread[thr].tasks_in_list,
+	              task_per_thread[thr].rq_total,
 	              stuck,
 	              !!(task_profiling_mask & thr_bit));
 
@@ -181,13 +177,13 @@ void ha_thread_dump(struct buffer *buf, int thr, int calling_tid)
 	chunk_appendf(buf, "\n");
 	chunk_appendf(buf, "             cpu_ns: poll=%llu now=%llu diff=%llu\n", p, n, n-p);
 
-	/* this is the end of what we can dump from outside the current thread */
+	/* this is the end of what we can dump from outside the thread */
 
 	if (thr != tid)
 		return;
 
 	chunk_appendf(buf, "             curr_task=");
-	ha_task_dump(buf, th_ctx->current, "             ");
+	ha_task_dump(buf, sched->current, "             ");
 
 	if (stuck) {
 		/* We only emit the backtrace for stuck threads in order not to
@@ -1146,7 +1142,7 @@ void debug_handler(int sig, siginfo_t *si, void *arg)
 	 * if it didn't move.
 	 */
 	if (!((threads_harmless_mask|sleeping_thread_mask) & tid_bit))
-		th_ctx->flags |= TH_FL_STUCK;
+		ti->flags |= TI_FL_STUCK;
 }
 
 static int init_debug_per_thread()

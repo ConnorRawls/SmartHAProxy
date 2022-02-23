@@ -31,6 +31,7 @@
 #include <haproxy/stream_interface-t.h>
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
+#include <haproxy/time.h>
 #include <haproxy/tools-t.h>
 
 
@@ -846,7 +847,7 @@ static inline int channel_alloc_buffer(struct channel *chn, struct buffer_wait *
 		return 1;
 
 	if (!LIST_INLIST(&wait->list))
-		LIST_APPEND(&th_ctx->buffer_wq, &wait->list);
+		LIST_APPEND(&ti->buffer_wq, &wait->list);
 
 	return 0;
 }

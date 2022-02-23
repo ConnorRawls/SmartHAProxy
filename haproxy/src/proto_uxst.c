@@ -36,6 +36,7 @@
 #include <haproxy/proto_uxst.h>
 #include <haproxy/sock.h>
 #include <haproxy/sock_unix.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 #include <haproxy/version.h>
 
@@ -73,7 +74,6 @@ struct protocol proto_uxst = {
 	.fam            = &proto_fam_unix,
 
 	/* socket layer */
-	.proto_type     = PROTO_TYPE_STREAM,
 	.sock_type      = SOCK_STREAM,
 	.sock_prot      = 0,
 	.rx_enable      = sock_enable,
@@ -142,7 +142,7 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
  uxst_return:
 	if (msg && errlen) {
 		const char *path = ((struct sockaddr_un *)&listener->rx.addr)->sun_path;
-		snprintf(errmsg, errlen, "%s for [%s]", msg, path);
+		snprintf(errmsg, errlen, "%s [%s]", msg, path);
 	}
 	return err;
 }
@@ -284,6 +284,10 @@ static int uxst_connect_server(struct connection *conn, int flags)
 		conn->flags |= CO_FL_ERROR;
 		return SF_ERR_INTERNAL;
 	}
+
+	/* if a send_proxy is there, there are data */
+	if (conn->send_proxy_ofs)
+		flags |= CONNECT_HAS_DATA;
 
 	if (global.tune.server_sndbuf)
                 setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &global.tune.server_sndbuf, sizeof(global.tune.server_sndbuf));

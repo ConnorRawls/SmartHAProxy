@@ -16,7 +16,7 @@
 #include <ctype.h>
 #include <errno.h>
 
-#include <import/ebmbtree.h>
+#include <import/xxhash.h>
 
 #include <haproxy/api.h>
 #include <haproxy/applet-t.h>
@@ -38,6 +38,7 @@
 #include <haproxy/resolvers.h>
 #include <haproxy/sample.h>
 #include <haproxy/server.h>
+#include <haproxy/ssl_sock.h>
 #include <haproxy/stats.h>
 #include <haproxy/stream.h>
 #include <haproxy/stream_interface.h>
@@ -45,7 +46,6 @@
 #include <haproxy/tcpcheck.h>
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
-#include <haproxy/xxhash.h>
 
 
 static void srv_update_status(struct server *s);
@@ -195,94 +195,6 @@ void srv_set_dyncookie(struct server *s)
 		srv_check_for_dup_dyncookie(s);
  out:
 	HA_RWLOCK_RDUNLOCK(PROXY_LOCK, &p->lock);
-}
-
-/* Returns true if it's possible to reuse an idle connection from server <srv>
- * for a websocket stream. This is the case if server is configured to use the
- * same protocol for both HTTP and websocket streams. This depends on the value
- * of "proto", "alpn" and "ws" keywords.
- */
-int srv_check_reuse_ws(struct server *srv)
-{
-	if (srv->mux_proto || srv->use_ssl != 1 || !srv->ssl_ctx.alpn_str) {
-		/* explicit srv.mux_proto or no ALPN : srv.mux_proto is used
-		 * for mux selection.
-		 */
-		const struct ist srv_mux = srv->mux_proto ?
-		                           srv->mux_proto->token : IST_NULL;
-
-		switch (srv->ws) {
-		/* "auto" means use the same protocol : reuse is possible. */
-		case SRV_WS_AUTO:
-			return 1;
-
-		/* "h2" means use h2 for websocket : reuse is possible if
-		 * server mux is h2.
-		 */
-		case SRV_WS_H2:
-			if (srv->mux_proto && isteq(srv_mux, ist("h2")))
-				return 1;
-			break;
-
-		/* "h1" means use h1 for websocket : reuse is possible if
-		 * server mux is h1.
-		 */
-		case SRV_WS_H1:
-			if (!srv->mux_proto || isteq(srv_mux, ist("h1")))
-				return 1;
-			break;
-		}
-	}
-	else {
-		/* ALPN selection.
-		 * Based on the assumption that only "h2" and "http/1.1" token
-		 * are used on server ALPN.
-		 */
-		const struct ist alpn = ist2(srv->ssl_ctx.alpn_str,
-		                             srv->ssl_ctx.alpn_len);
-
-		switch (srv->ws) {
-		case SRV_WS_AUTO:
-			/* for auto mode, consider reuse as possible if the
-			 * server uses a single protocol ALPN
-			 */
-			if (!istchr(alpn, ','))
-				return 1;
-			break;
-
-		case SRV_WS_H2:
-			return isteq(alpn, ist("\x02h2"));
-
-		case SRV_WS_H1:
-			return isteq(alpn, ist("\x08http/1.1"));
-		}
-	}
-
-	return 0;
-}
-
-/* Return the proto to used for a websocket stream on <srv> without ALPN. NULL
- * is a valid value indicating to use the fallback mux.
- */
-const struct mux_ops *srv_get_ws_proto(struct server *srv)
-{
-	const struct mux_proto_list *mux = NULL;
-
-	switch (srv->ws) {
-	case SRV_WS_AUTO:
-		mux = srv->mux_proto;
-		break;
-
-	case SRV_WS_H1:
-		mux = get_mux_proto(ist("h1"));
-		break;
-
-	case SRV_WS_H2:
-		mux = get_mux_proto(ist("h2"));
-		break;
-	}
-
-	return mux ? mux->mux : NULL;
 }
 
 /*
@@ -501,33 +413,6 @@ static int srv_parse_error_limit(char **args, int *cur_arg,
 		          args[*cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
-
-	return 0;
-}
-
-/* Parse the "ws" keyword */
-static int srv_parse_ws(char **args, int *cur_arg,
-                        struct proxy *curproxy, struct server *newsrv, char **err)
-{
-	if (!args[*cur_arg + 1]) {
-		memprintf(err, "'%s' expects 'auto', 'h1' or 'h2' value", args[*cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
-	if (strcmp(args[*cur_arg + 1], "h1") == 0) {
-		newsrv->ws = SRV_WS_H1;
-	}
-	else if (strcmp(args[*cur_arg + 1], "h2") == 0) {
-		newsrv->ws = SRV_WS_H2;
-	}
-	else if (strcmp(args[*cur_arg + 1], "auto") == 0) {
-		newsrv->ws = SRV_WS_AUTO;
-	}
-	else {
-		memprintf(err, "'%s' has to be 'auto', 'h1' or 'h2'", args[*cur_arg]);
-		return ERR_ALERT | ERR_FATAL;
-	}
-
 
 	return 0;
 }
@@ -1759,8 +1644,7 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "cookie",              srv_parse_cookie,              1,  1,  0 }, /* Assign a cookie to the server */
 	{ "disabled",            srv_parse_disabled,            0,  1,  1 }, /* Start the server in 'disabled' state */
 	{ "enabled",             srv_parse_enabled,             0,  1,  1 }, /* Start the server in 'enabled' state */
-	{ "error-limit",         srv_parse_error_limit,         1,  1,  1 }, /* Configure the consecutive count of check failures to consider a server on error */
-	{ "ws",                  srv_parse_ws,                  1,  1,  1 }, /* websocket protocol */
+	{ "error-limit",         srv_parse_error_limit,         1,  1,  0 }, /* Configure the consecutive count of check failures to consider a server on error */
 	{ "id",                  srv_parse_id,                  1,  0,  1 }, /* set id# of server */
 	{ "init-addr",           srv_parse_init_addr,           1,  1,  0 }, /* */
 	{ "log-proto",           srv_parse_log_proto,           1,  1,  0 }, /* Set the protocol for event messages, only relevant in a ring section */
@@ -1774,10 +1658,10 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "no-send-proxy-v2",    srv_parse_no_send_proxy_v2,    0,  1,  1 }, /* Disable use of PROXY V2 protocol */
 	{ "no-tfo",              srv_parse_no_tfo,              0,  1,  1 }, /* Disable use of TCP Fast Open */
 	{ "non-stick",           srv_parse_non_stick,           0,  1,  0 }, /* Disable stick-table persistence */
-	{ "observe",             srv_parse_observe,             1,  1,  1 }, /* Enables health adjusting based on observing communication with the server */
-	{ "on-error",            srv_parse_on_error,            1,  1,  1 }, /* Configure the action on check failure */
-	{ "on-marked-down",      srv_parse_on_marked_down,      1,  1,  1 }, /* Configure the action when a server is marked down */
-	{ "on-marked-up",        srv_parse_on_marked_up,        1,  1,  1 }, /* Configure the action when a server is marked up */
+	{ "observe",             srv_parse_observe,             1,  1,  0 }, /* Enables health adjusting based on observing communication with the server */
+	{ "on-error",            srv_parse_on_error,            1,  1,  0 }, /* Configure the action on check failure */
+	{ "on-marked-down",      srv_parse_on_marked_down,      1,  1,  0 }, /* Configure the action when a server is marked down */
+	{ "on-marked-up",        srv_parse_on_marked_up,        1,  1,  0 }, /* Configure the action when a server is marked up */
 	{ "pool-low-conn",       srv_parse_pool_low_conn,       1,  1,  1 }, /* Set the min number of orphan idle connecbefore being allowed to pick from other threads */
 	{ "pool-max-conn",       srv_parse_pool_max_conn,       1,  1,  1 }, /* Set the max number of orphan idle connections, -1 means unlimited */
 	{ "pool-purge-delay",    srv_parse_pool_purge_delay,    1,  1,  1 }, /* Set the time before we destroy orphan idle connections, defaults to 1s */
@@ -1790,7 +1674,7 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "resolvers",           srv_parse_resolvers,           1,  1,  0 }, /* Configure the resolver to use for name resolution */
 	{ "send-proxy",          srv_parse_send_proxy,          0,  1,  1 }, /* Enforce use of PROXY V1 protocol */
 	{ "send-proxy-v2",       srv_parse_send_proxy_v2,       0,  1,  1 }, /* Enforce use of PROXY V2 protocol */
-	{ "slowstart",           srv_parse_slowstart,           1,  1,  1 }, /* Set the warm-up timer for a previously failed server */
+	{ "slowstart",           srv_parse_slowstart,           1,  1,  0 }, /* Set the warm-up timer for a previously failed server */
 	{ "source",              srv_parse_source,             -1,  1,  1 }, /* Set the source address to be used to connect to the server */
 	{ "stick",               srv_parse_stick,               0,  1,  0 }, /* Enable stick-table persistence */
 	{ "tfo",                 srv_parse_tfo,                 0,  1,  1 }, /* enable TCP Fast Open of server */
@@ -1940,6 +1824,7 @@ const char *server_parse_maxconn_change_request(struct server *sv,
 	return NULL;
 }
 
+#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 static struct sample_expr *srv_sni_sample_parse_expr(struct server *srv, struct proxy *px,
                                                      const char *file, int linenum, char **err)
 {
@@ -1979,6 +1864,7 @@ static int server_parse_sni_expr(struct server *newsrv, struct proxy *px, char *
 
 	return 0;
 }
+#endif
 
 static void display_parser_err(const char *file, int linenum, char **args, int cur_arg, int err_code, char **err)
 {
@@ -2071,11 +1957,14 @@ static void srv_ssl_settings_cpy(struct server *srv, struct server *src)
 	if (src->ssl_ctx.methods.max)
 		srv->ssl_ctx.methods.max = src->ssl_ctx.methods.max;
 
+#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 	if (src->ssl_ctx.ciphersuites != NULL)
 		srv->ssl_ctx.ciphersuites = strdup(src->ssl_ctx.ciphersuites);
+#endif
 	if (src->sni_expr != NULL)
 		srv->sni_expr = strdup(src->sni_expr);
 
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
 	if (src->ssl_ctx.alpn_str) {
 		srv->ssl_ctx.alpn_str = malloc(src->ssl_ctx.alpn_len);
 		if (srv->ssl_ctx.alpn_str) {
@@ -2084,7 +1973,8 @@ static void srv_ssl_settings_cpy(struct server *srv, struct server *src)
 			srv->ssl_ctx.alpn_len = src->ssl_ctx.alpn_len;
 		}
 	}
-
+#endif
+#ifdef OPENSSL_NPN_NEGOTIATED
 	if (src->ssl_ctx.npn_str) {
 		srv->ssl_ctx.npn_str = malloc(src->ssl_ctx.npn_len);
 		if (srv->ssl_ctx.npn_str) {
@@ -2093,26 +1983,9 @@ static void srv_ssl_settings_cpy(struct server *srv, struct server *src)
 			srv->ssl_ctx.npn_len = src->ssl_ctx.npn_len;
 		}
 	}
+#endif
 }
-
-/* Activate ssl on server <s>.
- * do nothing if there is no change to apply
- *
- * Must be called with the server lock held.
- */
-void srv_set_ssl(struct server *s, int use_ssl)
-{
-	if (s->use_ssl == use_ssl)
-		return;
-
-	s->use_ssl = use_ssl;
-	if (s->use_ssl)
-		s->xprt = xprt_get(XPRT_SSL);
-	else
-		s->xprt = s->check.xprt = s->agent.xprt = xprt_get(XPRT_RAW);
-}
-
-#endif /* USE_OPENSSL */
+#endif
 
 /*
  * Prepare <srv> for hostname resolution.
@@ -2129,7 +2002,7 @@ int srv_prepare_for_resolution(struct server *srv, const char *hostname)
 
 	hostname_len    = strlen(hostname);
 	hostname_dn     = trash.area;
-	hostname_dn_len = resolv_str_to_dn_label(hostname, hostname_len,
+	hostname_dn_len = resolv_str_to_dn_label(hostname, hostname_len + 1,
 	                                         hostname_dn, trash.size);
 	if (hostname_dn_len == -1)
 		goto err;
@@ -2214,7 +2087,6 @@ static void srv_settings_cpy(struct server *srv, struct server *src, int srv_tmp
 	srv->agent.fastinter          = src->agent.fastinter;
 	srv->agent.downinter          = src->agent.downinter;
 	srv->maxqueue                 = src->maxqueue;
-	srv->ws                       = src->ws;
 	srv->minconn                  = src->minconn;
 	srv->maxconn                  = src->maxconn;
 	srv->slowstart                = src->slowstart;
@@ -2380,7 +2252,8 @@ struct server *srv_drop(struct server *srv)
 
 	EXTRA_COUNTERS_FREE(srv->extra_counters);
 
-	ha_free(&srv);
+	free(srv);
+	srv = NULL;
 
  end:
 	return next;
@@ -2486,13 +2359,13 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
 
 		srv_settings_cpy(newsrv, srv, 1);
 		srv_prepare_for_resolution(newsrv, srv->hostname);
-
+#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 		if (newsrv->sni_expr) {
 			newsrv->ssl_ctx.sni = srv_sni_sample_parse_expr(newsrv, px, NULL, 0, NULL);
 			if (!newsrv->ssl_ctx.sni)
 				goto err;
 		}
-
+#endif
 		/* append to list of servers available to receive an hostname */
 		if (newsrv->srvrq)
 			LIST_APPEND(&newsrv->srvrq->attached_servers, &newsrv->srv_rec_item);
@@ -2511,7 +2384,9 @@ static int _srv_parse_tmpl_init(struct server *srv, struct proxy *px)
  err:
 	_srv_parse_set_id_from_prefix(srv, srv->tmpl_info.prefix, srv->tmpl_info.nb_low);
 	if (newsrv)  {
+#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 		release_sample_expr(newsrv->ssl_ctx.sni);
+#endif
 		free_check(&newsrv->agent);
 		free_check(&newsrv->check);
 		LIST_DELETE(&newsrv->global_list);
@@ -2674,8 +2549,7 @@ static int _srv_parse_init(struct server **srv, char **args, int *cur_arg,
 		 */
 		srv_set_addr_desc(newsrv, !(parse_flags & SRV_PARSE_DYNAMIC));
 
-		if (!newsrv->srvrq && !newsrv->hostname &&
-		    !protocol_lookup(newsrv->addr.ss_family, PROTO_TYPE_STREAM, 0)) {
+		if (!newsrv->srvrq && !newsrv->hostname && !protocol_by_family(newsrv->addr.ss_family)) {
 			ha_alert("Unknown protocol family %d '%s'\n",
 			         newsrv->addr.ss_family, args[*cur_arg]);
 			err_code |= ERR_ALERT | ERR_FATAL;
@@ -2786,6 +2660,7 @@ out:
 	return err_code;
 }
 
+#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 /* This function is first intended to be used through parse_server to
  * initialize a new server on startup.
  */
@@ -2804,6 +2679,7 @@ static int _srv_parse_sni_expr_init(char **args, int cur_arg,
 
 	return ret;
 }
+#endif
 
 /* Server initializations finalization.
  * Initialize health check, agent check and SNI expression if enabled.
@@ -2816,8 +2692,10 @@ static int _srv_parse_finalize(char **args, int cur_arg,
                                struct server *srv, struct proxy *px,
                                int parse_flags)
 {
+#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	int ret;
 	char *errmsg = NULL;
+#endif
 
 	if (srv->do_check && srv->trackit) {
 		ha_alert("unable to enable checks and tracking at the same time!\n");
@@ -2830,6 +2708,7 @@ static int _srv_parse_finalize(char **args, int cur_arg,
 		return ERR_ALERT | ERR_FATAL;
 	}
 
+#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	if ((ret = _srv_parse_sni_expr_init(args, cur_arg, srv, px, &errmsg)) != 0) {
 		if (errmsg) {
 			ha_alert("%s\n", errmsg);
@@ -2837,6 +2716,7 @@ static int _srv_parse_finalize(char **args, int cur_arg,
 		}
 		return ret;
 	}
+#endif
 
 	/* A dynamic server is disabled on startup. It must not be counted as
 	 * an active backend entry.
@@ -3614,7 +3494,7 @@ int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *c
 
  save_ip:
 	if (counters) {
-		counters->app.resolver.update++;
+		counters->update++;
 		/* save the first ip we found */
 		chunk_printf(chk, "%s/%s", counters->pid, counters->id);
 	}
@@ -3629,7 +3509,7 @@ int snr_resolution_cb(struct resolv_requester *requester, struct dns_counters *c
 
  invalid:
 	if (counters) {
-		counters->app.resolver.invalid++;
+		counters->invalid++;
 		goto update_status;
 	}
 	if (!snr_update_srv_status(s, has_no_ip) && has_no_ip)
@@ -3691,7 +3571,7 @@ int srvrq_resolution_error_cb(struct resolv_requester *requester, int error_code
 	}
 
 	/* Remove any associated server ref */
-	resolv_detach_from_resolution_answer_items(res,  requester);
+	resolv_detach_from_resolution_answer_items(res,  requester, 1);
 
 	return 0;
 }
@@ -3716,7 +3596,7 @@ int snr_resolution_error_cb(struct resolv_requester *requester, int error_code)
 	if (!snr_update_srv_status(s, 1)) {
 		memset(&s->addr, 0, sizeof(s->addr));
 		HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
-		resolv_detach_from_resolution_answer_items(requester->resolution, requester);
+		resolv_detach_from_resolution_answer_items(requester->resolution, requester, 1);
 		return 0;
 	}
 	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
@@ -3827,7 +3707,7 @@ int srv_set_fqdn(struct server *srv, const char *hostname, int resolv_locked)
 	chunk_reset(&trash);
 	hostname_len    = strlen(hostname);
 	hostname_dn     = trash.area;
-	hostname_dn_len = resolv_str_to_dn_label(hostname, hostname_len,
+	hostname_dn_len = resolv_str_to_dn_label(hostname, hostname_len + 1,
 	                                         hostname_dn, trash.size);
 	if (hostname_dn_len == -1)
 		goto err;
@@ -3839,7 +3719,7 @@ int srv_set_fqdn(struct server *srv, const char *hostname, int resolv_locked)
 	    strcasecmp(resolution->hostname_dn, hostname_dn) == 0)
 		goto end;
 
-	resolv_unlink_resolution(srv->resolv_requester);
+	resolv_unlink_resolution(srv->resolv_requester, 0);
 
 	free(srv->hostname);
 	free(srv->hostname_dn);
@@ -3982,7 +3862,7 @@ int srv_init_addr(void)
 		struct server *srv;
 
 		/* servers are in backend only */
-		if (!(curproxy->cap & PR_CAP_BE) || (curproxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)))
+		if (!(curproxy->cap & PR_CAP_BE) || curproxy->disabled)
 			goto srv_init_addr_next;
 
 		for (srv = curproxy->srv; srv; srv = srv->next) {
@@ -4071,7 +3951,7 @@ struct server *cli_find_server(struct appctx *appctx, char *arg)
 		return NULL;
 	}
 
-	if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) {
+	if (px->disabled) {
 		cli_err(appctx, "Proxy is disabled.\n");
 		return NULL;
 	}
@@ -4280,9 +4160,9 @@ static int cli_parse_set_server(char **args, char *payload, struct appctx *appct
 
 		HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
 		if (strcmp(args[4], "on") == 0) {
-			srv_set_ssl(sv, 1);
+			ssl_sock_set_srv(sv, 1);
 		} else if (strcmp(args[4], "off") == 0) {
-			srv_set_ssl(sv, 0);
+			ssl_sock_set_srv(sv, 0);
 		} else {
 			HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
 			cli_err(appctx, "'set server <srv> ssl' expects 'on' or 'off'.\n");
@@ -4492,9 +4372,6 @@ static int cli_parse_enable_health(char **args, char *payload, struct appctx *ap
 	if (!sv)
 		return 1;
 
-	if (!(sv->check.state & CHK_ST_CONFIGURED))
-		return cli_err(appctx, "Health check was not configured on this server, cannot enable.\n");
-
 	HA_SPIN_LOCK(SERVER_LOCK, &sv->lock);
 	sv->check.state |= CHK_ST_ENABLED;
 	HA_SPIN_UNLOCK(SERVER_LOCK, &sv->lock);
@@ -4558,72 +4435,6 @@ static int srv_alloc_lb(struct server *sv, struct proxy *be)
 
 	return 1;
 }
-
-/* updates the server's weight during a warmup stage. Once the final weight is
- * reached, the task automatically stops. Note that any server status change
- * must have updated s->last_change accordingly.
- */
-static struct task *server_warmup(struct task *t, void *context, unsigned int state)
-{
-	struct server *s = context;
-
-	/* by default, plan on stopping the task */
-	t->expire = TICK_ETERNITY;
-	if ((s->next_admin & SRV_ADMF_MAINT) ||
-	    (s->next_state != SRV_ST_STARTING))
-		return t;
-
-	HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
-
-	/* recalculate the weights and update the state */
-	server_recalc_eweight(s, 1);
-
-	/* probably that we can refill this server with a bit more connections */
-	pendconn_grab_from_px(s);
-
-	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
-
-	/* get back there in 1 second or 1/20th of the slowstart interval,
-	 * whichever is greater, resulting in small 5% steps.
-	 */
-	if (s->next_state == SRV_ST_STARTING)
-		t->expire = tick_add(now_ms, MS_TO_TICKS(MAX(1000, s->slowstart / 20)));
-	return t;
-}
-
-/* Allocate the slowstart task if the server is configured with a slowstart
- * timer. If server next_state is SRV_ST_STARTING, the task is scheduled.
- *
- * Returns 0 on success else non-zero.
- */
-static int init_srv_slowstart(struct server *srv)
-{
-	struct task *t;
-
-	if (srv->slowstart) {
-		if ((t = task_new_anywhere()) == NULL) {
-			ha_alert("Cannot activate slowstart for server %s/%s: out of memory.\n", srv->proxy->id, srv->id);
-			return ERR_ALERT | ERR_FATAL;
-		}
-
-		/* We need a warmup task that will be called when the server
-		 * state switches from down to up.
-		 */
-		srv->warmup = t;
-		t->process = server_warmup;
-		t->context = srv;
-
-		/* server can be in this state only because of */
-		if (srv->next_state == SRV_ST_STARTING) {
-			task_schedule(srv->warmup,
-			              tick_add(now_ms,
-			                       MS_TO_TICKS(MAX(1000, (now.tv_sec - srv->last_change)) / 20)));
-		}
-	}
-
-	return ERR_NONE;
-}
-REGISTER_POST_SERVER_CHECK(init_srv_slowstart);
 
 /* Memory allocation and initialization of the per_thr field.
  * Returns 0 if the field has been successfully initialized, -1 on failure.
@@ -4750,8 +4561,7 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 		goto out;
 	}
 
-	if (srv->use_ssl == 1 || (srv->proxy->options & PR_O_TCPCHK_SSL) ||
-	    srv->check.use_ssl == 1) {
+	if (srv->use_ssl == 1) {
 		if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->prepare_srv) {
 			if (xprt_get(XPRT_SSL)->prepare_srv(srv))
 				goto out;
@@ -4781,10 +4591,6 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 		srv->agent.state &= ~CHK_ST_ENABLED;
 	}
 
-	/* Init slowstart if needed. */
-	if (init_srv_slowstart(srv))
-		goto out;
-
 	/* Attach the server to the end of the proxy linked list. Note that this
 	 * operation is not thread-safe so this is executed under thread
 	 * isolation.
@@ -4798,7 +4604,7 @@ static int cli_parse_add_server(char **args, char *payload, struct appctx *appct
 
 		while (1) {
 			/* check for duplicate server */
-			if (strcmp(srv->id, next->id) == 0) {
+			if (!strcmp(srv->id, next->id)) {
 				ha_alert("Already exists a server with the same name in backend.\n");
 				goto out;
 			}
@@ -5737,133 +5543,6 @@ static void srv_cleanup_connections(struct server *srv)
 		if ((i = ((i + 1 == global.nbthread) ? 0 : i + 1)) == tid)
 			break;
 	}
-}
-
-/* removes an idle conn after updating the server idle conns counters */
-void srv_release_conn(struct server *srv, struct connection *conn)
-{
-	if (conn->flags & CO_FL_LIST_MASK) {
-		/* The connection is currently in the server's idle list, so tell it
-		 * there's one less connection available in that list.
-		 */
-		_HA_ATOMIC_DEC(&srv->curr_idle_conns);
-		_HA_ATOMIC_DEC(conn->flags & CO_FL_SAFE_LIST ? &srv->curr_safe_nb : &srv->curr_idle_nb);
-		_HA_ATOMIC_DEC(&srv->curr_idle_thr[tid]);
-	}
-	else {
-		/* The connection is not private and not in any server's idle
-		 * list, so decrement the current number of used connections
-		 */
-		_HA_ATOMIC_DEC(&srv->curr_used_conns);
-	}
-
-	/* Remove the connection from any tree (safe, idle or available) */
-	HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-	conn_delete_from_tree(&conn->hash_node->node);
-	HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-}
-
-/* retrieve a connection from its <hash> in <tree>
- * returns NULL if no connection found
- */
-struct connection *srv_lookup_conn(struct eb_root *tree, uint64_t hash)
-{
-	struct ebmb_node *node = NULL;
-	struct connection *conn = NULL;
-	struct conn_hash_node *hash_node = NULL;
-
-	node = ebmb_lookup(tree, &hash, sizeof(hash_node->hash));
-	if (node) {
-		hash_node = ebmb_entry(node, struct conn_hash_node, node);
-		conn = hash_node->conn;
-	}
-
-	return conn;
-}
-
-/* retrieve the next connection sharing the same hash as <conn>
- * returns NULL if no connection found
- */
-struct connection *srv_lookup_conn_next(struct connection *conn)
-{
-	struct ebmb_node *node = NULL;
-	struct connection *next_conn = NULL;
-	struct conn_hash_node *hash_node = NULL;
-
-	node = ebmb_next_dup(&conn->hash_node->node);
-	if (node) {
-		hash_node = ebmb_entry(node, struct conn_hash_node, node);
-		next_conn = hash_node->conn;
-	}
-
-	return next_conn;
-}
-
-/* This adds an idle connection to the server's list if the connection is
- * reusable, not held by any owner anymore, but still has available streams.
- */
-int srv_add_to_idle_list(struct server *srv, struct connection *conn, int is_safe)
-{
-	/* we try to keep the connection in the server's idle list
-	 * if we don't have too many FD in use, and if the number of
-	 * idle+current conns is lower than what was observed before
-	 * last purge, or if we already don't have idle conns for the
-	 * current thread and we don't exceed last count by global.nbthread.
-	 */
-	if (!(conn->flags & CO_FL_PRIVATE) &&
-	    srv && srv->pool_purge_delay > 0 &&
-	    ((srv->proxy->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR) &&
-	    ha_used_fds < global.tune.pool_high_count &&
-	    (srv->max_idle_conns == -1 || srv->max_idle_conns > srv->curr_idle_conns) &&
-	    ((eb_is_empty(&srv->per_thr[tid].safe_conns) &&
-	      (is_safe || eb_is_empty(&srv->per_thr[tid].idle_conns))) ||
-	     (ha_used_fds < global.tune.pool_low_count &&
-	      (srv->curr_used_conns + srv->curr_idle_conns <=
-	       MAX(srv->curr_used_conns, srv->est_need_conns) + srv->low_idle_conns))) &&
-	    !conn->mux->used_streams(conn) && conn->mux->avail_streams(conn)) {
-		int retadd;
-
-		retadd = _HA_ATOMIC_ADD_FETCH(&srv->curr_idle_conns, 1);
-		if (retadd > srv->max_idle_conns) {
-			_HA_ATOMIC_DEC(&srv->curr_idle_conns);
-			return 0;
-		}
-		_HA_ATOMIC_DEC(&srv->curr_used_conns);
-
-		HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		conn_delete_from_tree(&conn->hash_node->node);
-
-		if (is_safe) {
-			conn->flags = (conn->flags & ~CO_FL_LIST_MASK) | CO_FL_SAFE_LIST;
-			ebmb_insert(&srv->per_thr[tid].safe_conns, &conn->hash_node->node, sizeof(conn->hash_node->hash));
-			_HA_ATOMIC_INC(&srv->curr_safe_nb);
-		} else {
-			conn->flags = (conn->flags & ~CO_FL_LIST_MASK) | CO_FL_IDLE_LIST;
-			ebmb_insert(&srv->per_thr[tid].idle_conns, &conn->hash_node->node, sizeof(conn->hash_node->hash));
-			_HA_ATOMIC_INC(&srv->curr_idle_nb);
-		}
-		HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
-		_HA_ATOMIC_INC(&srv->curr_idle_thr[tid]);
-
-		__ha_barrier_full();
-		if ((volatile void *)srv->idle_node.node.leaf_p == NULL) {
-			HA_SPIN_LOCK(OTHER_LOCK, &idle_conn_srv_lock);
-			if ((volatile void *)srv->idle_node.node.leaf_p == NULL) {
-				srv->idle_node.key = tick_add(srv->pool_purge_delay,
-				                              now_ms);
-				eb32_insert(&idle_conn_srv, &srv->idle_node);
-				if (!task_in_wq(idle_conn_task) && !
-				    task_in_rq(idle_conn_task)) {
-					task_schedule(idle_conn_task,
-					              srv->idle_node.key);
-				}
-
-			}
-			HA_SPIN_UNLOCK(OTHER_LOCK, &idle_conn_srv_lock);
-		}
-		return 1;
-	}
-	return 0;
 }
 
 struct task *srv_cleanup_idle_conns(struct task *task, void *context, unsigned int state)

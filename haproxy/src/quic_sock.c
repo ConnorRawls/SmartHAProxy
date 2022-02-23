@@ -17,7 +17,6 @@
 
 #include <haproxy/connection.h>
 #include <haproxy/listener.h>
-#include <haproxy/session.h>
 #include <haproxy/xprt_quic.h>
 
 /* This function is called from the protocol layer accept() in order to
@@ -36,6 +35,9 @@ int quic_session_accept(struct connection *cli_conn)
 	struct session *sess;
 
 	cli_conn->proxy_netns = l->rx.settings->netns;
+	if (conn_prepare(cli_conn, l->rx.proto, l->bind_conf->xprt) < 0)
+		goto out_free_conn;
+
 	/* This flag is ordinarily set by conn_ctrl_init() which cannot
 	 * be called for now.
 	 */
@@ -55,17 +57,16 @@ int quic_session_accept(struct connection *cli_conn)
 			goto out_free_conn;
 	}
 
+	if (conn_xprt_start(cli_conn) < 0)
+		goto out_free_conn;
+
 	sess = session_new(p, l, &cli_conn->obj_type);
 	if (!sess)
 		goto out_free_conn;
 
 	conn_set_owner(cli_conn, sess, NULL);
 
-	if (conn_complete_session(cli_conn) < 0)
-		goto out_free_sess;
-
-	if (conn_xprt_start(cli_conn) >= 0)
-		return 1;
+	return 1;
 
  out_free_sess:
 	/* prevent call to listener_release during session_free. It will be
@@ -79,7 +80,7 @@ int quic_session_accept(struct connection *cli_conn)
 	conn_free(cli_conn);
  out:
 
-	return -1;
+	return 0;
 }
 
 /*
@@ -92,35 +93,33 @@ static int new_quic_cli_conn(struct quic_conn *qc, struct listener *l,
                              struct sockaddr_storage *saddr)
 {
 	struct connection *cli_conn;
+	struct sockaddr_storage *dst;
 
+	dst = NULL;
 	if (unlikely((cli_conn = conn_new(&l->obj_type)) == NULL))
 		goto out;
 
-	if (!sockaddr_alloc(&cli_conn->dst, saddr, sizeof *saddr))
+	if (!sockaddr_alloc(&dst, saddr, sizeof *saddr))
 		goto out_free_conn;
 
-	cli_conn->flags |= CO_FL_ADDR_TO_SET;
 	qc->conn = cli_conn;
 	cli_conn->qc = qc;
 
+	cli_conn->dst = dst;
 	cli_conn->handle.fd = l->rx.fd;
+	cli_conn->flags |= CO_FL_ADDR_FROM_SET;
 	cli_conn->target = &l->obj_type;
 
 	/* XXX Should not be there. */
 	l->accept = quic_session_accept;
-	/* We need the xprt context before accepting (->accept()) the connection:
-	 * we may receive packet before this connection acception.
-	 */
-	if (conn_prepare(cli_conn, l->rx.proto, l->bind_conf->xprt) < 0)
-		goto out_free_conn;
 
 	return 1;
 
  out_free_conn:
-	qc->conn = NULL;
 	conn_stop_tracking(cli_conn);
 	conn_xprt_close(cli_conn);
 	conn_free(cli_conn);
+	qc->conn = NULL;
  out:
 
 	return 0;
@@ -142,16 +141,39 @@ struct connection *quic_sock_accept_conn(struct listener *l, int *status)
 {
 	struct quic_conn *qc;
 	struct quic_rx_packet *pkt;
-	int ret;
+	struct quic_cid *odcid;
+	int ret, ipv4;
 
 	qc = NULL;
-	pkt = MT_LIST_POP(&l->rx.pkts, struct quic_rx_packet *, rx_list);
+	pkt = LIST_ELEM(l->rx.qpkts.n, struct quic_rx_packet *, rx_list);
 	/* Should never happen. */
-	if (!pkt)
+	if (&pkt->rx_list == &l->rx.qpkts)
 		goto err;
 
 	qc = pkt->qc;
+	LIST_DELETE(&pkt->rx_list);
 	if (!new_quic_cli_conn(qc, l, &pkt->saddr))
+		goto err;
+
+	ipv4 = pkt->saddr.ss_family == AF_INET;
+	if (!qc_new_conn_init(qc, ipv4, &l->rx.odcids, &l->rx.cids,
+	                      pkt->dcid.data, pkt->dcid.len,
+	                      pkt->scid.data, pkt->scid.len))
+		goto err;
+
+	odcid = &qc->params.original_destination_connection_id;
+	/* Copy the transport parameters. */
+	qc->params = l->bind_conf->quic_params;
+	/* Copy original_destination_connection_id transport parameter. */
+	memcpy(odcid->data, &pkt->dcid, pkt->odcid_len);
+	odcid->len = pkt->odcid_len;
+	/* Copy the initial source connection ID. */
+	quic_cid_cpy(&qc->params.initial_source_connection_id, &qc->scid);
+	qc->enc_params_len =
+		quic_transport_params_encode(qc->enc_params,
+		                             qc->enc_params + sizeof qc->enc_params,
+		                             &qc->params, 1);
+	if (!qc->enc_params_len)
 		goto err;
 
 	ret = CO_AC_DONE;
@@ -173,53 +195,32 @@ struct connection *quic_sock_accept_conn(struct listener *l, int *status)
 void quic_sock_fd_iocb(int fd)
 {
 	ssize_t ret;
-	struct rxbuf *rxbuf;
 	struct buffer *buf;
 	struct listener *l = objt_listener(fdtab[fd].owner);
-	struct quic_transport_params *params;
 	/* Source address */
 	struct sockaddr_storage saddr = {0};
-	size_t max_sz;
 	socklen_t saddrlen;
 
-	BUG_ON(!l);
-
 	if (!l)
-		return;
+		ABORT_NOW();
 
 	if (!(fdtab[fd].state & FD_POLL_IN) || !fd_recv_ready(fd))
 		return;
 
-	rxbuf = MT_LIST_POP(&l->rx.rxbuf_list, typeof(rxbuf), mt_list);
-	if (!rxbuf)
-		goto out;
-	buf = &rxbuf->buf;
-
-	params = &l->bind_conf->quic_params;
-	max_sz = params->max_udp_payload_size;
-	if (b_contig_space(buf) < max_sz) {
-		/* Note that when we enter this function, <buf> is always empty */
-		b_reset(buf);
-		if (b_contig_space(buf) < max_sz)
-			goto out;
-	}
-
+	buf = get_trash_chunk();
 	saddrlen = sizeof saddr;
 	do {
-		ret = recvfrom(fd, b_tail(buf), max_sz, 0,
+		ret = recvfrom(fd, buf->area, buf->size, 0,
 		               (struct sockaddr *)&saddr, &saddrlen);
 		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
 			if (errno == EAGAIN)
 				fd_cant_recv(fd);
-			goto out;
+			return;
 		}
 	} while (0);
 
-	b_add(buf, ret);
-	quic_lstnr_dgram_read(buf, ret, l, &saddr);
-	b_del(buf, ret);
- out:
-	MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->mt_list);
+	buf->data = ret;
+	quic_lstnr_dgram_read(buf->area, buf->data, l, &saddr);
 }

@@ -176,18 +176,15 @@ ssize_t dns_recv_nameserver(struct dns_nameserver *ns, void *data, size_t size)
 			ds->rx_msg.len = 0;
 
 			/* This barrier is here to ensure that all data is
-			 * stored if the appctx detect the elem is out of the
-			 * list.
-			 */
+			 * stored if the appctx detect the elem is out of the list */
 			__ha_barrier_store();
 
 			LIST_DEL_INIT(&ds->waiter);
 
 			if (ds->appctx) {
 				/* This second barrier is here to ensure that
-				 * the waked up appctx won't miss that the elem
-				 * is removed from the list.
-				 */
+				 * the waked up appctx won't miss that the
+				 * elem is removed from the list */
 				__ha_barrier_store();
 
 				/* awake appctx because it may have other
@@ -616,7 +613,6 @@ static void dns_session_io_handler(struct appctx *appctx)
 	if (ret) {
 		/* let's be woken up once new request to write arrived */
 		HA_RWLOCK_WRLOCK(DNS_LOCK, &ring->lock);
-		BUG_ON(LIST_INLIST(&appctx->wait_entry));
 		LIST_APPEND(&ring->waiters, &appctx->wait_entry);
 		HA_RWLOCK_WRUNLOCK(DNS_LOCK, &ring->lock);
 		si_rx_endp_done(si);
@@ -629,9 +625,8 @@ read:
 	 * Note: we need a load barrier here to not miss the
 	 * delete from the list
 	 */
-
 	__ha_barrier_load();
-	if (!LIST_INLIST_ATOMIC(&ds->waiter)) {
+	if (!LIST_INLIST(&ds->waiter)) {
 		while (1) {
 			uint16_t query_id;
 			struct eb32_node *eb;
@@ -706,15 +701,16 @@ read:
 			pool_free(dns_query_pool, query);
 			ds->onfly_queries--;
 
+			/* lock the dns_stream_server containing lists heads */
+			HA_SPIN_LOCK(DNS_LOCK, &ds->dss->lock);
+
 			/* the dns_session is also added in queue of the
 			 * wait_sess list where the task processing
 			 * response will pop available responses
 			 */
-			HA_SPIN_LOCK(DNS_LOCK, &ds->dss->lock);
-
-			BUG_ON(LIST_INLIST(&ds->waiter));
 			LIST_APPEND(&ds->dss->wait_sess, &ds->waiter);
 
+			/* lock the dns_stream_server containing lists heads */
 			HA_SPIN_UNLOCK(DNS_LOCK, &ds->dss->lock);
 
 			/* awake the task processing the responses */
@@ -731,6 +727,7 @@ read:
 		}
 
 	}
+
 
 	return;
 close:
@@ -761,24 +758,11 @@ void dns_session_free(struct dns_session *ds)
 
 	dns_queries_flush(ds);
 
-	/* Ensure to remove this session from external lists
-	 * Note: we are under the lock of dns_stream_server
-	 * which own the heads of those lists.
-	 */
-	LIST_DEL_INIT(&ds->waiter);
-	LIST_DEL_INIT(&ds->list);
-
 	ds->dss->cur_conns--;
 	/* Note: this is useless to update
 	 * max_active_conns here because
 	 * we decrease the value
 	 */
-
-	BUG_ON(!LIST_ISEMPTY(&ds->list));
-	BUG_ON(!LIST_ISEMPTY(&ds->waiter));
-	BUG_ON(!LIST_ISEMPTY(&ds->queries));
-	BUG_ON(!LIST_ISEMPTY(&ds->ring.waiters));
-	BUG_ON(!eb_is_empty(&ds->query_ids));
 	pool_free(dns_session_pool, ds);
 }
 
@@ -794,14 +778,6 @@ static void dns_session_release(struct appctx *appctx)
 
 	if (!ds)
 		return;
-
-	/* We do not call ring_appctx_detach here
-	 * because we want to keep readers counters
-	 * to retry a conn with a different appctx.
-	 */
-	HA_RWLOCK_WRLOCK(DNS_LOCK, &ds->ring.lock);
-	LIST_DEL_INIT(&appctx->wait_entry);
-	HA_RWLOCK_WRUNLOCK(DNS_LOCK, &ds->ring.lock);
 
 	dss = ds->dss;
 
@@ -835,6 +811,13 @@ static void dns_session_release(struct appctx *appctx)
 		HA_SPIN_UNLOCK(DNS_LOCK, &dss->lock);
 		return;
 	}
+
+	/* We do not call ring_appctx_detach here
+	 * because we want to keep readers counters
+	 * to retry a con with a different appctx*/
+	HA_RWLOCK_WRLOCK(DNS_LOCK, &ds->ring.lock);
+	LIST_DEL_INIT(&appctx->wait_entry);
+	HA_RWLOCK_WRUNLOCK(DNS_LOCK, &ds->ring.lock);
 
 	/* if there is no pending complete response
 	 * message, ensure to reset
@@ -890,7 +873,7 @@ static struct appctx *dns_session_create(struct dns_session *ds)
 	struct stream *s;
 	struct applet *applet = &dns_session_applet;
 
-	appctx = appctx_new(applet);
+	appctx = appctx_new(applet, tid_bit);
 	if (!appctx)
 		goto out_close;
 
@@ -909,7 +892,7 @@ static struct appctx *dns_session_create(struct dns_session *ds)
 
 
 	s->target = &ds->dss->srv->obj_type;
-	if (!sockaddr_alloc(&s->si[1].dst, &ds->dss->srv->addr, sizeof(ds->dss->srv->addr)))
+	if (!sockaddr_alloc(&s->target_addr, &ds->dss->srv->addr, sizeof(ds->dss->srv->addr)))
 		goto out_free_strm;
 	s->flags = SF_ASSIGNED|SF_ADDR_SET;
 	s->si[1].flags |= SI_FL_NOLINGER;
@@ -1044,7 +1027,7 @@ struct dns_session *dns_session_new(struct dns_stream_server *dss)
 	/* never fail because it is the first watcher attached to the ring */
 	DISGUISE(ring_attach(&ds->ring));
 
-	if ((ds->task_exp = task_new_here()) == NULL)
+	if ((ds->task_exp = task_new(tid_bit)) == NULL)
 		goto error;
 
 	ds->task_exp->process = dns_process_query_exp;
@@ -1240,7 +1223,7 @@ int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
 		goto out;
 	}
 	/* Create the task associated to the resolver target handling conns */
-	if ((dss->task_req = task_new_anywhere()) == NULL) {
+	if ((dss->task_req = task_new(MAX_THREADS_MASK)) == NULL) {
 		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
 		goto out;
 	}
@@ -1257,7 +1240,7 @@ int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
 	}
 
 	/* Create the task associated to the resolver target handling conns */
-	if ((dss->task_rsp = task_new_anywhere()) == NULL) {
+	if ((dss->task_rsp = task_new(MAX_THREADS_MASK)) == NULL) {
 		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
 		goto out;
 	}
@@ -1267,7 +1250,7 @@ int dns_stream_init(struct dns_nameserver *ns, struct server *srv)
 	dss->task_rsp->context = ns;
 
 	/* Create the task associated to the resolver target handling conns */
-	if ((dss->task_idle = task_new_anywhere()) == NULL) {
+	if ((dss->task_idle = task_new(MAX_THREADS_MASK)) == NULL) {
 		ha_alert("memory allocation error initializing the ring for dns tcp server '%s'.\n", srv->id);
 		goto out;
 	}

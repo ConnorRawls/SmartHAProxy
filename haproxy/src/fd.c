@@ -88,13 +88,11 @@
 #endif
 
 #include <haproxy/api.h>
-#include <haproxy/activity.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
 #include <haproxy/log.h>
 #include <haproxy/port_range.h>
-#include <haproxy/ticks.h>
 #include <haproxy/tools.h>
 
 
@@ -437,7 +435,7 @@ int fd_update_events(int fd, uint evts)
 	uint new_flags, must_stop;
 	ulong rmask, tmask;
 
-	th_ctx->flags &= ~TH_FL_STUCK; // this thread is still running
+	ti->flags &= ~TI_FL_STUCK; // this thread is still running
 
 	/* do nothing if the FD was taken over under us */
 	do {
@@ -547,6 +545,7 @@ int fd_update_events(int fd, uint evts)
 ssize_t fd_write_frag_line(int fd, size_t maxlen, const struct ist pfx[], size_t npfx, const struct ist msg[], size_t nmsg, int nl)
 {
 	struct iovec iovec[32];
+	size_t totlen = 0;
 	size_t sent = 0;
 	int vec = 0;
 	int attempts = 0;
@@ -573,6 +572,7 @@ ssize_t fd_write_frag_line(int fd, size_t maxlen, const struct ist pfx[], size_t
 		iovec[vec].iov_base = pfx->ptr;
 		iovec[vec].iov_len  = MIN(maxlen, pfx->len);
 		maxlen -= iovec[vec].iov_len;
+		totlen += iovec[vec].iov_len;
 		if (iovec[vec].iov_len)
 			vec++;
 		pfx++; npfx--;
@@ -699,30 +699,6 @@ void my_closefrom(int start)
 		close(start++);
 }
 #endif // defined(USE_POLL)
-
-/* Computes the bounded poll() timeout based on the next expiration timer <next>
- * by bounding it to MAX_DELAY_MS. <next> may equal TICK_ETERNITY. The pollers
- * just needs to call this function right before polling to get their timeout
- * value. Timeouts that are already expired (possibly due to a pending event)
- * are accounted for in activity.poll_exp.
- */
-int compute_poll_timeout(int next)
-{
-	int wait_time;
-
-	if (!tick_isset(next))
-		wait_time = MAX_DELAY_MS;
-	else if (tick_is_expired(next, now_ms)) {
-		activity[tid].poll_exp++;
-		wait_time = 0;
-	}
-	else {
-		wait_time = TICKS_TO_MS(tick_remain(now_ms, next)) + 1;
-		if (wait_time > MAX_DELAY_MS)
-			wait_time = MAX_DELAY_MS;
-	}
-	return wait_time;
-}
 
 /* disable the specified poller */
 void disable_poller(const char *poller_name)

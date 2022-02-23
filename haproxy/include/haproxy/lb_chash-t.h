@@ -22,7 +22,8 @@
 #ifndef _HAPROXY_LB_CHASH_T_H
 #define _HAPROXY_LB_CHASH_T_H
 
-#include <import/ebtree-t.h>
+#include <import/eb32tree.h>
+#include <import/ebtree.h>
 
 struct lb_chash {
 	struct eb_root act;	/* weighted chash entries of active servers */

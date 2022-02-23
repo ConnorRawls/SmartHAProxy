@@ -27,28 +27,12 @@
 #include <haproxy/trace.h>
 #include <haproxy/xprt_quic.h>
 
-/* Initial salt depending on QUIC version to derive client/server initial secrets.
- * This one is for draft-29 QUIC version.
- */
-unsigned char initial_salt_draft_29[20] = {
-	0xaf, 0xbf, 0xec, 0x28, 0x99, 0x93, 0xd2, 0x4c,
-	0x9e, 0x97, 0x86, 0xf1, 0x9c, 0x61, 0x11, 0xe0,
-	0x43, 0x90, 0xa8, 0x99
-};
-
-unsigned char initial_salt_v1[20] = {
-	0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3,
-	0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
-	0xcc, 0xbb, 0x7f, 0x0a
-};
-
 void quic_tls_keys_hexdump(struct buffer *buf, struct quic_tls_secrets *secs);
 
 void quic_tls_secret_hexdump(struct buffer *buf,
                              const unsigned char *secret, size_t secret_len);
 
 int quic_derive_initial_secret(const EVP_MD *md,
-                               const unsigned char *initial_salt, size_t initial_salt_sz,
                                unsigned char *initial_secret, size_t initial_secret_sz,
                                const unsigned char *secret, size_t secret_sz);
 
@@ -195,9 +179,9 @@ static inline char *quic_hdshk_state_str(const enum quic_handshake_state state)
 	case QUIC_HS_ST_SERVER_HANDSHAKE_FAILED:
 		return "SF";
 	case QUIC_HS_ST_COMPLETE:
-		return "HCP";
+		return "CP";
 	case QUIC_HS_ST_CONFIRMED:
-		return "HCF";
+		return "CF";
 	}
 
 	return NULL;
@@ -357,8 +341,6 @@ static inline int quic_tls_level_pkt_type(enum quic_tls_enc_level level)
 		return QUIC_PACKET_TYPE_0RTT;
 	case QUIC_TLS_ENC_LEVEL_HANDSHAKE:
 		return QUIC_PACKET_TYPE_HANDSHAKE;
-	case QUIC_TLS_ENC_LEVEL_APP:
-		return QUIC_PACKET_TYPE_SHORT;
 	default:
 		return -1;
 	}
@@ -377,13 +359,10 @@ static inline int quic_get_tls_enc_levels(enum quic_tls_enc_level *level,
 		break;
 	case QUIC_HS_ST_SERVER_HANDSHAKE:
 	case QUIC_HS_ST_CLIENT_HANDSHAKE:
-		*level = QUIC_TLS_ENC_LEVEL_HANDSHAKE;
-		*next_level = QUIC_TLS_ENC_LEVEL_APP;
-		break;
 	case QUIC_HS_ST_COMPLETE:
 	case QUIC_HS_ST_CONFIRMED:
-		*level = QUIC_TLS_ENC_LEVEL_APP;
-		*next_level = QUIC_TLS_ENC_LEVEL_NONE;
+		*level = QUIC_TLS_ENC_LEVEL_HANDSHAKE;
+		*next_level = QUIC_TLS_ENC_LEVEL_APP;
 		break;
 	default:
 		return 0;
@@ -405,8 +384,7 @@ static inline void quic_tls_discard_keys(struct quic_enc_level *qel)
  * depending on <server> boolean value.
  * Return 1 if succeeded or 0 if not.
  */
-static inline int qc_new_isecs(struct quic_conn *qc,
-                               const unsigned char *salt, size_t salt_len,
+static inline int qc_new_isecs(struct connection *conn,
                                const unsigned char *cid, size_t cidlen, int server)
 {
 	unsigned char initial_secret[32];
@@ -417,11 +395,10 @@ static inline int qc_new_isecs(struct quic_conn *qc,
 	struct quic_tls_secrets *rx_ctx, *tx_ctx;
 	struct quic_tls_ctx *ctx;
 
-	TRACE_ENTER(QUIC_EV_CONN_ISEC);
-	ctx = &qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].tls_ctx;
+	TRACE_ENTER(QUIC_EV_CONN_ISEC, conn);
+	ctx = &conn->qc->els[QUIC_TLS_ENC_LEVEL_INITIAL].tls_ctx;
 	quic_initial_tls_ctx_init(ctx);
 	if (!quic_derive_initial_secret(ctx->rx.md,
-	                                salt, salt_len,
 	                                initial_secret, sizeof initial_secret,
 	                                cid, cidlen))
 		goto err;
@@ -450,12 +427,12 @@ static inline int qc_new_isecs(struct quic_conn *qc,
 		goto err;
 
 	tx_ctx->flags |= QUIC_FL_TLS_SECRETS_SET;
-	TRACE_LEAVE(QUIC_EV_CONN_ISEC, NULL, rx_init_sec, tx_init_sec);
+	TRACE_LEAVE(QUIC_EV_CONN_ISEC, conn, rx_init_sec, tx_init_sec);
 
 	return 1;
 
  err:
-	TRACE_DEVEL("leaving in error", QUIC_EV_CONN_ISEC);
+	TRACE_DEVEL("leaving in error", QUIC_EV_CONN_ISEC, conn);
 	return 0;
 }
 

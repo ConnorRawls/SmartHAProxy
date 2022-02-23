@@ -110,16 +110,15 @@ for CC in ["gcc", "clang"]:
     for ssl in [
         "stock",
         "OPENSSL_VERSION=1.0.2u",
-        "OPENSSL_VERSION=3.0.0",
+        "OPENSSL_VERSION=3.0.0-alpha17",
         "LIBRESSL_VERSION=2.9.2",
         "LIBRESSL_VERSION=3.3.3",
-        "QUICTLS=yes",
 #        "BORINGSSL=yes",
     ]:
         flags = ["USE_OPENSSL=1"]
-        if ssl == "BORINGSSL=yes" or ssl == "QUICTLS=yes":
+        if ssl == "BORINGSSL=yes":
             flags.append("USE_QUIC=1")
-        if "OPENSSL_VERSION=3.0.0" in ssl or ssl == "QUICTLS=yes":
+        if "OPENSSL_VERSION=3.0.0" in ssl:
             flags.append('DEBUG_CFLAGS="-g -Wno-deprecated-declarations"')
         if ssl != "stock":
             flags.append("SSL_LIB=${HOME}/opt/lib")

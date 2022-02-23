@@ -154,7 +154,6 @@ static enum act_parse_ret parse_set_req_line(const char **args, int *orig_arg, s
                                              struct act_rule *rule, char **err)
 {
 	int cur_arg = *orig_arg;
-	int cap = 0;
 
 	switch (args[0][4]) {
 	case 'm' :
@@ -187,11 +186,8 @@ static enum act_parse_ret parse_set_req_line(const char **args, int *orig_arg, s
 
 	LIST_INIT(&rule->arg.http.fmt);
 	px->conf.args.ctx = ARGC_HRQ;
-	if (px->cap & PR_CAP_FE)
-		cap |= SMP_VAL_FE_HRQ_HDR;
-	if (px->cap & PR_CAP_BE)
-		cap |= SMP_VAL_BE_HRQ_HDR;
-	if (!parse_logformat_string(args[cur_arg], px, &rule->arg.http.fmt, LOG_OPT_HTTP, cap, err)) {
+	if (!parse_logformat_string(args[cur_arg], px, &rule->arg.http.fmt, LOG_OPT_HTTP,
+	                            (px->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR, err)) {
 		return ACT_RET_PRS_ERR;
 	}
 
@@ -592,7 +588,6 @@ static enum act_parse_ret parse_replace_uri(const char **args, int *orig_arg, st
                                             struct act_rule *rule, char **err)
 {
 	int cur_arg = *orig_arg;
-	int cap = 0;
 	char *error = NULL;
 
 	switch (args[0][8]) {
@@ -627,11 +622,8 @@ static enum act_parse_ret parse_replace_uri(const char **args, int *orig_arg, st
 
 	LIST_INIT(&rule->arg.http.fmt);
 	px->conf.args.ctx = ARGC_HRQ;
-	if (px->cap & PR_CAP_FE)
-		cap |= SMP_VAL_FE_HRQ_HDR;
-	if (px->cap & PR_CAP_BE)
-		cap |= SMP_VAL_BE_HRQ_HDR;
-	if (!parse_logformat_string(args[cur_arg + 1], px, &rule->arg.http.fmt, LOG_OPT_HTTP, cap, err)) {
+	if (!parse_logformat_string(args[cur_arg + 1], px, &rule->arg.http.fmt, LOG_OPT_HTTP,
+	                            (px->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR, err)) {
 		regex_free(rule->arg.http.re);
 		return ACT_RET_PRS_ERR;
 	}
@@ -1486,7 +1478,7 @@ static enum act_return http_action_set_header(struct act_rule *rule, struct prox
 static enum act_parse_ret parse_http_set_header(const char **args, int *orig_arg, struct proxy *px,
 						   struct act_rule *rule, char **err)
 {
-	int cap = 0, cur_arg;
+	int cap, cur_arg;
 
 	if (args[*orig_arg-1][0] == 'e') {
 		rule->action = ACT_CUSTOM;
@@ -1514,17 +1506,11 @@ static enum act_parse_ret parse_http_set_header(const char **args, int *orig_arg
 
 	if (rule->from == ACT_F_HTTP_REQ) {
 		px->conf.args.ctx = ARGC_HRQ;
-		if (px->cap & PR_CAP_FE)
-			cap |= SMP_VAL_FE_HRQ_HDR;
-		if (px->cap & PR_CAP_BE)
-			cap |= SMP_VAL_BE_HRQ_HDR;
+		cap = (px->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR;
 	}
 	else{
 		px->conf.args.ctx =  ARGC_HRS;
-		if (px->cap & PR_CAP_FE)
-			cap |= SMP_VAL_FE_HRS_HDR;
-		if (px->cap & PR_CAP_BE)
-			cap |= SMP_VAL_BE_HRS_HDR;
+		cap = (px->cap & PR_CAP_BE) ? SMP_VAL_BE_HRS_HDR : SMP_VAL_FE_HRS_HDR;
 	}
 
 	cur_arg++;
@@ -1602,7 +1588,7 @@ static enum act_return http_action_replace_header(struct act_rule *rule, struct 
 static enum act_parse_ret parse_http_replace_header(const char **args, int *orig_arg, struct proxy *px,
 						    struct act_rule *rule, char **err)
 {
-	int cap = 0, cur_arg;
+	int cap, cur_arg;
 
 	if (args[*orig_arg-1][8] == 'h')
 		rule->action = 0; // replace-header
@@ -1629,17 +1615,11 @@ static enum act_parse_ret parse_http_replace_header(const char **args, int *orig
 
 	if (rule->from == ACT_F_HTTP_REQ) {
 		px->conf.args.ctx = ARGC_HRQ;
-		if (px->cap & PR_CAP_FE)
-			cap |= SMP_VAL_FE_HRQ_HDR;
-		if (px->cap & PR_CAP_BE)
-			cap |= SMP_VAL_BE_HRQ_HDR;
+		cap = (px->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR;
 	}
 	else{
 		px->conf.args.ctx =  ARGC_HRS;
-		if (px->cap & PR_CAP_FE)
-			cap |= SMP_VAL_FE_HRS_HDR;
-		if (px->cap & PR_CAP_BE)
-			cap |= SMP_VAL_BE_HRS_HDR;
+		cap = (px->cap & PR_CAP_BE) ? SMP_VAL_BE_HRS_HDR : SMP_VAL_FE_HRS_HDR;
 	}
 
 	cur_arg++;
@@ -1920,7 +1900,7 @@ static void release_http_map(struct act_rule *rule)
 static enum act_parse_ret parse_http_set_map(const char **args, int *orig_arg, struct proxy *px,
 					     struct act_rule *rule, char **err)
 {
-	int cap = 0, cur_arg;
+	int cap, cur_arg;
 
 	if (args[*orig_arg-1][0] == 'a') // add-acl
 		rule->action = 0;
@@ -1957,17 +1937,11 @@ static enum act_parse_ret parse_http_set_map(const char **args, int *orig_arg, s
 
 	if (rule->from == ACT_F_HTTP_REQ) {
 		px->conf.args.ctx = ARGC_HRQ;
-		if (px->cap & PR_CAP_FE)
-			cap |= SMP_VAL_FE_HRQ_HDR;
-		if (px->cap & PR_CAP_BE)
-			cap |= SMP_VAL_BE_HRQ_HDR;
+		cap = (px->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR;
 	}
 	else{
 		px->conf.args.ctx =  ARGC_HRS;
-		if (px->cap & PR_CAP_FE)
-			cap |= SMP_VAL_FE_HRS_HDR;
-		if (px->cap & PR_CAP_BE)
-			cap |= SMP_VAL_BE_HRS_HDR;
+		cap = (px->cap & PR_CAP_BE) ? SMP_VAL_BE_HRS_HDR : SMP_VAL_FE_HRS_HDR;
 	}
 
 	/* key pattern */

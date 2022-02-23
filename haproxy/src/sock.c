@@ -26,7 +26,6 @@
 #include <net/if.h>
 
 #include <haproxy/api.h>
-#include <haproxy/activity.h>
 #include <haproxy/connection.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
@@ -74,7 +73,7 @@ struct connection *sock_accept_conn(struct listener *l, int *status)
 	    (((cfd = accept4(l->rx.fd, (struct sockaddr*)addr, &laddr,
 	                     SOCK_NONBLOCK | (master ? SOCK_CLOEXEC : 0))) == -1) &&
 	     (errno == ENOSYS || errno == EINVAL || errno == EBADF) &&
-	     ((accept4_broken = 1))))
+	     (accept4_broken = 1)))
 #endif
 	{
 		laddr = sizeof(*conn->src);
@@ -545,7 +544,7 @@ int sock_find_compatible_fd(const struct receiver *rx)
 	if (!rx->proto->fam->addrcmp)
 		return -1;
 
-	if (rx->proto->proto_type == PROTO_TYPE_DGRAM)
+	if (rx->proto->sock_type == SOCK_DGRAM)
 		options |= SOCK_XFER_OPT_DGRAM;
 
 	if (rx->settings->options & RX_O_FOREIGN)
@@ -836,7 +835,7 @@ int sock_drain(struct connection *conn)
 	if (fdtab[fd].state & (FD_POLL_ERR|FD_POLL_HUP))
 		goto shut;
 
-	if (!(conn->flags & CO_FL_WANT_DRAIN) && !fd_recv_ready(fd))
+	if (!fd_recv_ready(fd))
 		return 0;
 
 	/* no drain function defined, use the generic one */

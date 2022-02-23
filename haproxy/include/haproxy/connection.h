@@ -28,13 +28,14 @@
 #include <haproxy/buf.h>
 #include <haproxy/connection-t.h>
 #include <haproxy/fd.h>
-#include <haproxy/list.h>
+#include <haproxy/http_ana.h>
 #include <haproxy/listener-t.h>
 #include <haproxy/obj_type.h>
-#include <haproxy/pool-t.h>
-#include <haproxy/server.h>
-#include <haproxy/session-t.h>
+#include <haproxy/pool.h>
+#include <haproxy/session.h>
 #include <haproxy/task-t.h>
+#include <haproxy/tcpcheck-t.h>
+
 
 extern struct pool_head *pool_head_connection;
 extern struct pool_head *pool_head_connstream;
@@ -51,6 +52,8 @@ extern struct mux_stopping_data mux_stopping_data[MAX_THREADS];
 /* receive a PROXY protocol header over a connection */
 int conn_recv_proxy(struct connection *conn, int flag);
 int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm);
+int make_proxy_line_v1(char *buf, int buf_len, struct sockaddr_storage *src, struct sockaddr_storage *dst);
+int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connection *remote, struct stream *strm);
 
 int conn_append_debug_info(struct buffer *buf, const struct connection *conn, const char *pfx);
 
@@ -72,37 +75,6 @@ int conn_recv_socks4_proxy_response(struct connection *conn);
 
 /* If we delayed the mux creation because we were waiting for the handshake, do it now */
 int conn_create_mux(struct connection *conn);
-int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake);
-int conn_upgrade_mux_fe(struct connection *conn, void *ctx, struct buffer *buf,
-                        struct ist mux_proto, int mode);
-int conn_install_mux_fe(struct connection *conn, void *ctx);
-int conn_install_mux_be(struct connection *conn, void *ctx, struct session *sess,
-                        const struct mux_ops *force_mux_ops);
-int conn_install_mux_chk(struct connection *conn, void *ctx, struct session *sess);
-
-void conn_delete_from_tree(struct ebmb_node *node);
-
-void conn_init(struct connection *conn, void *target);
-struct connection *conn_new(void *target);
-void conn_free(struct connection *conn);
-struct conn_hash_node *conn_alloc_hash_node(struct connection *conn);
-struct sockaddr_storage *sockaddr_alloc(struct sockaddr_storage **sap, const struct sockaddr_storage *orig, socklen_t len);
-void sockaddr_free(struct sockaddr_storage **sap);
-void cs_free(struct conn_stream *cs);
-struct conn_stream *cs_new(struct connection *conn, void *target);
-
-
-/* connection hash stuff */
-uint64_t conn_calculate_hash(const struct conn_hash_params *params);
-uint64_t conn_hash_prehash(char *buf, size_t size);
-void conn_hash_update(char *buf, size_t *idx,
-                      const void *data, size_t size,
-                      enum conn_hash_params_t *flags,
-                      enum conn_hash_params_t type);
-uint64_t conn_hash_digest(char *buf, size_t bufsize,
-                          enum conn_hash_params_t flags);
-const char *conn_err_code_str(struct connection *c);
-int xprt_add_hs(struct connection *conn);
 
 extern struct idle_conns idle_conns[MAX_THREADS];
 
@@ -173,8 +145,6 @@ static inline void conn_ctrl_init(struct connection *conn)
 static inline void conn_ctrl_close(struct connection *conn)
 {
 	if (!conn->xprt && (conn->flags & CO_FL_CTRL_READY)) {
-		if ((conn->flags & (CO_FL_WANT_DRAIN | CO_FL_SOCK_RD_SH)) == CO_FL_WANT_DRAIN)
-			conn_ctrl_drain(conn);
 		conn->flags &= ~CO_FL_CTRL_READY;
 		if (conn->ctrl->ctrl_close)
 			conn->ctrl->ctrl_close(conn);
@@ -246,11 +216,84 @@ static inline void conn_xprt_shutw_hard(struct connection *c)
 		c->xprt->shutw(c, c->xprt_ctx, 0);
 }
 
+/* This is used at the end of the socket IOCB to possibly create the mux if it
+ * was not done yet, or wake it up if flags changed compared to old_flags or if
+ * need_wake insists on this. It returns <0 if the connection was destroyed and
+ * must not be used, >=0 otherwise.
+ */
+static inline int conn_notify_mux(struct connection *conn, int old_flags, int forced_wake)
+{
+	int ret = 0;
+
+	/* If we don't yet have a mux, that means we were waiting for
+	 * information to create one, typically from the ALPN. If we're
+	 * done with the handshake, attempt to create one.
+	 */
+	if (unlikely(!conn->mux) && !(conn->flags & CO_FL_WAIT_XPRT)) {
+		ret = conn_create_mux(conn);
+		if (ret < 0)
+			goto done;
+	}
+
+	/* The wake callback is normally used to notify the data layer about
+	 * data layer activity (successful send/recv), connection establishment,
+	 * shutdown and fatal errors. We need to consider the following
+	 * situations to wake up the data layer :
+	 *  - change among the CO_FL_NOTIFY_DONE flags :
+	 *      SOCK_{RD,WR}_SH, ERROR,
+	 *  - absence of any of {L4,L6}_CONN and CONNECTED, indicating the
+	 *    end of handshake and transition to CONNECTED
+	 *  - raise of CONNECTED with HANDSHAKE down
+	 *  - end of HANDSHAKE with CONNECTED set
+	 *  - regular data layer activity
+	 *
+	 * One tricky case is the wake up on read0 or error on an idle
+	 * backend connection, that can happen on a connection that is still
+	 * polled while at the same moment another thread is about to perform a
+	 * takeover. The solution against this is to remove the connection from
+	 * the idle list if it was in it, and possibly reinsert it at the end
+	 * if the connection remains valid. The cost is non-null (locked tree
+	 * removal) but remains low given that this is extremely rarely called.
+	 * In any case it's guaranteed by the FD's thread_mask that we're
+	 * called from the same thread the connection is queued in.
+	 *
+	 * Note that the wake callback is allowed to release the connection and
+	 * the fd (and return < 0 in this case).
+	 */
+	if ((forced_wake ||
+	     ((conn->flags ^ old_flags) & CO_FL_NOTIFY_DONE) ||
+	     ((old_flags & CO_FL_WAIT_XPRT) && !(conn->flags & CO_FL_WAIT_XPRT))) &&
+	    conn->mux && conn->mux->wake) {
+		uint conn_in_list = conn->flags & CO_FL_LIST_MASK;
+		struct server *srv = objt_server(conn->target);
+
+		if (conn_in_list) {
+			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			conn_delete_from_tree(&conn->hash_node->node);
+			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+		}
+
+		ret = conn->mux->wake(conn);
+		if (ret < 0)
+			goto done;
+
+		if (conn_in_list) {
+			struct eb_root *root = (conn_in_list == CO_FL_SAFE_LIST) ?
+				&srv->per_thr[tid].safe_conns :
+				&srv->per_thr[tid].idle_conns;
+
+			HA_SPIN_LOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+			ebmb_insert(root, &conn->hash_node->node, sizeof(conn->hash_node->hash));
+			HA_SPIN_UNLOCK(IDLE_CONNS_LOCK, &idle_conns[tid].idle_conns_lock);
+		}
+	}
+ done:
+	return ret;
+}
+
 /* shut read */
 static inline void cs_shutr(struct conn_stream *cs, enum cs_shr_mode mode)
 {
-	if (cs->flags & CS_FL_SHR)
-		return;
 
 	/* clean data-layer shutdown */
 	if (cs->conn->mux && cs->conn->mux->shutr)
@@ -261,8 +304,6 @@ static inline void cs_shutr(struct conn_stream *cs, enum cs_shr_mode mode)
 /* shut write */
 static inline void cs_shutw(struct conn_stream *cs, enum cs_shw_mode mode)
 {
-	if (cs->flags & CS_FL_SHW)
-		return;
 
 	/* clean data-layer shutdown */
 	if (cs->conn->mux && cs->conn->mux->shutw)
@@ -275,6 +316,7 @@ static inline void cs_close(struct conn_stream *cs)
 {
 	cs_shutw(cs, CS_SHW_SILENT);
 	cs_shutr(cs, CS_SHR_RESET);
+	cs->flags = CS_FL_NONE;
 }
 
 /* completely close a conn_stream after draining possibly pending data (but do not detach it) */
@@ -282,6 +324,7 @@ static inline void cs_drain_and_close(struct conn_stream *cs)
 {
 	cs_shutw(cs, CS_SHW_SILENT);
 	cs_shutr(cs, CS_SHR_DRAIN);
+	cs->flags = CS_FL_NONE;
 }
 
 /* sets CS_FL_ERROR or CS_FL_ERR_PENDING on the cs */
@@ -341,6 +384,52 @@ static inline int conn_is_back(const struct connection *conn)
 	return !objt_listener(conn->target);
 }
 
+/* Initializes all required fields for a new connection. Note that it does the
+ * minimum acceptable initialization for a connection that already exists and
+ * is about to be reused. It also leaves the addresses untouched, which makes
+ * it usable across connection retries to reset a connection to a known state.
+ */
+static inline void conn_init(struct connection *conn, void *target)
+{
+	conn->obj_type = OBJ_TYPE_CONN;
+	conn->flags = CO_FL_NONE;
+	conn->mux = NULL;
+	conn->ctx = NULL;
+	conn->owner = NULL;
+	conn->send_proxy_ofs = 0;
+	conn->handle.fd = DEAD_FD_MAGIC;
+	conn->err_code = CO_ER_NONE;
+	conn->target = target;
+	conn->destroy_cb = NULL;
+	conn->proxy_netns = NULL;
+	MT_LIST_INIT(&conn->toremove_list);
+	if (conn_is_back(conn))
+		LIST_INIT(&conn->session_list);
+	else
+		LIST_INIT(&conn->stopping_list);
+	conn->subs = NULL;
+	conn->src = NULL;
+	conn->dst = NULL;
+	conn->proxy_authority = IST_NULL;
+	conn->proxy_unique_id = IST_NULL;
+	conn->qc = NULL;
+	conn->hash_node = NULL;
+	conn->xprt = NULL;
+}
+
+static inline struct conn_hash_node *conn_alloc_hash_node(struct connection *conn)
+{
+	struct conn_hash_node *hash_node = NULL;
+
+	hash_node = pool_zalloc(pool_head_conn_hash_node);
+	if (unlikely(!hash_node))
+		return NULL;
+
+	hash_node->conn = conn;
+
+	return hash_node;
+}
+
 /* sets <owner> as the connection's owner */
 static inline void conn_set_owner(struct connection *conn, void *owner, void (*cb)(struct connection *))
 {
@@ -358,6 +447,108 @@ static inline void conn_set_private(struct connection *conn)
 		if (obj_type(conn->target) == OBJ_TYPE_SERVER)
 			srv_release_conn(__objt_server(conn->target), conn);
 	}
+}
+
+/* Allocates a struct sockaddr from the pool if needed, assigns it to *sap and
+ * returns it. If <sap> is NULL, the address is always allocated and returned.
+ * if <sap> is non-null, an address will only be allocated if it points to a
+ * non-null pointer. In this case the allocated address will be assigned there.
+ * If <orig> is non-null and <len> positive, the address in <sa> will be copied
+ * into the allocated address. In both situations the new pointer is returned.
+ */
+static inline struct sockaddr_storage *
+sockaddr_alloc(struct sockaddr_storage **sap, const struct sockaddr_storage *orig, socklen_t len)
+{
+	struct sockaddr_storage *sa;
+
+	if (sap && *sap)
+		return *sap;
+
+	sa = pool_alloc(pool_head_sockaddr);
+	if (sa && orig && len > 0)
+		memcpy(sa, orig, len);
+	if (sap)
+		*sap = sa;
+	return sa;
+}
+
+/* Releases the struct sockaddr potentially pointed to by <sap> to the pool. It
+ * may be NULL or may point to NULL. If <sap> is not NULL, a NULL is placed
+ * there.
+ */
+static inline void sockaddr_free(struct sockaddr_storage **sap)
+{
+	if (!sap)
+		return;
+	pool_free(pool_head_sockaddr, *sap);
+	*sap = NULL;
+}
+
+/* Tries to allocate a new connection and initialized its main fields. The
+ * connection is returned on success, NULL on failure. The connection must
+ * be released using pool_free() or conn_free().
+ */
+static inline struct connection *conn_new(void *target)
+{
+	struct connection *conn;
+	struct conn_hash_node *hash_node;
+
+	conn = pool_alloc(pool_head_connection);
+	if (unlikely(!conn))
+		return NULL;
+
+	conn_init(conn, target);
+
+	if (conn_is_back(conn)) {
+		if (obj_type(target) == OBJ_TYPE_SERVER)
+			srv_use_conn(__objt_server(target), conn);
+
+		hash_node = conn_alloc_hash_node(conn);
+		if (unlikely(!hash_node)) {
+			pool_free(pool_head_connection, conn);
+			return NULL;
+		}
+
+		conn->hash_node = hash_node;
+	}
+
+	return conn;
+}
+
+/* Releases a conn_stream previously allocated by cs_new(), as well as any
+ * buffer it would still hold.
+ */
+static inline void cs_free(struct conn_stream *cs)
+{
+
+	pool_free(pool_head_connstream, cs);
+}
+
+/* Tries to allocate a new conn_stream and initialize its main fields. If
+ * <conn> is NULL, then a new connection is allocated on the fly, initialized,
+ * and assigned to cs->conn ; this connection will then have to be released
+ * using pool_free() or conn_free(). The conn_stream is initialized and added
+ * to the mux's stream list on success, then returned. On failure, nothing is
+ * allocated and NULL is returned.
+ */
+static inline struct conn_stream *cs_new(struct connection *conn, void *target)
+{
+	struct conn_stream *cs;
+
+	cs = pool_alloc(pool_head_connstream);
+	if (unlikely(!cs))
+		return NULL;
+
+	if (!conn) {
+		conn = conn_new(target);
+		if (unlikely(!conn)) {
+			cs_free(cs);
+			return NULL;
+		}
+	}
+
+	cs_init(cs, conn);
+	return cs;
 }
 
 /* Retrieves any valid conn_stream from this connection, preferably the first
@@ -384,6 +575,50 @@ static inline void conn_force_unsubscribe(struct connection *conn)
 	conn->subs = NULL;
 }
 
+/* Releases a connection previously allocated by conn_new() */
+static inline void conn_free(struct connection *conn)
+{
+	/* If the connection is owned by the session, remove it from its list
+	 */
+	if (conn_is_back(conn) && LIST_INLIST(&conn->session_list)) {
+		session_unown_conn(conn->owner, conn);
+	}
+	else if (!(conn->flags & CO_FL_PRIVATE)) {
+		if (obj_type(conn->target) == OBJ_TYPE_SERVER)
+			srv_release_conn(__objt_server(conn->target), conn);
+	}
+
+	/* Remove the conn from toremove_list.
+	 *
+	 * This is needed to prevent a double-free in case the connection was
+	 * already scheduled from cleaning but is freed before via another
+	 * call.
+	 */
+	MT_LIST_DELETE(&conn->toremove_list);
+
+	sockaddr_free(&conn->src);
+	sockaddr_free(&conn->dst);
+
+	pool_free(pool_head_authority, istptr(conn->proxy_authority));
+	conn->proxy_authority = IST_NULL;
+
+	pool_free(pool_head_uniqueid, istptr(conn->proxy_unique_id));
+	conn->proxy_unique_id = IST_NULL;
+
+	pool_free(pool_head_conn_hash_node, conn->hash_node);
+	conn->hash_node = NULL;
+
+	/* By convention we always place a NULL where the ctx points to if the
+	 * mux is null. It may have been used to store the connection as a
+	 * stream_interface's end point for example.
+	 */
+	if (conn->ctx != NULL && conn->mux == NULL)
+		*(void **)conn->ctx = NULL;
+
+	conn_force_unsubscribe(conn);
+	pool_free(pool_head_connection, conn);
+}
+
 /* Release a conn_stream */
 static inline void cs_destroy(struct conn_stream *cs)
 {
@@ -408,22 +643,6 @@ static inline void cs_destroy(struct conn_stream *cs)
 static inline struct connection *cs_conn(const struct conn_stream *cs)
 {
 	return cs ? cs->conn : NULL;
-}
-
-/* Returns the source address of the connection or NULL if not set */
-static inline const struct sockaddr_storage *conn_src(struct connection *conn)
-{
-	if (conn->flags & CO_FL_ADDR_FROM_SET)
-		return conn->src;
-	return NULL;
-}
-
-/* Returns the destination address of the connection or NULL if not set */
-static inline const struct sockaddr_storage *conn_dst(struct connection *conn)
-{
-	if (conn->flags & CO_FL_ADDR_TO_SET)
-		return conn->dst;
-	return NULL;
 }
 
 /* Retrieves the connection's original source address. Returns non-zero on
@@ -507,7 +726,8 @@ static inline void conn_set_mark(const struct connection *conn, int mark)
 #if defined(SO_MARK)
 	setsockopt(conn->handle.fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark));
 #elif defined(SO_USER_COOKIE)
-	setsockopt(conn->handle.fd, SOL_SOCKET, SO_USER_COOKIE, &mark, sizeof(mark));
+	uint32_t mval = (uint32_t)mark;
+	setsockopt(conn->handle.fd, SOL_SOCKET, SO_USER_COOKIE, &mval, sizeof(mval));
 #elif defined(SO_RTABLE)
 	setsockopt(conn->handle.fd, SOL_SOCKET, SO_RTABLE, &mark, sizeof(mark));
 #endif
@@ -560,7 +780,63 @@ static inline int conn_install_mux(struct connection *conn, const struct mux_ops
 	return ret;
 }
 
-int conn_update_alpn(struct connection *conn, const struct ist alpn, int force);
+/* returns a human-readable error code for conn->err_code, or NULL if the code
+ * is unknown.
+ */
+static inline const char *conn_err_code_str(struct connection *c)
+{
+	switch (c->err_code) {
+	case CO_ER_NONE:          return "Success";
+
+	case CO_ER_CONF_FDLIM:    return "Reached configured maxconn value";
+	case CO_ER_PROC_FDLIM:    return "Too many sockets on the process";
+	case CO_ER_SYS_FDLIM:     return "Too many sockets on the system";
+	case CO_ER_SYS_MEMLIM:    return "Out of system buffers";
+	case CO_ER_NOPROTO:       return "Protocol or address family not supported";
+	case CO_ER_SOCK_ERR:      return "General socket error";
+	case CO_ER_PORT_RANGE:    return "Source port range exhausted";
+	case CO_ER_CANT_BIND:     return "Can't bind to source address";
+	case CO_ER_FREE_PORTS:    return "Out of local source ports on the system";
+	case CO_ER_ADDR_INUSE:    return "Local source address already in use";
+
+	case CO_ER_PRX_EMPTY:     return "Connection closed while waiting for PROXY protocol header";
+	case CO_ER_PRX_ABORT:     return "Connection error while waiting for PROXY protocol header";
+	case CO_ER_PRX_TIMEOUT:   return "Timeout while waiting for PROXY protocol header";
+	case CO_ER_PRX_TRUNCATED: return "Truncated PROXY protocol header received";
+	case CO_ER_PRX_NOT_HDR:   return "Received something which does not look like a PROXY protocol header";
+	case CO_ER_PRX_BAD_HDR:   return "Received an invalid PROXY protocol header";
+	case CO_ER_PRX_BAD_PROTO: return "Received an unhandled protocol in the PROXY protocol header";
+
+	case CO_ER_CIP_EMPTY:     return "Connection closed while waiting for NetScaler Client IP header";
+	case CO_ER_CIP_ABORT:     return "Connection error while waiting for NetScaler Client IP header";
+	case CO_ER_CIP_TIMEOUT:   return "Timeout while waiting for a NetScaler Client IP header";
+	case CO_ER_CIP_TRUNCATED: return "Truncated NetScaler Client IP header received";
+	case CO_ER_CIP_BAD_MAGIC: return "Received an invalid NetScaler Client IP magic number";
+	case CO_ER_CIP_BAD_PROTO: return "Received an unhandled protocol in the NetScaler Client IP header";
+
+	case CO_ER_SSL_EMPTY:     return "Connection closed during SSL handshake";
+	case CO_ER_SSL_ABORT:     return "Connection error during SSL handshake";
+	case CO_ER_SSL_TIMEOUT:   return "Timeout during SSL handshake";
+	case CO_ER_SSL_TOO_MANY:  return "Too many SSL connections";
+	case CO_ER_SSL_NO_MEM:    return "Out of memory when initializing an SSL connection";
+	case CO_ER_SSL_RENEG:     return "Rejected a client-initiated SSL renegotiation attempt";
+	case CO_ER_SSL_CA_FAIL:   return "SSL client CA chain cannot be verified";
+	case CO_ER_SSL_CRT_FAIL:  return "SSL client certificate not trusted";
+	case CO_ER_SSL_MISMATCH:  return "Server presented an SSL certificate different from the configured one";
+	case CO_ER_SSL_MISMATCH_SNI: return "Server presented an SSL certificate different from the expected one";
+	case CO_ER_SSL_HANDSHAKE: return "SSL handshake failure";
+	case CO_ER_SSL_HANDSHAKE_HB: return "SSL handshake failure after heartbeat";
+	case CO_ER_SSL_KILLED_HB: return "Stopped a TLSv1 heartbeat attack (CVE-2014-0160)";
+	case CO_ER_SSL_NO_TARGET: return "Attempt to use SSL on an unknown target (internal error)";
+	case CO_ER_SSL_EARLY_FAILED: return "Server refused early data";
+
+	case CO_ER_SOCKS4_SEND:    return "SOCKS4 Proxy write error during handshake";
+	case CO_ER_SOCKS4_RECV:    return "SOCKS4 Proxy read error during handshake";
+	case CO_ER_SOCKS4_DENY:    return "SOCKS4 Proxy deny the request";
+	case CO_ER_SOCKS4_ABORT:   return "SOCKS4 Proxy handshake aborted by server";
+	}
+	return NULL;
+}
 
 static inline const char *conn_get_ctrl_name(const struct connection *conn)
 {
@@ -604,6 +880,41 @@ static inline struct xprt_ops *xprt_get(int id)
 	if (id >= XPRT_ENTRIES)
 		return NULL;
 	return registered_xprt[id];
+}
+
+/* Try to add a handshake pseudo-XPRT. If the connection's first XPRT is
+ * raw_sock, then just use the new XPRT as the connection XPRT, otherwise
+ * call the xprt's add_xprt() method.
+ * Returns 0 on success, or non-zero on failure.
+ */
+static inline int xprt_add_hs(struct connection *conn)
+{
+	void *xprt_ctx = NULL;
+	const struct xprt_ops *ops = xprt_get(XPRT_HANDSHAKE);
+	void *nextxprt_ctx = NULL;
+	const struct xprt_ops *nextxprt_ops = NULL;
+
+	if (conn->flags & CO_FL_ERROR)
+		return -1;
+	if (ops->init(conn, &xprt_ctx) < 0)
+		return -1;
+	if (conn->xprt == xprt_get(XPRT_RAW)) {
+		nextxprt_ctx = conn->xprt_ctx;
+		nextxprt_ops = conn->xprt;
+		conn->xprt_ctx = xprt_ctx;
+		conn->xprt = ops;
+	} else {
+		if (conn->xprt->add_xprt(conn, conn->xprt_ctx, xprt_ctx, ops,
+		                         &nextxprt_ctx, &nextxprt_ops) != 0) {
+			ops->close(conn, xprt_ctx);
+			return -1;
+		}
+	}
+	if (ops->add_xprt(conn, xprt_ctx, nextxprt_ctx, nextxprt_ops, NULL, NULL) != 0) {
+		ops->close(conn, xprt_ctx);
+		return -1;
+	}
+	return 0;
 }
 
 /* notify the next xprt that the connection is about to become idle and that it
@@ -723,15 +1034,193 @@ static inline struct proxy *conn_get_proxy(const struct connection *conn)
 	return objt_proxy(conn->target);
 }
 
-
-/* boolean, returns true if connection is over SSL */
-static inline
-int conn_is_ssl(struct connection *conn)
+/* installs the best mux for incoming connection <conn> using the upper context
+ * <ctx>. If the mux protocol is forced, we use it to find the best
+ * mux. Otherwise we use the ALPN name, if any. Returns < 0 on error.
+ */
+static inline int conn_install_mux_fe(struct connection *conn, void *ctx)
 {
-	if (!conn || conn->xprt != xprt_get(XPRT_SSL) || !conn->xprt_ctx)
+	struct bind_conf     *bind_conf = __objt_listener(conn->target)->bind_conf;
+	const struct mux_ops *mux_ops;
+
+	if (bind_conf->mux_proto)
+		mux_ops = bind_conf->mux_proto->mux;
+	else {
+		struct ist mux_proto;
+		const char *alpn_str = NULL;
+		int alpn_len = 0;
+		int mode;
+
+		if (bind_conf->frontend->mode == PR_MODE_HTTP)
+			mode = PROTO_MODE_HTTP;
+		else
+			mode = PROTO_MODE_TCP;
+
+		conn_get_alpn(conn, &alpn_str, &alpn_len);
+		mux_proto = ist2(alpn_str, alpn_len);
+		mux_ops = conn_get_best_mux(conn, mux_proto, PROTO_SIDE_FE, mode);
+		if (!mux_ops)
+			return -1;
+	}
+	return conn_install_mux(conn, mux_ops, ctx, bind_conf->frontend, conn->owner);
+}
+
+/* installs the best mux for outgoing connection <conn> using the upper context
+ * <ctx>. If the mux protocol is forced, we use it to find the best mux. Returns
+ * < 0 on error.
+ */
+static inline int conn_install_mux_be(struct connection *conn, void *ctx, struct session *sess)
+{
+	struct server *srv = objt_server(conn->target);
+	struct proxy  *prx = objt_proxy(conn->target);
+	const struct mux_ops *mux_ops;
+
+	if (srv)
+		prx = srv->proxy;
+
+	if (!prx) // target must be either proxy or server
+		return -1;
+
+	if (srv && srv->mux_proto)
+		mux_ops = srv->mux_proto->mux;
+	else {
+		struct ist mux_proto;
+		const char *alpn_str = NULL;
+		int alpn_len = 0;
+		int mode;
+
+		if (prx->mode == PR_MODE_HTTP)
+			mode = PROTO_MODE_HTTP;
+		else
+			mode = PROTO_MODE_TCP;
+
+		conn_get_alpn(conn, &alpn_str, &alpn_len);
+		mux_proto = ist2(alpn_str, alpn_len);
+
+		mux_ops = conn_get_best_mux(conn, mux_proto, PROTO_SIDE_BE, mode);
+		if (!mux_ops)
+			return -1;
+	}
+	return conn_install_mux(conn, mux_ops, ctx, prx, sess);
+}
+
+/* installs the best mux for outgoing connection <conn> for a check using the
+ * upper context <ctx>. If the mux protocol is forced by the check, we use it to
+ * find the best mux. Returns < 0 on error.
+ */
+static inline int conn_install_mux_chk(struct connection *conn, void *ctx, struct session *sess)
+{
+	struct check *check = objt_check(sess->origin);
+	struct server *srv = objt_server(conn->target);
+	struct proxy *prx = objt_proxy(conn->target);
+	const struct mux_ops *mux_ops;
+
+	if (!check) // Check must be defined
+		return -1;
+
+	if (srv)
+		prx = srv->proxy;
+
+	if (!prx) // target must be either proxy or server
+		return -1;
+
+	if (check->mux_proto)
+		mux_ops = check->mux_proto->mux;
+	else {
+		struct ist mux_proto;
+		const char *alpn_str = NULL;
+		int alpn_len = 0;
+		int mode;
+
+		if ((check->tcpcheck_rules->flags & TCPCHK_RULES_PROTO_CHK) == TCPCHK_RULES_HTTP_CHK)
+			mode = PROTO_MODE_HTTP;
+		else
+			mode = PROTO_MODE_TCP;
+
+		conn_get_alpn(conn, &alpn_str, &alpn_len);
+		mux_proto = ist2(alpn_str, alpn_len);
+
+		mux_ops = conn_get_best_mux(conn, mux_proto, PROTO_SIDE_BE, mode);
+		if (!mux_ops)
+			return -1;
+	}
+	return conn_install_mux(conn, mux_ops, ctx, prx, sess);
+}
+
+/* Change the mux for the connection.
+ * The caller should make sure he's not subscribed to the underlying XPRT.
+ */
+static inline int conn_upgrade_mux_fe(struct connection *conn, void *ctx, struct buffer *buf,
+				      struct ist mux_proto, int mode)
+{
+	struct bind_conf *bind_conf = __objt_listener(conn->target)->bind_conf;
+	const struct mux_ops *old_mux, *new_mux;
+	void *old_mux_ctx;
+	const char *alpn_str = NULL;
+	int alpn_len = 0;
+
+	if (!mux_proto.len) {
+		conn_get_alpn(conn, &alpn_str, &alpn_len);
+		mux_proto = ist2(alpn_str, alpn_len);
+	}
+	new_mux = conn_get_best_mux(conn, mux_proto, PROTO_SIDE_FE, mode);
+	old_mux = conn->mux;
+
+	/* No mux found */
+	if (!new_mux)
+		return -1;
+
+	/* Same mux, nothing to do */
+	if (old_mux == new_mux)
 		return 0;
-	else
-		return 1;
+
+	old_mux_ctx = conn->ctx;
+	conn->mux = new_mux;
+	conn->ctx = ctx;
+	if (new_mux->init(conn, bind_conf->frontend, conn->owner, buf) == -1) {
+		/* The mux upgrade failed, so restore the old mux */
+		conn->ctx = old_mux_ctx;
+		conn->mux = old_mux;
+		return -1;
+	}
+
+	/* The mux was upgraded, destroy the old one */
+	*buf = BUF_NULL;
+	old_mux->destroy(old_mux_ctx);
+	return 0;
+}
+
+/* Generate the hash of a connection with params as input
+ * Each non-null field of params is taken into account for the hash calcul.
+ */
+XXH64_hash_t conn_calculate_hash(const struct conn_hash_params *params);
+
+static inline XXH64_hash_t conn_hash_prehash(char *buf, size_t size)
+{
+	return XXH64(buf, size, 0);
+}
+
+/* Append <data> into <buf> at <idx> offset in preparation for connection hash
+ * calcul. <idx> is incremented beyond data <size>. In the same time, <flags>
+ * are updated with <type> for the hash header.
+ */
+static inline void conn_hash_update(char *buf, size_t *idx,
+                                    const void *data, size_t size,
+                                    enum conn_hash_params_t *flags,
+                                    enum conn_hash_params_t type)
+{
+	memcpy(&buf[*idx], data, size);
+	*idx += size;
+	*flags |= type;
+}
+
+static inline XXH64_hash_t conn_hash_digest(char *buf, size_t bufsize,
+                                            enum conn_hash_params_t flags)
+{
+	const uint64_t flags_u64 = (uint64_t)flags;
+	const XXH64_hash_t hash = XXH64(buf, bufsize, 0);
+
+	return (flags_u64 << CONN_HASH_PAYLOAD_LEN) | CONN_HASH_GET_PAYLOAD(hash);
 }
 
 #endif /* _HAPROXY_CONNECTION_H */

@@ -19,7 +19,6 @@
 #include <haproxy/compression-t.h>
 #include <haproxy/connection.h>
 #include <haproxy/extcheck.h>
-#include <haproxy/http_ana.h>
 #include <haproxy/http_htx.h>
 #include <haproxy/http_rules.h>
 #include <haproxy/listener.h>
@@ -232,6 +231,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		rc = PR_CAP_BE | PR_CAP_LB;
 	else if (strcmp(args[0], "defaults") == 0) {
 		/* "defaults" must first delete the last no-name defaults if any */
+		proxy_destroy_defaults(proxy_find_by_name("", PR_CAP_DEF, 0));
 		curr_defproxy = NULL;
 		rc = PR_CAP_DEF | PR_CAP_LISTEN;
 	}
@@ -315,95 +315,12 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 					 file, linenum, *err, args[arg+1], curr_defproxy->conf.file, curr_defproxy->conf.line);
 				err_code |= ERR_ALERT | ERR_FATAL;
 			}
-			curr_defproxy->flags |= PR_FL_EXPLICIT_REF;
-		}
-		else if (curr_defproxy)
-			curr_defproxy->flags |= PR_FL_IMPLICIT_REF;
-
-		if (curr_defproxy && (curr_defproxy->flags & (PR_FL_EXPLICIT_REF|PR_FL_IMPLICIT_REF)) == (PR_FL_EXPLICIT_REF|PR_FL_IMPLICIT_REF)) {
-			ha_alert("parsing [%s:%d] : defaults section '%s' (declared at %s:%d) is explicitly referenced by another proxy and implicitly used here."
-				 " To avoid any ambiguity don't mix both usage. Add a last defaults section not explicitly used or always use explicit references.\n",
-				 file, linenum, curr_defproxy->id, curr_defproxy->conf.file, curr_defproxy->conf.line);
-			err_code |= ERR_WARN;
 		}
 
 		curproxy = parse_new_proxy(name, rc, file, linenum, curr_defproxy);
 		if (!curproxy) {
 			err_code |= ERR_ALERT | ERR_ABORT;
 			goto out;
-		}
-
-		if (curr_defproxy && (!LIST_ISEMPTY(&curr_defproxy->http_req_rules)        ||
-				      !LIST_ISEMPTY(&curr_defproxy->http_res_rules)        ||
-				      !LIST_ISEMPTY(&curr_defproxy->http_after_res_rules)  ||
-				      !LIST_ISEMPTY(&curr_defproxy->tcp_req.l4_rules)      ||
-				      !LIST_ISEMPTY(&curr_defproxy->tcp_req.l5_rules)      ||
-				      !LIST_ISEMPTY(&curr_defproxy->tcp_req.inspect_rules) ||
-				      !LIST_ISEMPTY(&curr_defproxy->tcp_rep.inspect_rules))) {
-			/* If the current default proxy defines TCP/HTTP rules, the
-			 * current proxy will keep a reference on it. But some sanity
-			 * checks are performed first:
-			 *
-			 * - It cannot be used to init a defaults section
-			 * - It cannot be used to init a listen section
-			 * - It cannot be used to init backend and frontend sections at
-			 *   same time. It can be used to init several sections of the
-			 *   same type only.
-			 * - It cannot define L4/L5 TCP rules if it is used to init
-			 *   backend sections.
-			 * - It cannot define 'tcp-response content' rules if it
-			 *   is used to init frontend sections.
-			 *
-			 * If no error is found, refcount of the default proxy is incremented.
-			 */
-
-			/* Note: Add tcpcheck_rules too if unresolve args become allowed in defaults section */
-			if (rc & PR_CAP_DEF) {
-				ha_alert("parsing [%s:%d]: a defaults section cannot inherit from a defaults section defining TCP/HTTP rules (defaults section at %s:%d).\n",
-					 file, linenum, curr_defproxy->conf.file, curr_defproxy->conf.line);
-				err_code |= ERR_ALERT | ERR_ABORT;
-			}
-			else if ((rc & PR_CAP_LISTEN) == PR_CAP_LISTEN) {
-				ha_alert("parsing [%s:%d]: a listen section cannot inherit from a defaults section defining TCP/HTTP rules.\n",
-					 file, linenum);
-				err_code |= ERR_ALERT | ERR_ABORT;
-			}
-			else {
-				char defcap = (curr_defproxy->cap & PR_CAP_LISTEN);
-
-				if ((defcap == PR_CAP_BE || defcap == PR_CAP_FE) && (rc & PR_CAP_LISTEN) != defcap) {
-					ha_alert("parsing [%s:%d]: frontends and backends cannot inherit from the same defaults section"
-						 " if it defines TCP/HTTP rules (defaults section at %s:%d).\n",
-						 file, linenum, curr_defproxy->conf.file, curr_defproxy->conf.line);
-					err_code |= ERR_ALERT | ERR_ABORT;
-				}
-				else if (!(rc & PR_CAP_FE) && (!LIST_ISEMPTY(&curr_defproxy->tcp_req.l4_rules) ||
-							       !LIST_ISEMPTY(&curr_defproxy->tcp_req.l5_rules))) {
-					ha_alert("parsing [%s:%d]: a backend section cannot inherit from a defaults section defining"
-						 " 'tcp-request connection' or 'tcp-request session' rules (defaults section at %s:%d).\n",
-						 file, linenum, curr_defproxy->conf.file, curr_defproxy->conf.line);
-					err_code |= ERR_ALERT | ERR_ABORT;
-				}
-				else if (!(rc & PR_CAP_BE) && !LIST_ISEMPTY(&curr_defproxy->tcp_rep.inspect_rules)) {
-					ha_alert("parsing [%s:%d]: a frontend section cannot inherit from a defaults section defining"
-						 " 'tcp-response content' rules (defaults section at %s:%d).\n",
-						 file, linenum, curr_defproxy->conf.file, curr_defproxy->conf.line);
-					err_code |= ERR_ALERT | ERR_ABORT;
-				}
-				else {
-					curr_defproxy->cap = (curr_defproxy->cap & ~PR_CAP_LISTEN) | (rc & PR_CAP_LISTEN);
-					proxy_ref_defaults(curproxy, curr_defproxy);
-				}
-			}
-		}
-
-		if (curr_defproxy && (curr_defproxy->tcpcheck_rules.flags & TCPCHK_RULES_PROTO_CHK) &&
-		    (curproxy->cap & PR_CAP_LISTEN) == PR_CAP_BE) {
-			/* If the current default proxy defines tcpcheck rules, the
-			 * current proxy will keep a reference on it. but only if the
-			 * current proxy has the backend capability.
-			 */
-			proxy_ref_defaults(curproxy, curr_defproxy);
 		}
 
 		if (rc & PR_CAP_DEF) {
@@ -677,12 +594,12 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 	else if (strcmp(args[0], "disabled") == 0) {  /* disables this proxy */
 		if (alertif_too_many_args(0, file, linenum, args, &err_code))
 			goto out;
-		curproxy->flags |= PR_FL_DISABLED;
+		curproxy->disabled = PR_DISABLED;
 	}
 	else if (strcmp(args[0], "enabled") == 0) {  /* enables this proxy (used to revert a disabled default) */
 		if (alertif_too_many_args(0, file, linenum, args, &err_code))
 			goto out;
-		curproxy->flags &= ~PR_FL_DISABLED;
+		curproxy->disabled = 0;
 	}
 	else if (strcmp(args[0], "bind-process") == 0) {  /* enable this proxy only on some processes */
 		int cur_arg = 1;
@@ -705,8 +622,8 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		err_code |= ERR_WARN;
 	}
 	else if (strcmp(args[0], "acl") == 0) {  /* add an ACL */
-		if ((curproxy->cap & PR_CAP_DEF) && strlen(curproxy->id) == 0) {
-			ha_alert("parsing [%s:%d] : '%s' not allowed in anonymous 'defaults' section.\n", file, linenum, args[0]);
+		if (curproxy->cap & PR_CAP_DEF) {
+			ha_alert("parsing [%s:%d] : '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -1275,10 +1192,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 	}
 	else if (strcmp(args[0], "http-request") == 0) {	/* request access control: allow/deny/auth */
 		struct act_rule *rule;
-		int where = 0;
 
-		if ((curproxy->cap & PR_CAP_DEF) && strlen(curproxy->id) == 0) {
-			ha_alert("parsing [%s:%d] : '%s' not allowed in anonymous 'defaults' section.\n", file, linenum, args[0]);
+		if (curproxy->cap & PR_CAP_DEF) {
+			ha_alert("parsing [%s:%d]: '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -1299,21 +1215,17 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		}
 
 		err_code |= warnif_misplaced_http_req(curproxy, file, linenum, args[0]);
-
-		if (curproxy->cap & PR_CAP_FE)
-			where |= SMP_VAL_FE_HRQ_HDR;
-		if (curproxy->cap & PR_CAP_BE)
-			where |= SMP_VAL_BE_HRQ_HDR;
-		err_code |= warnif_cond_conflicts(rule->cond, where, file, linenum);
+		err_code |= warnif_cond_conflicts(rule->cond,
+	                                          (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
+	                                          file, linenum);
 
 		LIST_APPEND(&curproxy->http_req_rules, &rule->list);
 	}
 	else if (strcmp(args[0], "http-response") == 0) {	/* response access control */
 		struct act_rule *rule;
-		int where = 0;
 
-		if ((curproxy->cap & PR_CAP_DEF) && strlen(curproxy->id) == 0) {
-			ha_alert("parsing [%s:%d] : '%s' not allowed in anonymous 'defaults' section.\n", file, linenum, args[0]);
+		if (curproxy->cap & PR_CAP_DEF) {
+			ha_alert("parsing [%s:%d]: '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -1333,19 +1245,17 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		if (curproxy->cap & PR_CAP_FE)
-			where |= SMP_VAL_FE_HRS_HDR;
-		if (curproxy->cap & PR_CAP_BE)
-			where |= SMP_VAL_BE_HRS_HDR;
-		err_code |= warnif_cond_conflicts(rule->cond, where, file, linenum);
+		err_code |= warnif_cond_conflicts(rule->cond,
+	                                          (curproxy->cap & PR_CAP_BE) ? SMP_VAL_BE_HRS_HDR : SMP_VAL_FE_HRS_HDR,
+	                                          file, linenum);
 
 		LIST_APPEND(&curproxy->http_res_rules, &rule->list);
 	}
 	else if (strcmp(args[0], "http-after-response") == 0) {
 		struct act_rule *rule;
-		int where = 0;
-		if ((curproxy->cap & PR_CAP_DEF) && strlen(curproxy->id) == 0) {
-			ha_alert("parsing [%s:%d] : '%s' not allowed in anonymous 'defaults' section.\n", file, linenum, args[0]);
+
+		if (curproxy->cap & PR_CAP_DEF) {
+			ha_alert("parsing [%s:%d]: '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -1365,11 +1275,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		if (curproxy->cap & PR_CAP_FE)
-			where |= SMP_VAL_FE_HRS_HDR;
-		if (curproxy->cap & PR_CAP_BE)
-			where |= SMP_VAL_BE_HRS_HDR;
-		err_code |= warnif_cond_conflicts(rule->cond, where, file, linenum);
+		err_code |= warnif_cond_conflicts(rule->cond,
+	                                          (curproxy->cap & PR_CAP_BE) ? SMP_VAL_BE_HRS_HDR : SMP_VAL_FE_HRS_HDR,
+	                                          file, linenum);
 
 		LIST_APPEND(&curproxy->http_after_res_rules, &rule->list);
 	}
@@ -1401,7 +1309,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 	}
 	else if (strcmp(args[0], "redirect") == 0) {
 		struct redirect_rule *rule;
-		int where = 0;
 
 		if (curproxy->cap & PR_CAP_DEF) {
 			ha_alert("parsing [%s:%d] : '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
@@ -1418,12 +1325,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 		LIST_APPEND(&curproxy->redirect_rules, &rule->list);
 		err_code |= warnif_misplaced_redirect(curproxy, file, linenum, args[0]);
-
-		if (curproxy->cap & PR_CAP_FE)
-			where |= SMP_VAL_FE_HRQ_HDR;
-		if (curproxy->cap & PR_CAP_BE)
-			where |= SMP_VAL_BE_HRQ_HDR;
-		err_code |= warnif_cond_conflicts(rule->cond, where, file, linenum);
+		err_code |= warnif_cond_conflicts(rule->cond,
+	                                          (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
+	                                          file, linenum);
 	}
 	else if (strcmp(args[0], "use_backend") == 0) {
 		struct switching_rule *rule;
@@ -1764,7 +1668,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto stats_error_parsing;
 		} else if (strcmp(args[1], "admin") == 0) {
 			struct stats_admin_rule *rule;
-			int where = 0;
 
 			if (curproxy->cap & PR_CAP_DEF) {
 				ha_alert("parsing [%s:%d]: '%s %s' not allowed in 'defaults' section.\n", file, linenum, args[0], args[1]);
@@ -1788,11 +1691,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				goto out;
 			}
 
-			if (curproxy->cap & PR_CAP_FE)
-				where |= SMP_VAL_FE_HRQ_HDR;
-			if (curproxy->cap & PR_CAP_BE)
-				where |= SMP_VAL_BE_HRQ_HDR;
-			err_code |= warnif_cond_conflicts(cond, where, file, linenum);
+			err_code |= warnif_cond_conflicts(cond,
+			                                  (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
+			                                  file, linenum);
 
 			rule = calloc(1, sizeof(*rule));
 			if (!rule) {
@@ -1843,7 +1744,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				goto alloc_error;
 		} else if (strcmp(args[1], "http-request") == 0) {    /* request access control: allow/deny/auth */
 			struct act_rule *rule;
-			int where = 0;
 
 			if (curproxy->cap & PR_CAP_DEF) {
 				ha_alert("parsing [%s:%d]: '%s' not allowed in 'defaults' section.\n", file, linenum, args[0]);
@@ -1868,11 +1768,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				goto out;
 			}
 
-			if (curproxy->cap & PR_CAP_FE)
-				where |= SMP_VAL_FE_HRQ_HDR;
-			if (curproxy->cap & PR_CAP_BE)
-				where |= SMP_VAL_BE_HRQ_HDR;
-			err_code |= warnif_cond_conflicts(rule->cond, where, file, linenum);
+			err_code |= warnif_cond_conflicts(rule->cond,
+			                                  (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR,
+			                                  file, linenum);
 			LIST_APPEND(&curproxy->uri_auth->http_req_rules, &rule->list);
 
 		} else if (strcmp(args[1], "auth") == 0) {

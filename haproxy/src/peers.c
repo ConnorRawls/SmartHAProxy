@@ -20,10 +20,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#include <import/eb32tree.h>
-#include <import/ebmbtree.h>
-#include <import/ebpttree.h>
-
 #include <haproxy/api.h>
 #include <haproxy/applet.h>
 #include <haproxy/channel.h>
@@ -443,7 +439,7 @@ static void peers_trace(enum trace_level level, uint64_t mask,
 			const struct peer *peer = a2;
 			struct peers *peers = NULL;
 
-			if (peer->appctx) {
+			if (peer && peer->appctx) {
 				struct stream_interface *si;
 
 				si = peer->appctx->owner;
@@ -456,7 +452,8 @@ static void peers_trace(enum trace_level level, uint64_t mask,
 
 			if (peers)
 				chunk_appendf(&trace_buf, " %s", peers->local->id);
-			chunk_appendf(&trace_buf, " -> %s", peer->id);
+			if (peer)
+				chunk_appendf(&trace_buf, " -> %s", peer->id);
 		}
 
 		if (a3) {
@@ -1777,10 +1774,6 @@ static int peer_treat_updatemsg(struct appctx *appctx, struct peer *p, int updt,
 
 		if (!((1ULL << data_type) & st->remote_data))
 			continue;
-
-		if (stktable_data_types[data_type].is_local)
-			continue;
-
 		if (stktable_data_types[data_type].is_array) {
 			/* in case of array all elements
 			 * use the same std_type and they
@@ -3190,7 +3183,7 @@ static struct appctx *peer_session_create(struct peers *peers, struct peer *peer
 	peer->last_hdshk = now_ms;
 	s = NULL;
 
-	appctx = appctx_new(&peer_applet);
+	appctx = appctx_new(&peer_applet, tid_bit);
 	if (!appctx)
 		goto out_close;
 
@@ -3214,7 +3207,7 @@ static struct appctx *peer_session_create(struct peers *peers, struct peer *peer
 
 	/* initiate an outgoing connection */
 	s->target = peer_session_target(peer, s);
-	if (!sockaddr_alloc(&s->si[1].dst, &peer->addr, sizeof(peer->addr)))
+	if (!sockaddr_alloc(&s->target_addr, &peer->addr, sizeof(peer->addr)))
 		goto out_free_strm;
 	s->flags = SF_ASSIGNED|SF_ADDR_SET;
 	s->si[1].flags |= SI_FL_NOLINGER;
@@ -3510,7 +3503,7 @@ int peers_init_sync(struct peers *peers)
 		peers->peers_fe->maxconn += 3;
 	}
 
-	peers->sync_task = task_new_anywhere();
+	peers->sync_task = task_new(MAX_THREADS_MASK);
 	if (!peers->sync_task)
 		return 0;
 

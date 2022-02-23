@@ -48,7 +48,6 @@
 #include <haproxy/istbuf.h>
 #include <haproxy/list.h>
 #include <haproxy/log.h>
-#include <haproxy/net_helper.h>
 #include <haproxy/protocol.h>
 #include <haproxy/proxy-t.h>
 #include <haproxy/regex.h>
@@ -57,7 +56,7 @@
 #include <haproxy/ssl_sock.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
-#include <haproxy/ticks.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 #include <haproxy/trace.h>
 #include <haproxy/vars.h>
@@ -429,7 +428,7 @@ static void tcpcheck_expect_onerror_message(struct buffer *msg, struct check *ch
 	 *     4. Otherwise produce the generic tcp-check info message
 	 */
 	if (istlen(info)) {
-		chunk_istcat(msg, info);
+		chunk_strncat(msg, istptr(info), istlen(info));
 		goto comment;
 	}
 	else if (!LIST_ISEMPTY(&rule->expect.onerror_fmt)) {
@@ -517,7 +516,7 @@ static void tcpcheck_expect_onsuccess_message(struct buffer *msg, struct check *
 	 *     4. Otherwise produce the generic tcp-check info message
 	 */
 	if (istlen(info))
-		chunk_istcat(msg, info);
+		chunk_strncat(msg, istptr(info), istlen(info));
 	if (!LIST_ISEMPTY(&rule->expect.onsuccess_fmt))
 		msg->data += sess_build_logline(check->sess, NULL, b_tail(msg), b_room(msg),
 						&rule->expect.onsuccess_fmt);
@@ -657,9 +656,7 @@ enum tcpcheck_eval_ret tcpcheck_ldap_expect_bindrsp(struct check *check, struct 
 	enum healthcheck_status status;
 	struct buffer *msg = NULL;
 	struct ist desc = IST_NULL;
-	char *ptr;
-	unsigned short nbytes = 0;
-	size_t msglen = 0;
+	unsigned short msglen = 0;
 
 	TRACE_ENTER(CHK_EV_TCPCHK_EXP, check);
 
@@ -667,65 +664,35 @@ enum tcpcheck_eval_ret tcpcheck_ldap_expect_bindrsp(struct check *check, struct 
 	 * http://en.wikipedia.org/wiki/Basic_Encoding_Rules
 	 * http://tools.ietf.org/html/rfc4511
 	 */
-	ptr = b_head(&check->bi) + 1;
-
 	/* size of LDAPMessage */
-	if (*ptr & 0x80) {
-		/* For message size encoded on several bytes, we only handle
-		 * size encoded on 2 or 4 bytes. There is no reason to make this
-		 * part to complex because only Active Directory is known to
-		 * encode BindReponse length on 4 bytes.
-		 */
-		nbytes = (*ptr & 0x7f);
-		if (b_data(&check->bi) < 1 + nbytes)
-			goto too_short;
-		switch (nbytes) {
-			case 4: msglen = read_n32(ptr+1); break;
-			case 2: msglen = read_n16(ptr+1); break;
-			default:
-				status = HCHK_STATUS_L7RSP;
-				desc = ist("Not LDAPv3 protocol");
-				goto error;
-		}
-	}
-	else
-		msglen = *ptr;
-	ptr += 1 + nbytes;
-
-	if (b_data(&check->bi) < 2 + nbytes + msglen)
-		goto too_short;
+	msglen = (*(b_head(&check->bi) + 1) & 0x80) ? (*(b_head(&check->bi) + 1) & 0x7f) : 0;
 
 	/* http://tools.ietf.org/html/rfc4511#section-4.2.2
 	 *   messageID: 0x02 0x01 0x01: INTEGER 1
 	 *   protocolOp: 0x61: bindResponse
 	 */
-	if (memcmp(ptr, "\x02\x01\x01\x61", 4) != 0) {
+	if ((msglen > 2) || (memcmp(b_head(&check->bi) + 2 + msglen, "\x02\x01\x01\x61", 4) != 0)) {
 		status = HCHK_STATUS_L7RSP;
 		desc = ist("Not LDAPv3 protocol");
 		goto error;
 	}
-	ptr += 4;
 
-	/* skip size of bindResponse */
-	nbytes = 0;
-	if (*ptr & 0x80)
-		nbytes = (*ptr & 0x7f);
-	ptr += 1 + nbytes;
+	/* size of bindResponse */
+	msglen += (*(b_head(&check->bi) + msglen + 6) & 0x80) ? (*(b_head(&check->bi) + msglen + 6) & 0x7f) : 0;
 
 	/* http://tools.ietf.org/html/rfc4511#section-4.1.9
 	 *   ldapResult: 0x0a 0x01: ENUMERATION
 	 */
-	if (memcmp(ptr, "\x0a\x01", 2) != 0) {
+	if ((msglen > 4) || (memcmp(b_head(&check->bi) + 7 + msglen, "\x0a\x01", 2) != 0)) {
 		status = HCHK_STATUS_L7RSP;
 		desc = ist("Not LDAPv3 protocol");
 		goto error;
 	}
-	ptr += 2;
 
 	/* http://tools.ietf.org/html/rfc4511#section-4.1.9
 	 *   resultCode
 	 */
-	check->code = *ptr;
+	check->code = *(b_head(&check->bi) + msglen + 9);
 	if (check->code) {
 		status = HCHK_STATUS_L7STS;
 		desc = ist("See RFC: http://tools.ietf.org/html/rfc4511#section-4.1.9");
@@ -746,18 +713,6 @@ enum tcpcheck_eval_ret tcpcheck_ldap_expect_bindrsp(struct check *check, struct 
 	if (msg)
 		tcpcheck_expect_onerror_message(msg, check, rule, 0, desc);
 	set_server_check_status(check, status, (msg ? b_head(msg) : NULL));
-	goto out;
-
-  too_short:
-	if (!last_read)
-		goto wait_more_data;
-	/* invalid length or truncated response */
-	status = HCHK_STATUS_L7RSP;
-	goto error;
-
-  wait_more_data:
-	TRACE_DEVEL("waiting for more data", CHK_EV_TCPCHK_EXP, check);
-	ret = TCPCHK_EVAL_WAIT;
 	goto out;
 }
 
@@ -1125,7 +1080,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_connect(struct check *check, struct tcpchec
 	*conn->dst = (is_addr(&connect->addr)
 		      ? connect->addr
 		      : (is_addr(&check->addr) ? check->addr : s->addr));
-	proto = protocol_lookup(conn->dst->ss_family, PROTO_TYPE_STREAM, 0);
+	proto = protocol_by_family(conn->dst->ss_family);
 
 	port = 0;
 	if (connect->port)
@@ -1594,10 +1549,6 @@ enum tcpcheck_eval_ret tcpcheck_eval_recv(struct check *check, struct tcpcheck_r
 		goto stop;
 	}
 	if (!cur_read) {
-		if (cs->flags & CS_FL_EOI) {
-			/* If EOI is set, it means there is a response or an error */
-			goto out;
-		}
 		if (!(cs->flags & (CS_FL_WANT_ROOM|CS_FL_ERROR|CS_FL_EOS))) {
 			conn->mux->subscribe(cs, SUB_RETRY_RECV, &check->wait_list);
 			TRACE_DEVEL("waiting for response", CHK_EV_RX_DATA, check);
@@ -1818,7 +1769,7 @@ enum tcpcheck_eval_ret tcpcheck_eval_expect_http(struct check *check, struct tcp
 			case TCPCHK_EXPT_FL_HTTP_HVAL_END:
 				if (istlen(value) < istlen(vpat))
 					break;
-				value = ist2(istend(value) - istlen(vpat), istlen(vpat));
+				value = ist2(istptr(value) + istlen(value) - istlen(vpat), istlen(vpat));
 				if (isteq(value, vpat)) {
 					match = 1;
 					goto end_of_match;
@@ -2294,7 +2245,7 @@ int tcpcheck_main(struct check *check)
 			const char *msg = ((rule->connect.options & TCPCHK_OPT_IMPLICIT) ? NULL : "(tcp-check)");
 			enum healthcheck_status status = HCHK_STATUS_L4OK;
 #ifdef USE_OPENSSL
-			if (conn_is_ssl(conn))
+			if (ssl_sock_is_ssl(conn))
 				status = HCHK_STATUS_L6OK;
 #endif
 			set_server_check_status(check, status, msg);
@@ -2340,12 +2291,13 @@ struct tcpcheck_rule *parse_tcpcheck_action(char **args, int cur_arg, struct pro
 	struct tcpcheck_rule *chk = NULL;
 	struct act_rule *actrule = NULL;
 
-	actrule = new_act_rule(ACT_F_TCP_CHK, file, line);
+	actrule = calloc(1, sizeof(*actrule));
 	if (!actrule) {
 		memprintf(errmsg, "out of memory");
 		goto error;
 	}
 	actrule->kw = kw;
+	actrule->from = ACT_F_TCP_CHK;
 
 	cur_arg++;
 	if (kw->parse((const char **)args, &cur_arg, px, actrule, errmsg) == ACT_RET_PRS_ERR) {

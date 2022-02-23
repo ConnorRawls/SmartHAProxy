@@ -95,7 +95,6 @@ void flt_ot_pools_info(void)
 struct flt_ot_runtime_context *flt_ot_runtime_context_init(struct stream *s, struct filter *f, char **err)
 {
 	const struct flt_ot_conf      *conf = FLT_OT_CONF(f);
-	struct buffer                  uuid;
 	struct flt_ot_runtime_context *retptr = NULL;
 
 	FLT_OT_FUNC("%p, %p, %p:%p", s, f, FLT_OT_DPTR_ARGS(err));
@@ -106,23 +105,23 @@ struct flt_ot_runtime_context *flt_ot_runtime_context_init(struct stream *s, str
 
 	retptr->stream        = s;
 	retptr->filter        = f;
+	retptr->uuid.u64[0]   = ha_random64();
+	retptr->uuid.u64[1]   = ha_random64();
 	retptr->flag_harderr  = conf->tracer->flag_harderr;
 	retptr->flag_disabled = conf->tracer->flag_disabled;
 	retptr->logging       = conf->tracer->logging;
 	LIST_INIT(&(retptr->spans));
 	LIST_INIT(&(retptr->contexts));
 
-	uuid = b_make(retptr->uuid, sizeof(retptr->uuid), 0, 0);
-	ha_generate_uuid(&uuid);
+	(void)snprintf(retptr->uuid.s, sizeof(retptr->uuid.s), "%08x-%04hx-%04hx-%04hx-%012" PRIx64,
+	               retptr->uuid.time_low,
+	               retptr->uuid.time_mid,
+	               (uint16_t)((retptr->uuid.time_hi_and_version & UINT16_C(0xfff)) | UINT16_C(0x4000)),
+	               (uint16_t)(retptr->uuid.clock_seq | UINT16_C(0x8000)),
+	               (uint64_t)retptr->uuid.node);
 
-#ifdef USE_OT_VARS
-	/*
-	 * The HAProxy variable 'txn.ot.uuid' is registered here,
-	 * after which its value is set to runtime context UUID.
-	 */
-	if (flt_ot_var_register(FLT_OT_VAR_UUID, err) != -1)
-		(void)flt_ot_var_set(s, FLT_OT_VAR_UUID, retptr->uuid, SMP_OPT_DIR_REQ, err);
-#endif
+	if (flt_ot_var_register(FTL_OT_VAR_UUID, err) != -1)
+		(void)flt_ot_var_set(s, FTL_OT_VAR_UUID, retptr->uuid.s, SMP_OPT_DIR_REQ, err);
 
 	FLT_OT_DBG_RUNTIME_CONTEXT("session context: ", retptr);
 
@@ -611,9 +610,7 @@ void flt_ot_scope_free_unused(struct flt_ot_runtime_context *rt_ctx, struct chan
 				 * the context in question should be deleted.
 				 */
 				(void)flt_ot_http_headers_remove(chn, ctx->id, NULL);
-#ifdef USE_OT_VARS
 				(void)flt_ot_vars_unset(rt_ctx->stream, FLT_OT_VARS_SCOPE, ctx->id, ctx->smp_opt_dir, NULL);
-#endif
 
 				flt_ot_scope_context_free(&ctx);
 			}

@@ -126,7 +126,7 @@ static void generate_usermsgs_ctx_str(void)
 	int ret;
 
 	if (unlikely(b_is_null(&ctx->str))) {
-		area = calloc(USERMSGS_CTX_BUFSIZE, sizeof(*area));
+		area = calloc(USERMSGS_CTX_BUFSIZE, sizeof(char));
 		if (area)
 			ctx->str = b_make(area, USERMSGS_CTX_BUFSIZE, 0, 0);
 	}

@@ -564,7 +564,7 @@ select_compression_response_header(struct comp_state *st, struct stream *s, stru
 			goto fail;
 
 	/* limit cpu usage */
-	if (th_ctx->idle_pct < compress_min_idle)
+	if (ti->idle_pct < compress_min_idle)
 		goto fail;
 
 	/* initialize compression */
@@ -631,7 +631,6 @@ parse_compression_options(char **args, int section, struct proxy *proxy,
 			  char **err)
 {
 	struct comp    *comp;
-	int ret = 0;
 
 	if (proxy->comp == NULL) {
 		comp = calloc(1, sizeof(*comp));
@@ -645,71 +644,58 @@ parse_compression_options(char **args, int section, struct proxy *proxy,
 		int              cur_arg = 2;
 
 		if (!*args[cur_arg]) {
-			memprintf(err, "parsing [%s:%d] : '%s' expects <algorithm>.",
+			memprintf(err, "parsing [%s:%d] : '%s' expects <algorithm>\n",
 				  file, line, args[0]);
-			ret = -1;
-			goto end;
+			return -1;
 		}
 		while (*(args[cur_arg])) {
 			int retval = comp_append_algo(comp, args[cur_arg]);
 			if (retval) {
 				if (retval < 0)
-					memprintf(err, "'%s' : '%s' is not a supported algorithm.",
+					memprintf(err, "'%s' : '%s' is not a supported algorithm.\n",
 						  args[0], args[cur_arg]);
 				else
-					memprintf(err, "'%s' : out of memory while parsing algo '%s'.",
+					memprintf(err, "'%s' : out of memory while parsing algo '%s'.\n",
 						  args[0], args[cur_arg]);
-				ret = -1;
-				goto end;
+				return -1;
 			}
 
 			if (proxy->comp->algos->init(&ctx, 9) == 0)
 				proxy->comp->algos->end(&ctx);
 			else {
-				memprintf(err, "'%s' : Can't init '%s' algorithm.",
+				memprintf(err, "'%s' : Can't init '%s' algorithm.\n",
 					  args[0], args[cur_arg]);
-				ret = -1;
-				goto end;
+				return -1;
 			}
 			cur_arg++;
 			continue;
 		}
 	}
-	else if (strcmp(args[1], "offload") == 0) {
-		if (proxy->cap & PR_CAP_DEF) {
-			memprintf(err, "'%s' : '%s' ignored in 'defaults' section.",
-				  args[0], args[1]);
-			ret = 1;
-		}
+	else if (strcmp(args[1], "offload") == 0)
 		comp->offload = 1;
-	}
 	else if (strcmp(args[1], "type") == 0) {
 		int cur_arg = 2;
 
 		if (!*args[cur_arg]) {
-			memprintf(err, "'%s' expects <type>.", args[0]);
-			ret = -1;
-			goto end;
+			memprintf(err, "'%s' expects <type>\n", args[0]);
+			return -1;
 		}
 		while (*(args[cur_arg])) {
 			if (comp_append_type(comp, args[cur_arg])) {
 				memprintf(err, "'%s': out of memory.", args[0]);
-				ret = -1;
-				goto end;
+				return -1;
 			}
 			cur_arg++;
 			continue;
 		}
 	}
 	else {
-		memprintf(err, "'%s' expects 'algo', 'type' or 'offload'",
+		memprintf(err, "'%s' expects 'algo', 'type' or 'offload'\n",
 			  args[0]);
-		ret = -1;
-		goto end;
+		return -1;
 	}
 
-  end:
-	return ret;
+	return 0;
 }
 
 static int

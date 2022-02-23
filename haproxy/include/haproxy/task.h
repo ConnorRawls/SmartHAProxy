@@ -28,9 +28,7 @@
 #include <import/eb32sctree.h>
 #include <import/eb32tree.h>
 
-#include <haproxy/activity.h>
 #include <haproxy/api.h>
-#include <haproxy/clock.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
 #include <haproxy/intops.h>
@@ -92,15 +90,17 @@
 extern volatile unsigned long global_tasks_mask; /* Mask of threads with tasks in the global runqueue */
 extern unsigned int grq_total;    /* total number of entries in the global run queue, atomic */
 extern unsigned int niced_tasks;  /* number of niced tasks in the run queue */
-
 extern struct pool_head *pool_head_task;
 extern struct pool_head *pool_head_tasklet;
 extern struct pool_head *pool_head_notification;
+extern THREAD_LOCAL struct task_per_thread *sched; /* current's thread scheduler context */
 
 #ifdef USE_THREAD
 extern struct eb_root timers;      /* sorted timers tree, global */
 extern struct eb_root rqueue;      /* tree constituting the run queue */
 #endif
+
+extern struct task_per_thread task_per_thread[MAX_THREADS];
 
 __decl_thread(extern HA_SPINLOCK_T rq_lock);  /* spin lock related to run queue */
 __decl_thread(extern HA_RWLOCK_T wq_lock);    /* RW lock related to the wait queue */
@@ -111,6 +111,10 @@ void tasklet_kill(struct tasklet *t);
 void __task_wakeup(struct task *t);
 void __task_queue(struct task *task, struct eb_root *wq);
 
+struct work_list *work_list_create(int nbthread,
+                                   struct task *(*fct)(struct task *, void *, unsigned int),
+                                   void *arg);
+void work_list_destroy(struct work_list *work, int nbthread);
 unsigned int run_tasks_from_lists(unsigned int budgets[]);
 
 /*
@@ -120,24 +124,24 @@ unsigned int run_tasks_from_lists(unsigned int budgets[]);
  *   - return the date of next event in <next> or eternity.
  */
 
-void process_runnable_tasks(void);
+void process_runnable_tasks();
 
 /*
  * Extract all expired timers from the timer queue, and wakes up all
  * associated tasks.
  */
-void wake_expired_tasks(void);
+void wake_expired_tasks();
 
 /* Checks the next timer for the current thread by looking into its own timer
  * list and the global one. It may return TICK_ETERNITY if no timer is present.
  * Note that the next timer might very well be slightly in the past.
  */
-int next_timer_expiry(void);
+int next_timer_expiry();
 
 /*
  * Delete every tasks before running the master polling loop
  */
-void mworker_cleantasks(void);
+void mworker_cleantasks();
 
 /* returns the number of running tasks+tasklets on the whole process. Note
  * that this *is* racy since a task may move from the global to a local
@@ -152,7 +156,7 @@ static inline int total_run_queues()
 	ret = _HA_ATOMIC_LOAD(&grq_total);
 #endif
 	for (thr = 0; thr < global.nbthread; thr++)
-		ret += _HA_ATOMIC_LOAD(&ha_thread_ctx[thr].rq_total);
+		ret += _HA_ATOMIC_LOAD(&task_per_thread[thr].rq_total);
 	return ret;
 }
 
@@ -165,7 +169,7 @@ static inline int total_allocated_tasks()
 	int thr, ret;
 
 	for (thr = ret = 0; thr < global.nbthread; thr++)
-		ret += _HA_ATOMIC_LOAD(&ha_thread_ctx[thr].nb_tasks);
+		ret += _HA_ATOMIC_LOAD(&task_per_thread[thr].nb_tasks);
 	return ret;
 }
 
@@ -188,9 +192,9 @@ static inline int task_in_wq(struct task *t)
 static inline int thread_has_tasks(void)
 {
 	return (!!(global_tasks_mask & tid_bit) |
-		!eb_is_empty(&th_ctx->rqueue) |
-	        !!th_ctx->tl_class_mask |
-		!MT_LIST_ISEMPTY(&th_ctx->shared_tasklet_list));
+		!eb_is_empty(&sched->rqueue) |
+	        !!sched->tl_class_mask |
+		!MT_LIST_ISEMPTY(&sched->shared_tasklet_list));
 }
 
 /* puts the task <t> in run queue with reason flags <f>, and returns <t> */
@@ -283,7 +287,7 @@ static inline void task_queue(struct task *task)
 	{
 		BUG_ON(task->thread_mask != tid_bit); // should have TASK_SHARED_WQ
 		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
-			__task_queue(task, &th_ctx->timers);
+			__task_queue(task, &sched->timers);
 	}
 }
 
@@ -333,7 +337,7 @@ static inline struct task *task_unlink_rq(struct task *t)
 			_HA_ATOMIC_DEC(&grq_total);
 		}
 		else
-			_HA_ATOMIC_DEC(&th_ctx->rq_total);
+			_HA_ATOMIC_DEC(&sched->rq_total);
 		if (t->nice)
 			_HA_ATOMIC_DEC(&niced_tasks);
 	}
@@ -402,7 +406,7 @@ static inline void tasklet_remove_from_tasklet_list(struct tasklet *t)
 {
 	if (MT_LIST_DELETE((struct mt_list *)&t->list)) {
 		_HA_ATOMIC_AND(&t->state, ~TASK_IN_LIST);
-		_HA_ATOMIC_DEC(&ha_thread_ctx[t->tid >= 0 ? t->tid : tid].rq_total);
+		_HA_ATOMIC_DEC(&task_per_thread[t->tid >= 0 ? t->tid : tid].rq_total);
 	}
 }
 
@@ -463,45 +467,17 @@ static inline struct tasklet *tasklet_new(void)
 
 /*
  * Allocate and initialise a new task. The new task is returned, or NULL in
- * case of lack of memory. The task count is incremented. This API might change
- * in the near future, so prefer one of the task_new_*() wrappers below which
- * are usually more suitable. Tasks must be freed using task_free().
+ * case of lack of memory. The task count is incremented. Tasks should only
+ * be allocated this way, and must be freed using task_free().
  */
 static inline struct task *task_new(unsigned long thread_mask)
 {
 	struct task *t = pool_alloc(pool_head_task);
 	if (t) {
-		th_ctx->nb_tasks++;
+		sched->nb_tasks++;
 		task_init(t, thread_mask);
 	}
 	return t;
-}
-
-/* Allocate and initialize a new task, to run on global thread <thr>. The new
- * task is returned, or NULL in case of lack of memory. It's up to the caller
- * to pass a valid thread number (in tid space, 0 to nbthread-1). The task
- * count is incremented.
- */
-static inline struct task *task_new_on(uint thr)
-{
-	return task_new(1UL << thr);
-}
-
-/* Allocate and initialize a new task, to run on the calling thread. The new
- * task is returned, or NULL in case of lack of memory. The task count is
- * incremented.
- */
-static inline struct task *task_new_here()
-{
-	return task_new(tid_bit);
-}
-
-/* Allocate and initialize a new task, to run on any thread. The new task is
- * returned, or NULL in case of lack of memory. The task count is incremented.
- */
-static inline struct task *task_new_anywhere()
-{
-	return task_new(MAX_THREADS_MASK);
 }
 
 /*
@@ -510,8 +486,8 @@ static inline struct task *task_new_anywhere()
  */
 static inline void __task_free(struct task *t)
 {
-	if (t == th_ctx->current) {
-		th_ctx->current = NULL;
+	if (t == sched->current) {
+		sched->current = NULL;
 		__ha_barrier_store();
 	}
 	BUG_ON(task_in_wq(t) || task_in_rq(t));
@@ -523,7 +499,7 @@ static inline void __task_free(struct task *t)
 #endif
 
 	pool_free(pool_head_task, t);
-	th_ctx->nb_tasks--;
+	sched->nb_tasks--;
 	if (unlikely(stopping))
 		pool_flush(pool_head_task);
 }
@@ -547,7 +523,7 @@ static inline void task_destroy(struct task *t)
 	/* There's no need to protect t->state with a lock, as the task
 	 * has to run on the current thread.
 	 */
-	if (t == th_ctx->current || !(t->state & (TASK_QUEUED | TASK_RUNNING)))
+	if (t == sched->current || !(t->state & (TASK_QUEUED | TASK_RUNNING)))
 		__task_free(t);
 	else
 		t->process = NULL;
@@ -557,7 +533,7 @@ static inline void task_destroy(struct task *t)
 static inline void tasklet_free(struct tasklet *tl)
 {
 	if (MT_LIST_DELETE((struct mt_list *)&tl->list))
-		_HA_ATOMIC_DEC(&ha_thread_ctx[tl->tid >= 0 ? tl->tid : tid].rq_total);
+		_HA_ATOMIC_DEC(&task_per_thread[tl->tid >= 0 ? tl->tid : tid].rq_total);
 
 #ifdef DEBUG_TASK
 	if ((unsigned int)tl->debug.caller_idx > 1)
@@ -577,10 +553,6 @@ static inline void tasklet_set_tid(struct tasklet *tl, int tid)
 /* Ensure <task> will be woken up at most at <when>. If the task is already in
  * the run queue (but not running), nothing is done. It may be used that way
  * with a delay :  task_schedule(task, tick_add(now_ms, delay));
- * It MUST NOT be used with a timer in the past, and even less with
- * TICK_ETERNITY (which would block all timers). Note that passing it directly
- * now_ms without using tick_add() will definitely make this happen once every
- * 49.7 days.
  */
 static inline void task_schedule(struct task *task, int when)
 {
@@ -608,7 +580,7 @@ static inline void task_schedule(struct task *task, int when)
 
 		task->expire = when;
 		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
-			__task_queue(task, &th_ctx->timers);
+			__task_queue(task, &sched->timers);
 	}
 }
 
@@ -706,6 +678,13 @@ static inline void notification_wake(struct list *wake)
 static inline int notification_registered(struct list *wake)
 {
 	return !LIST_ISEMPTY(wake);
+}
+
+/* adds list item <item> to work list <work> and wake up the associated task */
+static inline void work_list_add(struct work_list *work, struct mt_list *item)
+{
+	MT_LIST_TRY_APPEND(&work->head, item);
+	task_wakeup(work->task, TASK_WOKEN_OTHER);
 }
 
 #endif /* _HAPROXY_TASK_H */

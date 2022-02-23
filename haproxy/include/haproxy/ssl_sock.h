@@ -32,6 +32,8 @@
 #include <haproxy/thread.h>
 
 extern struct list tlskeys_reference;
+extern int sslconns;
+extern int totalsslconns;
 extern struct eb_root ckchs_tree;
 extern struct eb_root crtlists_tree;
 extern struct eb_root cafile_tree;
@@ -60,8 +62,6 @@ void ssl_sock_destroy_bind_conf(struct bind_conf *bind_conf);
 int ssl_sock_prepare_srv_ctx(struct server *srv);
 void ssl_sock_free_srv_ctx(struct server *srv);
 void ssl_sock_free_all_ctx(struct bind_conf *bind_conf);
-int ssl_sock_get_alpn(const struct connection *conn, void *xprt_ctx,
-                      const char **str, int *len);
 int ssl_sock_load_ca(struct bind_conf *bind_conf);
 void ssl_sock_free_ca(struct bind_conf *bind_conf);
 int ssl_bio_and_sess_init(struct connection *conn, SSL_CTX *ssl_ctx,
@@ -73,6 +73,7 @@ const char *ssl_sock_get_proto_version(struct connection *conn);
 int ssl_sock_parse_alpn(char *arg, char **alpn_str, int *alpn_len, char **err);
 void ssl_sock_set_alpn(struct connection *conn, const unsigned char *, int);
 void ssl_sock_set_servername(struct connection *conn, const char *hostname);
+void ssl_sock_set_srv(struct server *s, signed char use_ssl);
 
 int ssl_sock_get_cert_used_sess(struct connection *conn);
 int ssl_sock_get_cert_used_conn(struct connection *conn);
@@ -143,6 +144,16 @@ int ssl_ocsp_response_print(struct buffer *ocsp_response, struct buffer *out);
 int ssl_sock_register_msg_callback(ssl_sock_msg_callback_func func);
 
 SSL *ssl_sock_get_ssl_object(struct connection *conn);
+
+/* boolean, returns true if connection is over SSL */
+static inline
+int ssl_sock_is_ssl(struct connection *conn)
+{
+	if (!conn || conn->xprt != xprt_get(XPRT_SSL) || !conn->xprt_ctx)
+		return 0;
+	else
+		return 1;
+}
 
 
 #endif /* USE_OPENSSL */

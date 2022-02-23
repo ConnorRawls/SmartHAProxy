@@ -43,6 +43,7 @@
 #include <import/ebpttree.h>
 #include <import/ebsttree.h>
 #include <import/lru.h>
+#include <import/xxhash.h>
 
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
@@ -78,7 +79,6 @@
 #include <haproxy/tools.h>
 #include <haproxy/vars.h>
 #include <haproxy/xprt_quic.h>
-#include <haproxy/xxhash.h>
 
 
 /* ***** READ THIS before adding code here! *****
@@ -92,6 +92,8 @@
  * to conditionally define it in openssl-compat.h than using lots of ifdefs.
  */
 
+int sslconns = 0;
+int totalsslconns = 0;
 int nb_engines = 0;
 
 static struct eb_root cert_issuer_tree = EB_ROOT; /* issuers tree from "issuers-chain-path" */
@@ -583,7 +585,7 @@ static void ssl_sock_unregister_msg_callbacks(void)
 
 SSL *ssl_sock_get_ssl_object(struct connection *conn)
 {
-	if (!conn_is_ssl(conn))
+	if (!ssl_sock_is_ssl(conn))
 		return NULL;
 
 	return ((struct ssl_sock_ctx *)(conn->xprt_ctx))->ssl;
@@ -706,7 +708,7 @@ void ssl_async_fd_free(int fd)
 
 	/* Now we can safely call SSL_free, no more pending job in engines */
 	SSL_free(ssl);
-	_HA_ATOMIC_DEC(&global.sslconns);
+	_HA_ATOMIC_DEC(&sslconns);
 	_HA_ATOMIC_DEC(&jobs);
 }
 /*
@@ -2451,10 +2453,10 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 	if (conn->qc) {
 		/* Look for the QUIC transport parameters. */
 #ifdef OPENSSL_IS_BORINGSSL
-		if (!SSL_early_callback_ctx_extension_get(ctx, con->qc->tps_tls_ext,
+		if (!SSL_early_callback_ctx_extension_get(ctx, TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS,
 		                                          &extension_data, &extension_len))
 #else
-		if (!SSL_client_hello_get0_ext(ssl, conn->qc->tps_tls_ext,
+		if (!SSL_client_hello_get0_ext(ssl, TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS,
 		                               &extension_data, &extension_len))
 #endif
 			goto abort;
@@ -2462,8 +2464,6 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 		if (!quic_transport_params_store(conn->qc, 0, extension_data,
 		                                 extension_data + extension_len))
 			goto abort;
-
-		quic_mux_transport_params_update(conn->qc->qcc);
 	}
 #endif
 
@@ -2679,21 +2679,7 @@ int ssl_sock_switchctx_cbk(SSL *ssl, int *al, void *arg)
 		HA_RWLOCK_RDLOCK(SNI_LOCK, &s->sni_lock);
 		ssl_sock_switchctx_set(ssl, s->default_ctx);
 		HA_RWLOCK_RDUNLOCK(SNI_LOCK, &s->sni_lock);
-		goto allow_early;
 	}
-
-	/* other cases fallback on abort, if strict-sni is set but no node was found */
-
- abort:
-	/* abort handshake (was SSL_TLSEXT_ERR_ALERT_FATAL) */
-	conn->err_code = CO_ER_SSL_HANDSHAKE;
-#ifdef OPENSSL_IS_BORINGSSL
-	return ssl_select_cert_error;
-#else
-	*al = SSL_AD_UNRECOGNIZED_NAME;
-	return 0;
-#endif
-
 allow_early:
 #ifdef OPENSSL_IS_BORINGSSL
 	if (allow_early)
@@ -2703,9 +2689,18 @@ allow_early:
 		SSL_set_max_early_data(ssl, 0);
 #endif
 	return 1;
+ abort:
+	/* abort handshake (was SSL_TLSEXT_ERR_ALERT_FATAL) */
+	conn->err_code = CO_ER_SSL_HANDSHAKE;
+#ifdef OPENSSL_IS_BORINGSSL
+	return ssl_select_cert_error;
+#else
+	*al = SSL_AD_UNRECOGNIZED_NAME;
+	return 0;
+#endif
 }
 
-#else /* ! HAVE_SSL_CLIENT_HELLO_CB  */
+#else /* OPENSSL_IS_BORINGSSL */
 
 /* Sets the SSL ctx of <ssl> to match the advertised server name. Returns a
  * warning when no match is found, which implies the default (first) cert
@@ -4133,10 +4128,8 @@ static int ssl_sess_new_srv_cb(SSL *ssl, SSL_SESSION *sess)
 	if (!(s->ssl_ctx.options & SRV_SSL_O_NO_REUSE)) {
 		int len;
 		unsigned char *ptr;
-		const char *sni;
 
 		len = i2d_SSL_SESSION(sess, NULL);
-		sni = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
 		HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.lock);
 		if (s->ssl_ctx.reused_sess[tid].ptr && s->ssl_ctx.reused_sess[tid].allocated_size >= len) {
 			ptr = s->ssl_ctx.reused_sess[tid].ptr;
@@ -4148,18 +4141,6 @@ static int ssl_sess_new_srv_cb(SSL *ssl, SSL_SESSION *sess)
 		if (s->ssl_ctx.reused_sess[tid].ptr) {
 			s->ssl_ctx.reused_sess[tid].size = i2d_SSL_SESSION(sess,
 			    &ptr);
-		}
-
-		if (s->ssl_ctx.reused_sess[tid].sni) {
-			/* if the new sni is empty or isn' t the same as the old one */
-			if ((!sni) || strcmp(s->ssl_ctx.reused_sess[tid].sni, sni) != 0) {
-				ha_free(&s->ssl_ctx.reused_sess[tid].sni);
-				if (sni)
-					s->ssl_ctx.reused_sess[tid].sni = strdup(sni);
-			}
-		} else if (sni) {
-			/* if there wasn't an old sni but there is a new one */
-			s->ssl_ctx.reused_sess[tid].sni = strdup(sni);
 		}
 		HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.lock);
 	} else {
@@ -5182,10 +5163,8 @@ void ssl_sock_free_srv_ctx(struct server *srv)
 	if (srv->ssl_ctx.reused_sess) {
 		int i;
 
-		for (i = 0; i < global.nbthread; i++) {
+		for (i = 0; i < global.nbthread; i++)
 			ha_free(&srv->ssl_ctx.reused_sess[i].ptr);
-			ha_free(&srv->ssl_ctx.reused_sess[i].sni);
-		}
 		ha_free(&srv->ssl_ctx.reused_sess);
 	}
 
@@ -5446,7 +5425,7 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 	ctx->subs = NULL;
 	ctx->xprt_st = 0;
 	ctx->xprt_ctx = NULL;
-	ctx->error_code = 0;
+	ctx->hsk_error_code = 0;
 
 	/* Only work with sockets for now, this should be adapted when we'll
 	 * add QUIC support.
@@ -5457,7 +5436,7 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 			goto err;
 	}
 
-	if (global.maxsslconn && global.sslconns >= global.maxsslconn) {
+	if (global.maxsslconn && sslconns >= global.maxsslconn) {
 		conn->err_code = CO_ER_SSL_TOO_MANY;
 		goto err;
 	}
@@ -5486,8 +5465,8 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 		/* leave init state and start handshake */
 		conn->flags |= CO_FL_SSL_WAIT_HS | CO_FL_WAIT_L6_CONN;
 
-		_HA_ATOMIC_INC(&global.sslconns);
-		_HA_ATOMIC_INC(&global.totalsslconns);
+		_HA_ATOMIC_INC(&sslconns);
+		_HA_ATOMIC_INC(&totalsslconns);
 		*xprt_ctx = ctx;
 		return 0;
 	}
@@ -5519,8 +5498,8 @@ static int ssl_sock_init(struct connection *conn, void **xprt_ctx)
 			conn->flags |= CO_FL_EARLY_SSL_HS;
 #endif
 
-		_HA_ATOMIC_INC(&global.sslconns);
-		_HA_ATOMIC_INC(&global.totalsslconns);
+		_HA_ATOMIC_INC(&sslconns);
+		_HA_ATOMIC_INC(&totalsslconns);
 		*xprt_ctx = ctx;
 		return 0;
 	}
@@ -5725,8 +5704,8 @@ check_error:
 		/* handshake did not complete, let's find why */
 		ret = SSL_get_error(ctx->ssl, ret);
 
-		if (!ctx->error_code)
-			ctx->error_code = ERR_peek_error();
+		if (!ctx->hsk_error_code)
+			ctx->hsk_error_code = ERR_peek_error();
 
 		if (ret == SSL_ERROR_WANT_WRITE) {
 			/* SSL handshake needs to write, L4 connection may not be ready */
@@ -5844,13 +5823,13 @@ reneg_ok:
 		}
 
 		if (counters) {
-			HA_ATOMIC_INC(&counters->sess);
-			HA_ATOMIC_INC(&counters_px->sess);
+			++counters->sess;
+			++counters_px->sess;
 		}
 	}
 	else if (counters) {
-		HA_ATOMIC_INC(&counters->reused_sess);
-		HA_ATOMIC_INC(&counters_px->reused_sess);
+		++counters->reused_sess;
+		++counters_px->reused_sess;
 	}
 
 	/* The connection is now established at both layers, it's time to leave */
@@ -5876,8 +5855,8 @@ reneg_ok:
 	}
 
 	if (counters) {
-		HA_ATOMIC_INC(&counters->failed_handshake);
-		HA_ATOMIC_INC(&counters_px->failed_handshake);
+		++counters->failed_handshake;
+		++counters_px->failed_handshake;
 	}
 
 	/* Fail on all other handshake errors */
@@ -6204,12 +6183,6 @@ static size_t ssl_sock_to_buf(struct connection *conn, void *xprt_ctx, struct bu
 				break;
 			} else if (ret == SSL_ERROR_ZERO_RETURN)
 				goto read0;
-			else if (ret == SSL_ERROR_SSL) {
-				struct ssl_sock_ctx *ctx = conn->xprt_ctx;
-				if (!ctx->error_code)
-					ctx->error_code = ERR_peek_error();
-				conn->err_code = CO_ERR_SSL_FATAL;
-			}
 			/* For SSL_ERROR_SYSCALL, make sure to clear the error
 			 * stack before shutting down the connection for
 			 * reading. */
@@ -6371,12 +6344,6 @@ static size_t ssl_sock_from_buf(struct connection *conn, void *xprt_ctx, const s
 #endif
 				break;
 			}
-			else if (ret == SSL_ERROR_SSL || ret == SSL_ERROR_SYSCALL) {
-				struct ssl_sock_ctx *ctx = conn->xprt_ctx;
-				if (!ctx->error_code)
-					ctx->error_code = ERR_peek_error();
-				conn->err_code = CO_ERR_SSL_FATAL;
-			}
 			goto out_error;
 		}
 	}
@@ -6459,7 +6426,7 @@ void ssl_sock_close(struct connection *conn, void *xprt_ctx) {
 		b_free(&ctx->early_buf);
 		tasklet_free(ctx->wait_event.tasklet);
 		pool_free(ssl_sock_ctx_pool, ctx);
-		_HA_ATOMIC_DEC(&global.sslconns);
+		_HA_ATOMIC_DEC(&sslconns);
 	}
 }
 
@@ -6490,7 +6457,7 @@ int ssl_sock_get_pkey_algo(struct connection *conn, struct buffer *out)
 	struct ssl_sock_ctx *ctx;
 	X509 *crt;
 
-	if (!conn_is_ssl(conn))
+	if (!ssl_sock_is_ssl(conn))
 		return 0;
 
 	ctx = conn->xprt_ctx;
@@ -6510,7 +6477,7 @@ const char *ssl_sock_get_cert_sig(struct connection *conn)
 	__OPENSSL_110_CONST__ ASN1_OBJECT *algorithm;
 	X509 *crt;
 
-	if (!conn_is_ssl(conn))
+	if (!ssl_sock_is_ssl(conn))
 		return NULL;
 	ctx = conn->xprt_ctx;
 	crt = SSL_get_certificate(ctx->ssl);
@@ -6526,7 +6493,7 @@ const char *ssl_sock_get_sni(struct connection *conn)
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	struct ssl_sock_ctx *ctx;
 
-	if (!conn_is_ssl(conn))
+	if (!ssl_sock_is_ssl(conn))
 		return NULL;
 	ctx = conn->xprt_ctx;
 	return SSL_get_servername(ctx->ssl, TLSEXT_NAMETYPE_host_name);
@@ -6540,7 +6507,7 @@ const char *ssl_sock_get_cipher_name(struct connection *conn)
 {
 	struct ssl_sock_ctx *ctx;
 
-	if (!conn_is_ssl(conn))
+	if (!ssl_sock_is_ssl(conn))
 		return NULL;
 	ctx = conn->xprt_ctx;
 	return SSL_get_cipher_name(ctx->ssl);
@@ -6551,7 +6518,7 @@ const char *ssl_sock_get_proto_version(struct connection *conn)
 {
 	struct ssl_sock_ctx *ctx;
 
-	if (!conn_is_ssl(conn))
+	if (!ssl_sock_is_ssl(conn))
 		return NULL;
 	ctx = conn->xprt_ctx;
 	return SSL_get_version(ctx->ssl);
@@ -6562,7 +6529,7 @@ void ssl_sock_set_alpn(struct connection *conn, const unsigned char *alpn, int l
 #ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
 	struct ssl_sock_ctx *ctx;
 
-	if (!conn_is_ssl(conn))
+	if (!ssl_sock_is_ssl(conn))
 		return;
 	ctx = conn->xprt_ctx;
 	SSL_set_alpn_protos(ctx->ssl, alpn, len);
@@ -6576,26 +6543,22 @@ void ssl_sock_set_servername(struct connection *conn, const char *hostname)
 {
 #ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
 	struct ssl_sock_ctx *ctx;
-	struct server *s;
+
 	char *prev_name;
 
-	if (!conn_is_ssl(conn))
+	if (!ssl_sock_is_ssl(conn))
 		return;
 	ctx = conn->xprt_ctx;
-	s = __objt_server(conn->target);
 
 	/* if the SNI changes, we must destroy the reusable context so that a
-	 * new connection will present a new SNI. compare with the SNI
-	 * previously stored in the reused_sess */
-	/* the RWLOCK is used to ensure that we are not trying to flush the
-	 * cache from the CLI */
-
-	HA_RWLOCK_RDLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.lock);
-	prev_name = s->ssl_ctx.reused_sess[tid].sni;
+	 * new connection will present a new SNI. As an optimization we could
+	 * later imagine having a small cache of ssl_ctx to hold a few SNI per
+	 * server.
+	 */
+	prev_name = (char *)SSL_get_servername(ctx->ssl, TLSEXT_NAMETYPE_host_name);
 	if ((!prev_name && hostname) ||
 	    (prev_name && (!hostname || strcmp(hostname, prev_name) != 0)))
 		SSL_set_session(ctx->ssl, NULL);
-	HA_RWLOCK_RDUNLOCK(SSL_SERVER_LOCK, &s->ssl_ctx.lock);
 
 	SSL_set_tlsext_host_name(ctx->ssl, hostname);
 #endif
@@ -6620,7 +6583,7 @@ int ssl_sock_get_remote_common_name(struct connection *conn,
 	};
 	int result = -1;
 
-	if (!conn_is_ssl(conn))
+	if (!ssl_sock_is_ssl(conn))
 		goto out;
 	ctx = conn->xprt_ctx;
 
@@ -6647,7 +6610,7 @@ int ssl_sock_get_cert_used_sess(struct connection *conn)
 	struct ssl_sock_ctx *ctx;
 	X509 *crt = NULL;
 
-	if (!conn_is_ssl(conn))
+	if (!ssl_sock_is_ssl(conn))
 		return 0;
 	ctx = conn->xprt_ctx;
 
@@ -6665,7 +6628,7 @@ int ssl_sock_get_cert_used_conn(struct connection *conn)
 {
 	struct ssl_sock_ctx *ctx;
 
-	if (!conn_is_ssl(conn))
+	if (!ssl_sock_is_ssl(conn))
 		return 0;
 	ctx = conn->xprt_ctx;
 	return SSL_SOCK_ST_FL_VERIFY_DONE & ctx->xprt_st ? 1 : 0;
@@ -6676,7 +6639,7 @@ unsigned int ssl_sock_get_verify_result(struct connection *conn)
 {
 	struct ssl_sock_ctx *ctx;
 
-	if (!conn_is_ssl(conn))
+	if (!ssl_sock_is_ssl(conn))
 		return (unsigned int)X509_V_ERR_APPLICATION_VERIFICATION;
 	ctx = conn->xprt_ctx;
 	return (unsigned int)SSL_get_verify_result(ctx->ssl);
@@ -6688,7 +6651,7 @@ unsigned int ssl_sock_get_verify_result(struct connection *conn)
  * freed by the caller. NPN is also checked if available since older versions
  * of openssl (1.0.1) which are more common in field only support this one.
  */
-int ssl_sock_get_alpn(const struct connection *conn, void *xprt_ctx, const char **str, int *len)
+static int ssl_sock_get_alpn(const struct connection *conn, void *xprt_ctx, const char **str, int *len)
 {
 #if defined(TLSEXT_TYPE_application_layer_protocol_negotiation) || \
 	defined(OPENSSL_NPN_NEGOTIATED) && !defined(OPENSSL_NO_NEXTPROTONEG)
@@ -7719,6 +7682,22 @@ static void __ssl_sock_deinit(void)
 	BIO_meth_free(ha_meth);
 }
 
+/* Activate ssl on server <s>.
+ * do nothing if there is no change to apply
+ *
+ * Must be called with the server lock held.
+ */
+void ssl_sock_set_srv(struct server *s, signed char use_ssl)
+{
+	if (s->use_ssl == use_ssl)
+		return;
+
+	s->use_ssl = use_ssl;
+	if (s->use_ssl == 1)
+		s->xprt = &ssl_sock;
+	else
+		s->xprt = s->check.xprt = s->agent.xprt = xprt_get(XPRT_RAW);
+}
 
 /*
  * Local variables:

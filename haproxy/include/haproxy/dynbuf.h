@@ -36,7 +36,7 @@
 
 extern struct pool_head *pool_head_buffer;
 
-int init_buffer(void);
+int init_buffer();
 void buffer_dump(FILE *o, struct buffer *b, int from, int to);
 
 /*****************************************************************/
@@ -112,7 +112,7 @@ void __offer_buffers(void *from, unsigned int count);
 
 static inline void offer_buffers(void *from, unsigned int count)
 {
-	if (!LIST_ISEMPTY(&th_ctx->buffer_wq))
+	if (!LIST_ISEMPTY(&ti->buffer_wq))
 		__offer_buffers(from, count);
 }
 

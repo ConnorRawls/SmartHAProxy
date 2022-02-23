@@ -67,7 +67,6 @@ struct protocol proto_udp4 = {
 	.fam            = &proto_fam_inet4,
 
 	/* socket layer */
-	.proto_type     = PROTO_TYPE_DGRAM,
 	.sock_type      = SOCK_DGRAM,
 	.sock_prot      = IPPROTO_UDP,
 	.rx_enable      = sock_enable,
@@ -101,7 +100,6 @@ struct protocol proto_udp6 = {
 	.fam            = &proto_fam_inet6,
 
 	/* socket layer */
-	.proto_type     = PROTO_TYPE_DGRAM,
 	.sock_type      = SOCK_DGRAM,
 	.sock_prot      = IPPROTO_UDP,
 	.rx_enable      = sock_enable,
@@ -150,7 +148,7 @@ int udp_bind_listener(struct listener *listener, char *errmsg, int errlen)
 		char pn[INET6_ADDRSTRLEN];
 
 		addr_to_str(&listener->rx.addr, pn, sizeof(pn));
-		snprintf(errmsg, errlen, "%s for [%s:%d]", msg, pn, get_host_port(&listener->rx.addr));
+		snprintf(errmsg, errlen, "%s [%s:%d]", msg, pn, get_host_port(&listener->rx.addr));
 	}
 	return err;
 }

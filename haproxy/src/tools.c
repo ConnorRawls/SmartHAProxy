@@ -946,8 +946,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 	int portl, porth, porta;
 	int abstract = 0;
 	int new_fd = -1;
-	enum proto_type proto_type;
-	int ctrl_type;
+	int sock_type, ctrl_type;
 
 	portl = porth = porta = 0;
 	if (fqdn)
@@ -968,23 +967,18 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 
 	/* prepare the default socket types */
 	if ((opts & (PA_O_STREAM|PA_O_DGRAM)) == PA_O_DGRAM ||
-	    ((opts & (PA_O_STREAM|PA_O_DGRAM)) == (PA_O_DGRAM|PA_O_STREAM) && (opts & PA_O_DEFAULT_DGRAM))) {
-		proto_type = PROTO_TYPE_DGRAM;
-		ctrl_type = SOCK_DGRAM;
-	} else {
-		proto_type = PROTO_TYPE_STREAM;
-		ctrl_type = SOCK_STREAM;
-	}
+	    ((opts & (PA_O_STREAM|PA_O_DGRAM)) == (PA_O_DGRAM|PA_O_STREAM) && (opts & PA_O_DEFAULT_DGRAM)))
+		sock_type = ctrl_type = SOCK_DGRAM;
+	else
+		sock_type = ctrl_type = SOCK_STREAM;
 
 	if (strncmp(str2, "stream+", 7) == 0) {
 		str2 += 7;
-		proto_type = PROTO_TYPE_STREAM;
-		ctrl_type = SOCK_STREAM;
+		sock_type = ctrl_type = SOCK_STREAM;
 	}
 	else if (strncmp(str2, "dgram+", 6) == 0) {
 		str2 += 6;
-		proto_type = PROTO_TYPE_DGRAM;
-		ctrl_type = SOCK_DGRAM;
+		sock_type = ctrl_type = SOCK_DGRAM;
 	}
 
 	if (strncmp(str2, "unix@", 5) == 0) {
@@ -996,15 +990,13 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		str2 += 5;
 		abstract = 0;
 		ss.ss_family = AF_UNIX;
-		proto_type = PROTO_TYPE_DGRAM;
-		ctrl_type = SOCK_DGRAM;
+		sock_type = ctrl_type = SOCK_DGRAM;
 	}
 	else if (strncmp(str2, "uxst@", 5) == 0) {
 		str2 += 5;
 		abstract = 0;
 		ss.ss_family = AF_UNIX;
-		proto_type = PROTO_TYPE_STREAM;
-		ctrl_type = SOCK_STREAM;
+		sock_type = ctrl_type = SOCK_STREAM;
 	}
 	else if (strncmp(str2, "abns@", 5) == 0) {
 		str2 += 5;
@@ -1026,49 +1018,43 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 	else if (strncmp(str2, "tcp4@", 5) == 0) {
 		str2 += 5;
 		ss.ss_family = AF_INET;
-		proto_type = PROTO_TYPE_STREAM;
-		ctrl_type = SOCK_STREAM;
+		sock_type = ctrl_type = SOCK_STREAM;
 	}
 	else if (strncmp(str2, "udp4@", 5) == 0) {
 		str2 += 5;
 		ss.ss_family = AF_INET;
-		proto_type = PROTO_TYPE_DGRAM;
-		ctrl_type = SOCK_DGRAM;
+		sock_type = ctrl_type = SOCK_DGRAM;
 	}
 	else if (strncmp(str2, "tcp6@", 5) == 0) {
 		str2 += 5;
 		ss.ss_family = AF_INET6;
-		proto_type = PROTO_TYPE_STREAM;
-		ctrl_type = SOCK_STREAM;
+		sock_type = ctrl_type = SOCK_STREAM;
 	}
 	else if (strncmp(str2, "udp6@", 5) == 0) {
 		str2 += 5;
 		ss.ss_family = AF_INET6;
-		proto_type = PROTO_TYPE_DGRAM;
-		ctrl_type = SOCK_DGRAM;
+		sock_type = ctrl_type = SOCK_DGRAM;
 	}
 	else if (strncmp(str2, "tcp@", 4) == 0) {
 		str2 += 4;
 		ss.ss_family = AF_UNSPEC;
-		proto_type = PROTO_TYPE_STREAM;
-		ctrl_type = SOCK_STREAM;
+		sock_type = ctrl_type = SOCK_STREAM;
 	}
 	else if (strncmp(str2, "udp@", 4) == 0) {
 		str2 += 4;
 		ss.ss_family = AF_UNSPEC;
-		proto_type = PROTO_TYPE_DGRAM;
-		ctrl_type = SOCK_DGRAM;
+		sock_type = ctrl_type = SOCK_DGRAM;
 	}
 	else if (strncmp(str2, "quic4@", 6) == 0) {
 		str2 += 6;
 		ss.ss_family = AF_INET;
-		proto_type = PROTO_TYPE_DGRAM;
+		sock_type = SOCK_DGRAM;
 		ctrl_type = SOCK_STREAM;
 	}
 	else if (strncmp(str2, "quic6@", 6) == 0) {
 		str2 += 6;
 		ss.ss_family = AF_INET6;
-		proto_type = PROTO_TYPE_DGRAM;
+		sock_type = SOCK_DGRAM;
 		ctrl_type = SOCK_STREAM;
 	}
 	else if (strncmp(str2, "fd@", 3) == 0) {
@@ -1127,7 +1113,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 
 			addr_len = sizeof(type);
 			if (getsockopt(new_fd, SOL_SOCKET, SO_TYPE, &type, &addr_len) != 0 ||
-			    (type == SOCK_STREAM) != (proto_type == PROTO_TYPE_STREAM)) {
+			    (type == SOCK_STREAM) != (sock_type == SOCK_STREAM)) {
 				memprintf(err, "socket on file descriptor '%d' is of the wrong type.\n", new_fd);
 				goto out;
 			}
@@ -1294,7 +1280,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		 * for servers actually).
 		 */
 		new_proto = protocol_lookup(ss.ss_family,
-					    proto_type,
+					    sock_type == SOCK_DGRAM,
 					    ctrl_type == SOCK_DGRAM);
 
 		if (!new_proto && (!fqdn || !*fqdn) && (ss.ss_family != AF_CUST_EXISTING_FD)) {
@@ -2446,6 +2432,7 @@ const char *parse_time_err(const char *text, unsigned *ret, unsigned unit_flags)
 		break;
 	default:
 		return text;
+		break;
 	}
 	if (*(++text) != '\0') {
 		ha_warning("unexpected character '%c' after the timer value '%s', only "
@@ -5440,27 +5427,13 @@ uint32_t parse_line(char *in, char *out, size_t *outlen, char **args, int *nbarg
 			}
 
 			if (brace) {
-				if (*in == '-') {
-					/* default value starts just after the '-' */
-					if (!value)
-						value = in + 1;
-
-					while (*in && *in != '}')
-						in++;
-					if (!*in)
-						goto no_brace;
-					*in = 0; // terminate the default value
-				}
-				else if (*in != '}') {
-				no_brace:
+				if (*in != '}') {
 					/* unmatched brace */
 					err |= PARSE_ERR_BRACE;
 					if (errptr)
 						*errptr = brace;
 					goto leave;
 				}
-
-				/* brace found, skip it */
 				in++;
 				brace = NULL;
 			}
@@ -5650,26 +5623,6 @@ int openssl_compare_current_version(const char *version)
 #else
 	return -2;
 #endif
-}
-
-/*
- * This function compares the loaded openssl name with a string <name>
- * This function returns 0 if the OpenSSL name starts like the passed parameter,
- * 1 otherwise.
- */
-int openssl_compare_current_name(const char *name)
-{
-#ifdef USE_OPENSSL
-	int name_len = 0;
-	const char *openssl_version = OpenSSL_version(OPENSSL_VERSION);
-
-	if (name) {
-		name_len = strlen(name);
-		if (strlen(name) <= strlen(openssl_version))
-			return strncmp(openssl_version, name, name_len);
-	}
-#endif
-	return 1;
 }
 
 static int init_tools_per_thread()

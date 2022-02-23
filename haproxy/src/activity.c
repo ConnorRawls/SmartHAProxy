@@ -13,13 +13,11 @@
 #include <haproxy/activity-t.h>
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
-#include <haproxy/clock.h>
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
 #include <haproxy/freq_ctr.h>
 #include <haproxy/stream_interface.h>
 #include <haproxy/tools.h>
-#include <haproxy/xxhash.h>
 
 #if defined(DEBUG_MEM_STATS)
 /* these ones are macros in bug.h when DEBUG_MEM_STATS is set, and will
@@ -241,7 +239,7 @@ void *malloc(size_t size)
 		return memprof_malloc_handler(size);
 
 	ret = memprof_malloc_handler(size);
-	size = malloc_usable_size(ret) + sizeof(void *);
+	size = malloc_usable_size(ret);
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_MALLOC);
 	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
@@ -266,7 +264,7 @@ void *calloc(size_t nmemb, size_t size)
 		return memprof_calloc_handler(nmemb, size);
 
 	ret = memprof_calloc_handler(nmemb, size);
-	size = malloc_usable_size(ret) + sizeof(void *);
+	size = malloc_usable_size(ret);
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_CALLOC);
 	_HA_ATOMIC_ADD(&bin->alloc_calls, 1);
@@ -296,10 +294,6 @@ void *realloc(void *ptr, size_t size)
 	size_before = malloc_usable_size(ptr);
 	ret = memprof_realloc_handler(ptr, size);
 	size = malloc_usable_size(ret);
-
-	/* only count the extra link for new allocations */
-	if (!ptr)
-		size += sizeof(void *);
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_REALLOC);
 	if (size > size_before) {
@@ -333,7 +327,7 @@ void free(void *ptr)
 		return;
 	}
 
-	size_before = malloc_usable_size(ptr) + sizeof(void *);
+	size_before = malloc_usable_size(ptr);
 	memprof_free_handler(ptr);
 
 	bin = memprof_get_bin(__builtin_return_address(0), MEMPROF_METH_FREE);
@@ -351,40 +345,6 @@ void report_stolen_time(uint64_t stolen)
 	activity[tid].cpust_total += stolen;
 	update_freq_ctr(&activity[tid].cpust_1s, stolen);
 	update_freq_ctr_period(&activity[tid].cpust_15s, 15000, stolen);
-}
-
-/* Update avg_loop value for the current thread and possibly decide to enable
- * task-level profiling on the current thread based on its average run time.
- * The <run_time> argument is the number of microseconds elapsed since the
- * last time poll() returned.
- */
-void activity_count_runtime(uint32_t run_time)
-{
-	uint32_t up, down;
-
-	/* 1 millisecond per loop on average over last 1024 iterations is
-	 * enough to turn on profiling.
-	 */
-	up = 1000;
-	down = up * 99 / 100;
-
-	run_time = swrate_add(&activity[tid].avg_loop_us, TIME_STATS_SAMPLES, run_time);
-
-	/* In automatic mode, reaching the "up" threshold on average switches
-	 * profiling to "on" when automatic, and going back below the "down"
-	 * threshold switches to off. The forced modes don't check the load.
-	 */
-	if (!(task_profiling_mask & tid_bit)) {
-		if (unlikely((profiling & HA_PROF_TASKS_MASK) == HA_PROF_TASKS_ON ||
-		             ((profiling & HA_PROF_TASKS_MASK) == HA_PROF_TASKS_AON &&
-		             swrate_avg(run_time, TIME_STATS_SAMPLES) >= up)))
-			_HA_ATOMIC_OR(&task_profiling_mask, tid_bit);
-	} else {
-		if (unlikely((profiling & HA_PROF_TASKS_MASK) == HA_PROF_TASKS_OFF ||
-		             ((profiling & HA_PROF_TASKS_MASK) == HA_PROF_TASKS_AOFF &&
-		             swrate_avg(run_time, TIME_STATS_SAMPLES) <= down)))
-			_HA_ATOMIC_AND(&task_profiling_mask, ~tid_bit);
-	}
 }
 
 #ifdef USE_MEMORY_PROFILING
@@ -561,32 +521,6 @@ static int cmp_memprof_addr(const void *a, const void *b)
 }
 #endif // USE_MEMORY_PROFILING
 
-/* Computes the index of function pointer <func> for use with sched_activity[]
- * or any other similar array passed in <array>, and returns a pointer to the
- * entry after having atomically assigned it to this function pointer. Note
- * that in case of collision, the first entry is returned instead ("other").
- */
-struct sched_activity *sched_activity_entry(struct sched_activity *array, const void *func)
-{
-	uint64_t hash = XXH64_avalanche(XXH64_mergeRound((size_t)func, (size_t)func));
-	struct sched_activity *ret;
-	const void *old = NULL;
-
-	hash ^= (hash >> 32);
-	hash ^= (hash >> 16);
-	hash ^= (hash >> 8);
-	hash &= 0xff;
-	ret = &array[hash];
-
-	if (likely(ret->func == func))
-		return ret;
-
-	if (HA_ATOMIC_CAS(&ret->func, &old, func))
-		return ret;
-
-	return array;
-}
-
 /* This function dumps all profiling settings. It returns 0 if the output
  * buffer is full and it needs to be called again, otherwise non-zero.
  * It dumps some parts depending on the following states:
@@ -741,15 +675,8 @@ static int cli_io_handler_show_profiling(struct appctx *appctx)
 		else
 			chunk_appendf(&trash, "[other]");
 
-		chunk_appendf(&trash," %s(%lld)", memprof_methods[entry->method],
+		chunk_appendf(&trash," %s(%lld)\n", memprof_methods[entry->method],
 			      (long long)(entry->alloc_tot - entry->free_tot) / (long long)(entry->alloc_calls + entry->free_calls));
-
-		if (entry->alloc_tot && entry->free_tot) {
-			/* that's a realloc, show the total diff to help spot leaks */
-			chunk_appendf(&trash," [delta=%lld]", (long long)(entry->alloc_tot - entry->free_tot));
-		}
-
-		chunk_appendf(&trash, "\n");
 
 		if (ci_putchk(si_ic(si), &trash) == -1) {
 			si_rx_room_blk(si);
@@ -887,7 +814,7 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 	/* 2. all threads's local run queues */
 	for (thr = 0; thr < global.nbthread; thr++) {
 		/* task run queue */
-		rqnode = eb32sc_first(&ha_thread_ctx[thr].rqueue, ~0UL);
+		rqnode = eb32sc_first(&task_per_thread[thr].rqueue, ~0UL);
 		while (rqnode) {
 			t = eb32sc_entry(rqnode, struct task, rq);
 			entry = sched_activity_entry(tmp_activity, t->process);
@@ -901,7 +828,7 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 		}
 
 		/* shared tasklet list */
-		list_for_each_entry(tl, mt_list_to_list(&ha_thread_ctx[thr].shared_tasklet_list), list) {
+		list_for_each_entry(tl, mt_list_to_list(&task_per_thread[thr].shared_tasklet_list), list) {
 			t = (const struct task *)tl;
 			entry = sched_activity_entry(tmp_activity, t->process);
 			if (!TASK_IS_TASKLET(t) && t->call_date) {
@@ -914,7 +841,7 @@ static int cli_io_handler_show_tasks(struct appctx *appctx)
 
 		/* classful tasklets */
 		for (queue = 0; queue < TL_CLASSES; queue++) {
-			list_for_each_entry(tl, &ha_thread_ctx[thr].tasklets[queue], list) {
+			list_for_each_entry(tl, &task_per_thread[thr].tasklets[queue], list) {
 				t = (const struct task *)tl;
 				entry = sched_activity_entry(tmp_activity, t->process);
 				if (!TASK_IS_TASKLET(t) && t->call_date) {

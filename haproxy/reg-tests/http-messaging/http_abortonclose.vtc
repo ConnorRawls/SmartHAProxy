@@ -55,7 +55,7 @@ haproxy h1 -conf {
     defaults
         mode http
         option abortonclose
-        retries 1
+        retries 3
         timeout client  10s
         timeout server  10s
         timeout connect 100ms

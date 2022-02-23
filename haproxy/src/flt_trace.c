@@ -146,7 +146,8 @@ trace_htx_hexdump(struct htx *htx, unsigned int offset, unsigned int len)
 		v = istadv(v, offset);
 		offset = 0;
 
-		v = isttrim(v, len);
+		if (v.len > len)
+			v.len = len;
 		len -= v.len;
 		if (type == HTX_BLK_DATA)
 			trace_hexdump(v);
@@ -641,7 +642,7 @@ parse_trace_flt(char **args, int *cur_arg, struct proxy *px,
 			else if (strcmp(args[pos], "quiet") == 0)
 				conf->flags |= TRACE_F_QUIET;
 			else if (strcmp(args[pos], "random-parsing") == 0)
-				; // ignore
+				continue; // ignore
 			else if (strcmp(args[pos], "random-forwarding") == 0)
 				conf->flags |= TRACE_F_RAND_FWD;
 			else if (strcmp(args[pos], "hexdump") == 0)

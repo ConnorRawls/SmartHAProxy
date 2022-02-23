@@ -25,7 +25,6 @@
 #include <sys/types.h>
 
 #include <haproxy/api.h>
-#include <haproxy/activity.h>
 #include <haproxy/applet-t.h>
 #include <haproxy/backend.h>
 #include <haproxy/base64.h>
@@ -33,7 +32,6 @@
 #include <haproxy/channel.h>
 #include <haproxy/check.h>
 #include <haproxy/cli.h>
-#include <haproxy/clock.h>
 #include <haproxy/compression.h>
 #include <haproxy/debug.h>
 #include <haproxy/errors.h>
@@ -42,7 +40,6 @@
 #include <haproxy/frontend.h>
 #include <haproxy/global.h>
 #include <haproxy/http.h>
-#include <haproxy/http_ana.h>
 #include <haproxy/http_htx.h>
 #include <haproxy/htx.h>
 #include <haproxy/list.h>
@@ -56,6 +53,7 @@
 #include <haproxy/resolvers.h>
 #include <haproxy/server.h>
 #include <haproxy/session.h>
+#include <haproxy/ssl_sock.h>
 #include <haproxy/stats.h>
 #include <haproxy/stream.h>
 #include <haproxy/stream_interface.h>
@@ -259,7 +257,6 @@ const struct name_desc stat_fields[ST_F_TOTAL_FIELDS] = {
 	[ST_F_USED_CONN_CUR]                 = { .name = "used_conn_cur",               .desc = "Current number of connections in use"},
 	[ST_F_NEED_CONN_EST]                 = { .name = "need_conn_est",               .desc = "Estimated needed number of connections"},
 	[ST_F_UWEIGHT]                       = { .name = "uweight",                     .desc = "Server's user weight, or sum of active servers' user weights for a backend" },
-	[ST_F_AGG_SRV_CHECK_STATUS]          = { .name = "agg_server_check_status",     .desc = "Backend's aggregated gauge of servers' state check status" },
 };
 
 /* one line of info */
@@ -275,7 +272,7 @@ THREAD_LOCAL struct field *stat_l[STATS_DOMAIN_COUNT];
 /* list of all registered stats module */
 static struct list stats_module_list[STATS_DOMAIN_COUNT] = {
 	LIST_HEAD_INIT(stats_module_list[STATS_DOMAIN_PROXY]),
-	LIST_HEAD_INIT(stats_module_list[STATS_DOMAIN_RESOLVERS]),
+	LIST_HEAD_INIT(stats_module_list[STATS_DOMAIN_DNS]),
 };
 
 THREAD_LOCAL void *trash_counters;
@@ -626,8 +623,8 @@ static int stats_dump_fields_typed(struct buffer *out,
 			              stats[ST_F_PID].u.u32);
 			break;
 
-		case STATS_DOMAIN_RESOLVERS:
-			chunk_appendf(out, "N.%d.%s:", field,
+		case STATS_DOMAIN_DNS:
+			chunk_appendf(out, "D.%d.%s:", field,
 			              stat_f[domain][field].name);
 			break;
 
@@ -728,10 +725,10 @@ static void stats_print_proxy_field_json(struct buffer *out,
 	              obj_type, iid, sid, pos, name, pid);
 }
 
-static void stats_print_rslv_field_json(struct buffer *out,
-                                        const struct field *stat,
-                                        const char *name,
-                                        int pos)
+static void stats_print_dns_field_json(struct buffer *out,
+                                       const struct field *stat,
+                                       const char *name,
+                                       int pos)
 {
 	chunk_appendf(out,
 	              "{"
@@ -773,10 +770,10 @@ static int stats_dump_fields_json(struct buffer *out,
 			                             stats[ST_F_IID].u.u32,
 			                             stats[ST_F_SID].u.u32,
 			                             stats[ST_F_PID].u.u32);
-		} else if (domain == STATS_DOMAIN_RESOLVERS) {
-			stats_print_rslv_field_json(out, &stats[field],
-			                            stat_f[domain][field].name,
-			                            field);
+		} else if (domain == STATS_DOMAIN_DNS) {
+			stats_print_dns_field_json(out, &stats[field],
+			                           stat_f[domain][field].name,
+			                           field);
 		}
 
 		if (old_len == out->data)
@@ -1696,7 +1693,7 @@ int stats_fill_fe_stats(struct proxy *px, struct field *stats, int len,
 				metric = mkf_u64(FN_COUNTER, px->fe_counters.denied_sess);
 				break;
 			case ST_F_STATUS:
-				metric = mkf_str(FO_STATUS, (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) ? "STOP" : "OPEN");
+				metric = mkf_str(FO_STATUS, px->disabled ? "STOP" : "OPEN");
 				break;
 			case ST_F_PID:
 				metric = mkf_u32(FO_KEY, 1);
@@ -2659,9 +2656,6 @@ int stats_fill_be_stats(struct proxy *px, int flags, struct field *stats, int le
 					chunk_appendf(out, " (%d/%d)", nbup, nbsrv);
 				metric = mkf_str(FO_STATUS, fld);
 				break;
-			case ST_F_AGG_SRV_CHECK_STATUS:
-				metric = mkf_u32(FN_GAUGE, 0);
-				break;
 			case ST_F_WEIGHT:
 				metric = mkf_u32(FN_AVG, (px->lbprm.tot_weight * px->lbprm.wmult + px->lbprm.wdiv - 1) / px->lbprm.wdiv);
 				break;
@@ -3220,7 +3214,7 @@ static void stats_dump_html_head(struct appctx *appctx, struct uri_auth *uri)
 	              "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\"\n"
 	              "\"http://www.w3.org/TR/html4/loose.dtd\">\n"
 	              "<html><head><title>Statistics Report for " PRODUCT_NAME "%s%s</title>\n"
-	              "<link rel=\"icon\" href=\"data:,\">\n"
+		      "<link rel=\"icon\" href=\"data:,\">\n"
 	              "<meta http-equiv=\"content-type\" content=\"text/html; charset=iso-8859-1\">\n"
 	              "<style type=\"text/css\"><!--\n"
 	              "body {"
@@ -3307,66 +3301,20 @@ static void stats_dump_html_head(struct appctx *appctx, struct uri_auth *uri)
 	              "table.det th { text-align: left; border-width: 0px; padding: 0px 1px 0px 0px; font-style:normal;font-size:11px;font-weight:bold;font-family: sans-serif;}\n"
 	              "table.det td { text-align: right; border-width: 0px; padding: 0px 0px 0px 4px; white-space: nowrap; font-style:normal;font-size:11px;font-weight:normal;}\n"
 	              "u {text-decoration:none; border-bottom: 1px dotted black;}\n"
-	              "div.tips {\n"
-	              " display:block;\n"
-	              " visibility:hidden;\n"
-	              " z-index:2147483647;\n"
-	              " position:absolute;\n"
-	              " padding:2px 4px 3px;\n"
-	              " background:#f0f060; color:#000000;\n"
-	              " border:1px solid #7040c0;\n"
-	              " white-space:nowrap;\n"
-	              " font-style:normal;font-size:11px;font-weight:normal;\n"
-	              " -moz-border-radius:3px;-webkit-border-radius:3px;border-radius:3px;\n"
-	              " -moz-box-shadow:gray 2px 2px 3px;-webkit-box-shadow:gray 2px 2px 3px;box-shadow:gray 2px 2px 3px;\n"
-	              "}\n"
-	              "u:hover div.tips {visibility:visible;}\n"
-	              "@media (prefers-color-scheme: dark) {\n"
-	              " body { font-family: arial, helvetica, sans-serif; font-size: 12px; font-weight: normal; color: #e8e6e3; background: #131516;}\n"
-	              " h1 { color: #a265e0!important; }\n"
-	              " h2 { color: #a265e0; }\n"
-	              " h3 { color: #ff5190; background-color: #3e3e1f; }\n"
-	              " a { color: #3391ff; }\n"
-	              " input { background-color: #2f3437; }\n"
-	              " .hr { border-color: #8c8273; }\n"
-	              " .titre { background-color: #1aa6a6; color: #e8e6e3; }\n"
-	              " .frontend {background: #2f3437;}\n"
-	              " .backend {background: #2f3437;}\n"
-	              " .active_down {background: #760000;}\n"
-	              " .active_going_up {background: #b99200;}\n"
-	              " .active_going_down {background: #6c6c00;}\n"
-	              " .active_up {background: #165900;}\n"
-	              " .active_nolb {background: #006ab9;}\n"
-	              " .active_draining {background: #006ab9;}\n"
-	              " .active_no_check {background: #2a2d2f;}\n"
-	              " .backup_down {background: #760000;}\n"
-	              " .backup_going_up {background: #7f007f;}\n"
-	              " .backup_going_down {background: #580092;}\n"
-	              " .backup_up {background: #2e3234;}\n"
-	              " .backup_nolb {background: #1e3c6a;}\n"
-	              " .backup_draining {background: #a37a00;}\n"
-	              " .backup_no_check {background: #2a2d2f;}\n"
-	              " .maintain {background: #9a601a;}\n"
-	              " a.px:link {color: #d8d83b; text-decoration: none;}\n"
-	              " a.px:visited {color: #d8d83b; text-decoration: none;}\n"
-	              " a.px:hover {color: #ffffff; text-decoration: none;}\n"
-	              " a.lfsb:link {color: #e8e6e3; text-decoration: none;}\n"
-	              " a.lfsb:visited {color: #e8e6e3; text-decoration: none;}\n"
-	              " a.lfsb:hover {color: #b5afa6; text-decoration: none;}\n"
-	              " table.tbl th.empty { background-color: #181a1b; }\n"
-	              " table.tbl th.pxname { background-color: #8d0033; color: #ffff46; }\n"
-	              " table.tbl th { border-color: #808080; }\n"
-	              " table.tbl td { border-color: #808080; }\n"
-	              " u {text-decoration:none; border-bottom: 1px dotted #e8e6e3;}\n"
-	              " div.tips {\n"
-	              "  background:#8e8e0d;\n"
-	              "  color:#e8e6e3;\n"
-	              "  border-color: #4e2c86;\n"
-	              "  -moz-box-shadow: #60686c 2px 2px 3px;\n"
-	              "  -webkit-box-shadow: #60686c 2px 2px 3px;\n"
-	              "  box-shadow: #60686c 2px 2px 3px;\n"
-	              " }\n"
-	              "}\n"
+		      "div.tips {\n"
+		      " display:block;\n"
+		      " visibility:hidden;\n"
+		      " z-index:2147483647;\n"
+		      " position:absolute;\n"
+		      " padding:2px 4px 3px;\n"
+		      " background:#f0f060; color:#000000;\n"
+		      " border:1px solid #7040c0;\n"
+		      " white-space:nowrap;\n"
+		      " font-style:normal;font-size:11px;font-weight:normal;\n"
+		      " -moz-border-radius:3px;-webkit-border-radius:3px;border-radius:3px;\n"
+		      " -moz-box-shadow:gray 2px 2px 3px;-webkit-box-shadow:gray 2px 2px 3px;box-shadow:gray 2px 2px 3px;\n"
+		      "}\n"
+		      "u:hover div.tips {visibility:visible;}\n"
 	              "-->\n"
 	              "</style></head>\n",
 	              (appctx->ctx.stats.flags & STAT_SHNODE) ? " on " : "",
@@ -3452,7 +3400,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 	              actconn, pipes_used, pipes_used+pipes_free, read_freq_ctr(&global.conn_per_sec),
 		      bps >= 1000000000UL ? (bps / 1000000000.0) : bps >= 1000000UL ? (bps / 1000000.0) : (bps / 1000.0),
 		      bps >= 1000000000UL ? 'G' : bps >= 1000000UL ? 'M' : 'k',
-	              total_run_queues(), total_allocated_tasks(), clock_report_idle()
+	              total_run_queues(), total_allocated_tasks(), report_idle()
 	              );
 
 	/* scope_txt = search query, appctx->ctx.stats.scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
@@ -3682,7 +3630,7 @@ static int stats_dump_proxies(struct stream_interface *si,
 		 * Also skip proxies that were disabled in the configuration
 		 * This change allows retrieving stats from "old" proxies after a reload.
 		 */
-		if (!(px->flags & PR_FL_DISABLED) && px->uuid > 0 &&
+		if (!(px->disabled & PR_DISABLED) && px->uuid > 0 &&
 		    (px->cap & (PR_CAP_FE | PR_CAP_BE)) && !(px->cap & PR_CAP_INT)) {
 			if (stats_dump_proxy_to_buffer(si, htx, px, uri) == 0)
 				return 0;
@@ -3756,7 +3704,7 @@ static int stats_dump_stat_to_buffer(struct stream_interface *si, struct htx *ht
 
 	case STAT_ST_LIST:
 		switch (domain) {
-		case STATS_DOMAIN_RESOLVERS:
+		case STATS_DOMAIN_DNS:
 			if (!stats_dump_resolvers(si, stat_l[domain],
 			                          stat_count[domain],
 			                          &stats_module_list[domain])) {
@@ -4095,7 +4043,7 @@ static int stats_process_http_post(struct stream_interface *si)
 						total_servers++;
 						break;
 					case ST_ADM_ACTION_SHUTDOWN:
-						if (!(px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))) {
+						if (!px->disabled) {
 							srv_shutdown_streams(sv, SF_ERR_KILLED);
 							altered_servers++;
 							total_servers++;
@@ -4451,8 +4399,8 @@ int stats_fill_info(struct field *info, int len, uint flags)
 	info[INF_CUM_REQ]                        = mkf_u32(FN_COUNTER, global.req_count);
 #ifdef USE_OPENSSL
 	info[INF_MAX_SSL_CONNS]                  = mkf_u32(FN_MAX, global.maxsslconn);
-	info[INF_CURR_SSL_CONNS]                 = mkf_u32(0, global.sslconns);
-	info[INF_CUM_SSL_CONNS]                  = mkf_u32(FN_COUNTER, global.totalsslconns);
+	info[INF_CURR_SSL_CONNS]                 = mkf_u32(0, sslconns);
+	info[INF_CUM_SSL_CONNS]                  = mkf_u32(FN_COUNTER, totalsslconns);
 #endif
 	info[INF_MAXPIPES]                       = mkf_u32(FO_CONFIG|FN_LIMIT, global.maxpipes);
 	info[INF_PIPES_USED]                     = mkf_u32(0, pipes_used);
@@ -4485,7 +4433,7 @@ int stats_fill_info(struct field *info, int len, uint flags)
 #endif
 	info[INF_TASKS]                          = mkf_u32(0, total_allocated_tasks());
 	info[INF_RUN_QUEUE]                      = mkf_u32(0, total_run_queues());
-	info[INF_IDLE_PCT]                       = mkf_u32(FN_AVG, clock_report_idle());
+	info[INF_IDLE_PCT]                       = mkf_u32(FN_AVG, report_idle());
 	info[INF_NODE]                           = mkf_str(FO_CONFIG|FN_OUTPUT|FS_SERVICE, global.node);
 	if (global.desc)
 		info[INF_DESCRIPTION]            = mkf_str(FO_CONFIG|FN_OUTPUT|FS_SERVICE, global.desc);
@@ -4873,7 +4821,7 @@ static int cli_parse_clear_counters(char **args, char *payload, struct appctx *a
 		}
 	}
 
-	resolv_stats_clear_counters(clrall, &stats_module_list[STATS_DOMAIN_RESOLVERS]);
+	resolv_stats_clear_counters(clrall, &stats_module_list[STATS_DOMAIN_DNS]);
 
 	memset(activity, 0, sizeof(activity));
 	return 1;
@@ -4921,8 +4869,8 @@ static int cli_parse_show_stat(char **args, char *payload, struct appctx *appctx
 
 		if (strcmp(args[arg], "proxy") == 0) {
 			++args;
-		} else if (strcmp(args[arg], "resolvers") == 0) {
-			appctx->ctx.stats.domain = STATS_DOMAIN_RESOLVERS;
+		} else if (strcmp(args[arg], "dns") == 0) {
+			appctx->ctx.stats.domain = STATS_DOMAIN_DNS;
 			++args;
 		} else {
 			return cli_err(appctx, "Invalid statistics domain.\n");
@@ -5104,28 +5052,28 @@ static int allocate_stats_px_postcheck(void)
 
 REGISTER_CONFIG_POSTPARSER("allocate-stats-px", allocate_stats_px_postcheck);
 
-static int allocate_stats_rslv_postcheck(void)
+static int allocate_stats_dns_postcheck(void)
 {
 	struct stats_module *mod;
 	size_t i = 0;
 	int err_code = 0;
 
-	stat_f[STATS_DOMAIN_RESOLVERS] = malloc(stat_count[STATS_DOMAIN_RESOLVERS] * sizeof(struct name_desc));
-	if (!stat_f[STATS_DOMAIN_RESOLVERS]) {
-		ha_alert("stats: cannot allocate all fields for resolver statistics\n");
+	stat_f[STATS_DOMAIN_DNS] = malloc(stat_count[STATS_DOMAIN_DNS] * sizeof(struct name_desc));
+	if (!stat_f[STATS_DOMAIN_DNS]) {
+		ha_alert("stats: cannot allocate all fields for dns statistics\n");
 		err_code |= ERR_ALERT | ERR_FATAL;
 		return err_code;
 	}
 
-	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_RESOLVERS], list) {
-		memcpy(stat_f[STATS_DOMAIN_RESOLVERS] + i,
+	list_for_each_entry(mod, &stats_module_list[STATS_DOMAIN_DNS], list) {
+		memcpy(stat_f[STATS_DOMAIN_DNS] + i,
 		       mod->stats,
 		       mod->stats_count * sizeof(struct name_desc));
 		i += mod->stats_count;
 	}
 
-	if (!resolv_allocate_counters(&stats_module_list[STATS_DOMAIN_RESOLVERS])) {
-		ha_alert("stats: cannot allocate all counters for resolver statistics\n");
+	if (!resolv_allocate_counters(&stats_module_list[STATS_DOMAIN_DNS])) {
+		ha_alert("stats: cannot allocate all counters for dns statistics\n");
 		err_code |= ERR_ALERT | ERR_FATAL;
 		return err_code;
 	}
@@ -5135,11 +5083,11 @@ static int allocate_stats_rslv_postcheck(void)
 	return err_code;
 }
 
-REGISTER_CONFIG_POSTPARSER("allocate-stats-resolver", allocate_stats_rslv_postcheck);
+REGISTER_CONFIG_POSTPARSER("allocate-stats-dns", allocate_stats_dns_postcheck);
 
 static int allocate_stat_lines_per_thread(void)
 {
-	int domains[] = { STATS_DOMAIN_PROXY, STATS_DOMAIN_RESOLVERS }, i;
+	int domains[] = { STATS_DOMAIN_PROXY, STATS_DOMAIN_DNS }, i;
 
 	for (i = 0; i < STATS_DOMAIN_COUNT; ++i) {
 		const int domain = domains[i];
@@ -5156,7 +5104,7 @@ REGISTER_PER_THREAD_ALLOC(allocate_stat_lines_per_thread);
 static int allocate_trash_counters(void)
 {
 	struct stats_module *mod;
-	int domains[] = { STATS_DOMAIN_PROXY, STATS_DOMAIN_RESOLVERS }, i;
+	int domains[] = { STATS_DOMAIN_PROXY, STATS_DOMAIN_DNS }, i;
 	size_t max_counters_size = 0;
 
 	/* calculate the greatest counters used by any stats modules */
@@ -5183,7 +5131,7 @@ REGISTER_PER_THREAD_ALLOC(allocate_trash_counters);
 
 static void deinit_stat_lines_per_thread(void)
 {
-	int domains[] = { STATS_DOMAIN_PROXY, STATS_DOMAIN_RESOLVERS }, i;
+	int domains[] = { STATS_DOMAIN_PROXY, STATS_DOMAIN_DNS }, i;
 
 	for (i = 0; i < STATS_DOMAIN_COUNT; ++i) {
 		const int domain = domains[i];
@@ -5197,7 +5145,7 @@ REGISTER_PER_THREAD_FREE(deinit_stat_lines_per_thread);
 
 static void deinit_stats(void)
 {
-	int domains[] = { STATS_DOMAIN_PROXY, STATS_DOMAIN_RESOLVERS }, i;
+	int domains[] = { STATS_DOMAIN_PROXY, STATS_DOMAIN_DNS }, i;
 
 	for (i = 0; i < STATS_DOMAIN_COUNT; ++i) {
 		const int domain = domains[i];

@@ -27,7 +27,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include <import/ebtree-t.h>
+#include <import/eb32tree.h>
+#include <import/ebpttree.h>
 
 #include <haproxy/api-t.h>
 #include <haproxy/arg-t.h>
@@ -200,12 +201,9 @@ enum PR_SRV_STATE_FILE {
 #define PR_RE_EARLY_ERROR         0x00010000 /* Retry if we failed at sending early data */
 #define PR_RE_JUNK_REQUEST        0x00020000 /* We received an incomplete or garbage response */
 
-/* Proxy flags */
-#define PR_FL_DISABLED           0x01  /* The proxy was disabled in the configuration (not at runtime) */
-#define PR_FL_STOPPED            0x02  /* The proxy was stopped */
-#define PR_FL_READY              0x04  /* The proxy is ready to be used (initialized and configured) */
-#define PR_FL_EXPLICIT_REF       0x08  /* The default proxy is explicitly referenced by another proxy */
-#define PR_FL_IMPLICIT_REF       0x10  /* The default proxy is implicitly referenced by another proxy */
+/* disabled state */
+#define PR_DISABLED               0x1  /* The proxy was disabled in the configuration (not at runtime) */
+#define PR_STOPPED                0x2  /* The proxy was stopped */
 
 struct stream;
 
@@ -261,7 +259,7 @@ struct error_snapshot {
 
 struct proxy {
 	enum obj_type obj_type;                 /* object type == OBJ_TYPE_PROXY */
-	char flags;                             /* bit field PR_FL_* */
+	char disabled;                          /* bit field PR_DISABLED | PR_STOPPED */
 	enum pr_mode mode;                      /* mode = PR_MODE_TCP, PR_MODE_HTTP, ... */
 	char cap;                               /* supported capabilities (PR_CAP_*) */
 	unsigned int maxconn;                   /* max # of active streams on the frontend */
@@ -276,7 +274,6 @@ struct proxy {
 		struct proxy *be;		/* default backend, or NULL if none set */
 		char *name;			/* default backend name during config parse */
 	} defbe;
-	struct proxy *defpx;                    /* default proxy used to init this one (may be NULL) */
 	struct list acl;                        /* ACL declared on this proxy */
 	struct list http_req_rules;		/* HTTP request rules: allow/deny/... */
 	struct list http_res_rules;		/* HTTP response rules: allow/deny/... */
@@ -423,7 +420,6 @@ struct proxy {
 		struct list listeners;		/* list of listeners belonging to this frontend */
 		struct list errors;             /* list of all custom error files */
 		struct arg_list args;           /* sample arg list that need to be resolved */
-		unsigned int refcount;          /* refcount on this proxy (only used for default proxy for now) */
 		struct ebpt_node by_name;       /* proxies are stored sorted by name here */
 		char *logformat_string;		/* log format string */
 		char *lfs_file;                 /* file name where the logformat string appears (strdup) */

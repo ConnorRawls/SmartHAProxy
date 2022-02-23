@@ -22,7 +22,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#include <import/ebpttree.h>
 #include <import/ebsttree.h>
 
 #include <haproxy/base64.h>
@@ -1799,7 +1798,6 @@ static void __ssl_sock_load_new_ckch_instance(struct ckch_inst *ckchi)
 
 		/* flush the session cache of the server */
 		for (i = 0; i < global.nbthread; i++) {
-			ha_free(&ckchi->server->ssl_ctx.reused_sess[i].sni);
 			ha_free(&ckchi->server->ssl_ctx.reused_sess[i].ptr);
 		}
 		HA_RWLOCK_WRUNLOCK(SSL_SERVER_LOCK, &ckchi->server->ssl_ctx.lock);
@@ -2507,7 +2505,8 @@ end:
 		appctx->ctx.ssl.new_cafile_entry = NULL;
 		appctx->ctx.ssl.old_cafile_entry = NULL;
 
-		ha_free(&appctx->ctx.ssl.path);
+		free(appctx->ctx.ssl.path);
+		appctx->ctx.ssl.path = NULL;
 
 		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 		return cli_dynerr(appctx, memprintf(&err, "%sCan't update %s!\n", err ? err : "", args[3]));
@@ -3225,7 +3224,8 @@ end:
 		appctx->ctx.ssl.new_crlfile_entry = NULL;
 		appctx->ctx.ssl.old_crlfile_entry = NULL;
 
-		ha_free(&appctx->ctx.ssl.path);
+		free(appctx->ctx.ssl.path);
+		appctx->ctx.ssl.path = NULL;
 
 		HA_SPIN_UNLOCK(CKCH_LOCK, &ckch_lock);
 		return cli_dynerr(appctx, memprintf(&err, "%sCan't update %s!\n", err ? err : "", args[3]));

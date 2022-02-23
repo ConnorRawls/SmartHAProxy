@@ -3,7 +3,6 @@
 # OT_INC     : force the include path to libopentracing-c-wrapper
 # OT_LIB     : force the lib path to libopentracing-c-wrapper
 # OT_RUNPATH : add libopentracing-c-wrapper RUNPATH to haproxy executable
-# OT_USE_VARS : allows the use of variables for the OpenTracing context
 
 OT_DEFINE    =
 OT_CFLAGS    =
@@ -62,13 +61,8 @@ OPTIONS_OBJS += \
 	addons/ot/src/parser.o      \
 	addons/ot/src/pool.o        \
 	addons/ot/src/scope.o       \
-	addons/ot/src/util.o
-
-ifneq ($(OT_USE_VARS),)
-OT_DEFINE     = -DUSE_OT_VARS
-OPTIONS_OBJS += \
+	addons/ot/src/util.o        \
 	addons/ot/src/vars.o
-endif
 
 OPTIONS_CFLAGS  += $(OT_CFLAGS) -Iaddons/ot/include
 OPTIONS_LDFLAGS += $(OT_LDFLAGS)

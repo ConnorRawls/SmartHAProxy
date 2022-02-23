@@ -20,12 +20,11 @@
 
 #include <haproxy/activity.h>
 #include <haproxy/api.h>
-#include <haproxy/clock.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
 #include <haproxy/signal.h>
-#include <haproxy/task.h>
 #include <haproxy/ticks.h>
+#include <haproxy/time.h>
 
 /*
  * Private data:
@@ -159,7 +158,8 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	 * Determine how long to wait for events to materialise on the port.
 	 */
 	wait_time = wake ? 0 : compute_poll_timeout(exp);
-	clock_entering_poll();
+	tv_entering_poll();
+	activity_count_runtime();
 
 	do {
 		int timeout = (global.tune.options & GTUNE_BUSY_POLLING) ? 0 : wait_time;
@@ -190,7 +190,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 				break;
 			}
 		}
-		clock_update_date(timeout, nevlist);
+		tv_update_date(timeout, nevlist);
 
 		if (nevlist || interrupted)
 			break;
@@ -202,7 +202,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 			break;
 	} while(1);
 
-	clock_leaving_poll(wait_time, nevlist);
+	tv_leaving_poll(wait_time, nevlist);
 
 	thread_harmless_end();
 	thread_idle_end();
@@ -293,7 +293,7 @@ static int init_evports_per_thread()
 	int fd;
 
 	evports_evlist_max = global.tune.maxpollevents;
-	evports_evlist = calloc(evports_evlist_max, sizeof(*evports_evlist));
+	evports_evlist = calloc(evports_evlist_max, sizeof (port_event_t));
 	if (evports_evlist == NULL) {
 		goto fail_alloc;
 	}

@@ -26,7 +26,6 @@
 #include <haproxy/global.h>
 #include <haproxy/mworker.h>
 #include <haproxy/task.h>
-#include <haproxy/time.h>
 
 
 static int use_program = 0; /* do we use the program section ? */
@@ -327,11 +326,6 @@ int cfg_program_postparser()
 {
 	int err_code = 0;
 	struct mworker_proc *child;
-
-	/* we only need to check this during configuration parsing,
-	 * wait mode doesn't have the complete description of a program */
-	if (global.mode & MODE_MWORKER_WAIT)
-		return err_code;
 
 	list_for_each_entry(child, &proc_list, list) {
 		if (child->reloads == 0 && (child->options & PROC_O_TYPE_PROG)) {

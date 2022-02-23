@@ -50,11 +50,6 @@
 #include <time.h>
 #include <syslog.h>
 #include <grp.h>
-
-#ifdef USE_THREAD
-#include <pthread.h>
-#endif
-
 #ifdef USE_CPU_AFFINITY
 #include <sched.h>
 #if defined(__FreeBSD__) || defined(__DragonFly__)
@@ -62,6 +57,12 @@
 #ifdef __FreeBSD__
 #include <sys/cpuset.h>
 #endif
+#include <pthread_np.h>
+#endif
+#ifdef __APPLE__
+#include <mach/mach_types.h>
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
 #endif
 #endif
 
@@ -95,7 +96,6 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/chunk.h>
 #include <haproxy/cli.h>
-#include <haproxy/clock.h>
 #include <haproxy/connection.h>
 #ifdef USE_CPU_AFFINITY
 #include <haproxy/cpuset.h>
@@ -139,6 +139,12 @@
 #include <haproxy/vars.h>
 #include <haproxy/version.h>
 
+///////////////// Begin edits /////////////////
+#include <haproxy/blacklist.h>
+#include <haproxy/sdsock.h>
+
+struct Blacklist blacklist;
+////////////////// End edits //////////////////
 
 /* array of init calls for older platforms */
 DECLARE_INIT_STAGES;
@@ -253,7 +259,6 @@ unsigned int rlim_fd_max_at_boot = 0;
 /* per-boot randomness */
 unsigned char boot_seed[20];        /* per-boot random seed (160 bits initially) */
 
-/* takes the thread config in argument or NULL for any thread */
 static void *run_thread_poll_loop(void *data);
 
 /* bitfield of a few warnings to emit just once (WARN_*) */
@@ -690,7 +695,7 @@ static void get_cur_unixsocket()
  * When called, this function reexec haproxy with -sf followed by current
  * children PIDs and possibly old children PIDs if they didn't leave yet.
  */
-static void mworker_reexec()
+void mworker_reload()
 {
 	char **next_argv = NULL;
 	int old_argc = 0; /* previous number of argument */
@@ -708,9 +713,6 @@ static void mworker_reexec()
 	setenv("HAPROXY_MWORKER_REEXEC", "1", 1);
 
 	mworker_proc_list_to_env(); /* put the children description in the env */
-
-	/* ensure that we close correctly every listeners before reexecuting */
-	mworker_cleanlisteners();
 
 	/* during the reload we must ensure that every FDs that can't be
 	 * reuse (ie those that are not referenced in the proc_list)
@@ -780,8 +782,10 @@ static void mworker_reexec()
 	for (i = 1; i < old_argc; i++)
 		next_argv[next_argc++] = old_argv[i];
 
+	ha_warning("Reexecuting Master process\n");
 	signal(SIGPROF, SIG_IGN);
 	execvp(next_argv[0], next_argv);
+
 	ha_warning("Failed to reexecute the master process [%d]: %s\n", pid, strerror(errno));
 	ha_free(&next_argv);
 	return;
@@ -790,28 +794,6 @@ alloc_error:
 	ha_free(&next_argv);
 	ha_warning("Failed to reexecute the master process [%d]: Cannot allocate memory\n", pid);
 	return;
-}
-
-/* reexec haproxy in waitmode */
-static void mworker_reexec_waitmode()
-{
-	setenv("HAPROXY_MWORKER_WAIT_ONLY", "1", 1);
-	mworker_reexec();
-}
-
-/* reload haproxy and emit a warning */
-void mworker_reload()
-{
-	struct mworker_proc *child;
-
-	ha_notice("Reloading HAProxy\n");
-
-	/* increment the number of reloads */
-	list_for_each_entry(child, &proc_list, list) {
-		child->reloads++;
-	}
-
-	mworker_reexec();
 }
 
 static void mworker_loop()
@@ -824,6 +806,7 @@ static void mworker_loop()
 	/* Busy polling makes no sense in the master :-) */
 	global.tune.options &= ~GTUNE_BUSY_POLLING;
 
+	master = 1;
 
 	signal_unregister(SIGTTIN);
 	signal_unregister(SIGTTOU);
@@ -841,6 +824,7 @@ static void mworker_loop()
 	signal_register_fct(SIGCHLD, mworker_catch_sigchld, SIGCHLD);
 
 	mworker_unblock_signals();
+	mworker_cleanlisteners();
 	mworker_cleantasks();
 
 	mworker_catch_sigchld(NULL); /* ensure we clean the children in case
@@ -858,7 +842,7 @@ static void mworker_loop()
 		leave */
 
 	fork_poller();
-	run_thread_poll_loop(NULL);
+	run_thread_poll_loop(0);
 }
 
 /*
@@ -866,24 +850,13 @@ static void mworker_loop()
  */
 void reexec_on_failure()
 {
-	struct mworker_proc *child;
-
 	if (!atexit_flag)
 		return;
 
-	/* get the info of the children in the env */
-	if (mworker_env_to_proc_list() < 0) {
-		exit(EXIT_FAILURE);
-	}
+	setenv("HAPROXY_MWORKER_WAIT_ONLY", "1", 1);
 
-	/* increment the number of failed reloads */
-	list_for_each_entry(child, &proc_list, list) {
-		child->failedreloads++;
-	}
-
-	usermsgs_clr(NULL);
-	ha_warning("Loading failure!\n");
-	mworker_reexec_waitmode();
+	ha_warning("Reexecuting Master process in waitpid mode\n");
+	mworker_reload();
 }
 
 
@@ -1540,7 +1513,7 @@ static void init(int argc, char **argv)
 #endif
 
 	tzset();
-	clock_init_process_date();
+	tv_init_process_date();
 	start_date = now;
 
 	ha_random_boot(argv);
@@ -1960,7 +1933,6 @@ static void init(int argc, char **argv)
 				exit(EXIT_FAILURE);
 			}
 			tmproc->options |= PROC_O_TYPE_MASTER; /* master */
-			tmproc->failedreloads = 0;
 			tmproc->reloads = 0;
 			tmproc->pid = pid;
 			tmproc->timestamp = start_date.tv_sec;
@@ -1980,7 +1952,6 @@ static void init(int argc, char **argv)
 
 		tmproc->options |= PROC_O_TYPE_WORKER; /* worker */
 		tmproc->pid = -1;
-		tmproc->failedreloads = 0;
 		tmproc->reloads = 0;
 		tmproc->timestamp = -1;
 		tmproc->ipc_fd[0] = -1;
@@ -2024,9 +1995,8 @@ static void init(int argc, char **argv)
 		ha_warning("a master CLI socket was defined, but master-worker mode (-W) is not enabled.\n");
 	}
 
-	/* destroy unreferenced defaults proxies  */
-	proxy_destroy_all_unref_defaults();
-
+	/* defaults sections are not needed anymore */
+	proxy_destroy_all_defaults();
 
 	err_code |= check_config_validity();
 	for (px = proxies_list; px; px = px->next) {
@@ -2034,7 +2004,7 @@ static void init(int argc, char **argv)
 		struct post_proxy_check_fct *ppcf;
 		struct post_server_check_fct *pscf;
 
-		if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+		if (px->disabled)
 			continue;
 
 		list_for_each_entry(pscf, &post_server_check_list, list) {
@@ -2096,13 +2066,13 @@ static void init(int argc, char **argv)
 				break;
 
 		for (px = proxies_list; px; px = px->next)
-			if (!(px->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) && px->li_all)
+			if (!px->disabled && px->li_all)
 				break;
 
 		if (!px) {
 			/* We may only have log-forward section */
 			for (px = cfg_log_forward; px; px = px->next)
-				if (!(px->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) && px->li_all)
+				if (!px->disabled && px->li_all)
 					break;
 		}
 
@@ -2436,7 +2406,7 @@ static void init(int argc, char **argv)
 
 	/* stop disabled proxies */
 	for (px = proxies_list; px; px = px->next) {
-		if (px->flags & (PR_FL_DISABLED|PR_FL_STOPPED))
+		if (px->disabled)
 			stop_proxy(px);
 	}
 
@@ -2517,9 +2487,6 @@ void deinit(void)
 		p = p->next;
 		free_proxy(p0);
 	}/* end while(p) */
-
-	/* destroy all referenced defaults proxies  */
-	proxy_destroy_all_unref_defaults();
 
 	while (ua) {
 		struct stat_scope *scope, *scopep;
@@ -2650,12 +2617,32 @@ __attribute__((noreturn)) void deinit_and_exit(int status)
 	exit(status);
 }
 
+/* Handler of the task of mux_stopping_data.
+ * Called on soft-stop.
+ */
+struct task *mux_stopping_process(struct task *t, void *ctx, unsigned int state)
+{
+	struct connection *conn, *back;
+
+	list_for_each_entry_safe(conn, back, &mux_stopping_data[tid].list, stopping_list) {
+		if (conn->mux && conn->mux->wake)
+			conn->mux->wake(conn);
+	}
+
+	return t;
+}
+
 /* Runs the polling loop */
 void run_poll_loop()
 {
 	int next, wake;
 
-	clock_update_date(0,1);
+	/* allocates the thread bound mux_stopping_data task */
+	mux_stopping_data[tid].task = task_new(tid_bit);
+	mux_stopping_data[tid].task->process = mux_stopping_process;
+	LIST_INIT(&mux_stopping_data[tid].list);
+
+	tv_update_date(0,1);
 	while (1) {
 		wake_expired_tasks();
 
@@ -2724,6 +2711,8 @@ void run_poll_loop()
 
 		activity[tid].loops++;
 	}
+
+	task_destroy(mux_stopping_data[tid].task);
 }
 
 static void *run_thread_poll_loop(void *data)
@@ -2736,10 +2725,16 @@ static void *run_thread_poll_loop(void *data)
 	__decl_thread(static pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER);
 	__decl_thread(static pthread_cond_t  init_cond  = PTHREAD_COND_INITIALIZER);
 
-	ha_set_thread(data);
-	set_thread_cpu_affinity();
-	clock_set_local_source();
+	ha_set_tid((unsigned long)data);
+	sched = &task_per_thread[tid];
 
+#if (_POSIX_TIMERS > 0) && defined(_POSIX_THREAD_CPUTIME)
+#ifdef USE_THREAD
+	pthread_getcpuclockid(pthread_self(), &ti->clock_id);
+#else
+	ti->clock_id = CLOCK_THREAD_CPUTIME_ID;
+#endif
+#endif
 	/* Now, initialize one thread init at a time. This is better since
 	 * some init code is a bit tricky and may release global resources
 	 * after reallocating them locally. This will also ensure there is
@@ -2753,7 +2748,7 @@ static void *run_thread_poll_loop(void *data)
 		init_left = global.nbthread;
 	init_left--;
 
-	clock_init_thread_date();
+	tv_init_thread_date();
 
 	/* per-thread alloc calls performed here are not allowed to snoop on
 	 * other threads, so they are free to initialize at their own rhythm
@@ -2882,6 +2877,13 @@ int main(int argc, char **argv)
 	struct rlimit limit;
 	int pidfd = -1;
 	int intovf = (unsigned char)argc + 1; /* let the compiler know it's strictly positive */
+
+	///////////////// Begin edits /////////////////
+
+	// Create sdsock
+	SDSock_Make();
+
+	////////////////// End edits //////////////////
 
 	/* Catch forced CFLAGS that miss 2-complement integer overflow */
 	if (intovf + 0x7FFFFFFF >= intovf) {
@@ -3225,7 +3227,7 @@ int main(int argc, char **argv)
 				if (global.mode & MODE_MWORKER) {
 					struct mworker_proc *child;
 
-					ha_notice("New worker (%d) forked\n", ret);
+					ha_notice("New worker #%d (%d) forked\n", 1, ret);
 					/* find the right mworker_proc */
 					list_for_each_entry(child, &proc_list, list) {
 						if (child->reloads == 0 && child->options & PROC_O_TYPE_WORKER) {
@@ -3266,7 +3268,6 @@ int main(int argc, char **argv)
 
 		if (in_parent) {
 			if (global.mode & (MODE_MWORKER|MODE_MWORKER_WAIT)) {
-				master = 1;
 
 				if ((!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) &&
 					(global.mode & MODE_DAEMON)) {
@@ -3278,16 +3279,7 @@ int main(int argc, char **argv)
 					global.mode |= MODE_QUIET; /* ensure that we won't say anything from now */
 				}
 
-				if (global.mode & MODE_MWORKER_WAIT) {
-					/* only the wait mode handles the master CLI */
-					mworker_loop();
-				} else {
-
-					/* if not in wait mode, reload in wait mode to free the memory */
-					ha_notice("Loading success.\n");
-					proc_self->failedreloads = 0; /* reset the number of failure */
-					mworker_reexec_waitmode();
-				}
+				mworker_loop();
 				/* should never get there */
 				exit(EXIT_FAILURE);
 			}
@@ -3374,13 +3366,15 @@ int main(int argc, char **argv)
 		 * it would have already be done, and 0-2 would have been
 		 * affected to listening sockets
 		 */
-		if ((global.mode & MODE_DAEMON) &&
-		    (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE))) {
-			/* detach from the tty */
-			stdio_quiet(devnullfd);
-			global.mode &= ~MODE_VERBOSE;
-			global.mode |= MODE_QUIET; /* ensure that we won't say anything from now */
-		}
+////////////////////////////////////////////// BEGIN MUTE //////////////////////////////////////////////
+		//if ((global.mode & MODE_DAEMON) &&
+		//    (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE))) {
+		//	/* detach from the tty */
+		//	stdio_quiet(devnullfd);
+		//	global.mode &= ~MODE_VERBOSE;
+		//	global.mode |= MODE_QUIET; /* ensure that we won't say anything from now */
+		//}
+/////////////////////////////////////////////// END MUTE ///////////////////////////////////////////////
 		pid = getpid(); /* update child's pid */
 		if (!(global.mode & MODE_MWORKER)) /* in mworker mode we don't want a new pgid for the children */
 			setsid();
@@ -3427,29 +3421,90 @@ int main(int argc, char **argv)
 			ha_warning("[%s.main()] Failed to set the dumpable flag, "
 				   "no core will be dumped.\n", argv[0]);
 #elif defined(USE_PROCCTL)
-		{
-			int traceable = PROC_TRACE_CTL_ENABLE;
-			if (procctl(P_PID, getpid(), PROC_TRACE_CTL, &traceable) == -1)
-				ha_warning("[%s.main()] Failed to set the traceable flag, "
-					   "no core will be dumped.\n", argv[0]);
-		}
+		int traceable = PROC_TRACE_CTL_ENABLE;
+		if (procctl(P_PID, getpid(), PROC_TRACE_CTL, &traceable) == -1)
+			ha_warning("[%s.main()] Failed to set the traceable flag, "
+				   "no core will be dumped.\n", argv[0]);
 #endif
 	}
 
 	global.mode &= ~MODE_STARTING;
 	reset_usermsgs_ctx();
 
-	/* start threads 2 and above */
-	setup_extra_threads(&run_thread_poll_loop);
+	/*
+	 * That's it : the central polling loop. Run until we stop.
+	 */
+#ifdef USE_THREAD
+	{
+		sigset_t     blocked_sig, old_sig;
+		int          i;
 
-	/* when multithreading we need to let only the thread 0 handle the signals */
+		/* ensure the signals will be blocked in every thread */
+		sigfillset(&blocked_sig);
+		sigdelset(&blocked_sig, SIGPROF);
+		sigdelset(&blocked_sig, SIGBUS);
+		sigdelset(&blocked_sig, SIGFPE);
+		sigdelset(&blocked_sig, SIGILL);
+		sigdelset(&blocked_sig, SIGSEGV);
+		pthread_sigmask(SIG_SETMASK, &blocked_sig, &old_sig);
+
+		/* Create nbthread-1 thread. The first thread is the current process */
+		ha_thread_info[0].pthread = pthread_self();
+		for (i = 1; i < global.nbthread; i++)
+			pthread_create(&ha_thread_info[i].pthread, NULL, &run_thread_poll_loop, (void *)(long)i);
+
+#ifdef USE_CPU_AFFINITY
+		/* Now the CPU affinity for all threads */
+
+		for (i = 0; i < global.nbthread; i++) {
+			if (ha_cpuset_count(&cpu_map.proc))
+				ha_cpuset_and(&cpu_map.thread[i], &cpu_map.proc);
+
+			if (i < MAX_THREADS &&       /* only the first 32/64 threads may be pinned */
+			    ha_cpuset_count(&cpu_map.thread[i])) {/* only do this if the thread has a THREAD map */
+#if defined(__APPLE__)
+				int j;
+				unsigned long set = cpu_map.thread[i].cpuset;
+
+				while ((j = ffsl(set)) > 0) {
+					thread_affinity_policy_data_t cpu_set = { j - 1 };
+					thread_port_t mthread = pthread_mach_thread_np(ha_thread_info[i].pthread);
+					thread_policy_set(mthread, THREAD_AFFINITY_POLICY, (thread_policy_t)&cpu_set, 1);
+					set &= ~(1UL << (j - 1));
+				}
+#else
+				struct hap_cpuset *set = &cpu_map.thread[i];
+				pthread_setaffinity_np(ha_thread_info[i].pthread,
+				                       sizeof(set->cpuset), &set->cpuset);
+#endif
+			}
+		}
+#endif /* !USE_CPU_AFFINITY */
+
+		/* when multithreading we need to let only the thread 0 handle the signals */
+		haproxy_unblock_signals();
+
+		/* Finally, start the poll loop for the first thread */
+		run_thread_poll_loop(0);
+
+		/* Wait the end of other threads */
+		for (i = 1; i < global.nbthread; i++)
+			pthread_join(ha_thread_info[i].pthread, NULL);
+
+#if defined(DEBUG_THREAD) || defined(DEBUG_FULL)
+		show_lock_stats();
+#endif
+	}
+#else /* ! USE_THREAD */
 	haproxy_unblock_signals();
+	run_thread_poll_loop(0);
+#endif
 
-	/* Finally, start the poll loop for the first thread */
-	run_thread_poll_loop(&ha_thread_info[0]);
+	///////////////// Begin edits /////////////////
+	
+	// Destroy blacklist and sdsock
 
-	/* wait for all threads to terminate */
-	wait_for_threads_completion();
+	////////////////// End edits //////////////////
 
 	deinit_and_exit(0);
 }

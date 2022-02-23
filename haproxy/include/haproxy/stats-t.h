@@ -253,8 +253,8 @@ enum field_scope {
 	FS_MASK     = 0xFF000000,
 };
 
-/* Show info fields for CLI output. For any field added here, please add the
- * text representation in the info_fields array. Please only append at the end,
+/* Show Info fields for CLI output. For any field added here, please add the text
+ * representation in the info_field_names array below. Please only append at the end,
  * before the INF_TOTAL_FIELDS entry, and never insert anything in the middle
  * nor at the beginning.
  */
@@ -338,7 +338,7 @@ enum info_field {
 
 
 /* Stats fields for CSV output. For any field added here, please add the text
- * representation in the stat_fields array. Please only append at the end,
+ * representation in the stat_field_names array below. Please only append at the end,
  * before the ST_F_TOTAL_FIELDS entry, and never insert anything in the middle
  * nor at the beginning.
  */
@@ -443,7 +443,6 @@ enum stat_field {
 	ST_F_USED_CONN_CUR,
 	ST_F_NEED_CONN_EST,
 	ST_F_UWEIGHT,
-	ST_F_AGG_SRV_CHECK_STATUS,
 
 	/* must always be the last one */
 	ST_F_TOTAL_FIELDS
@@ -470,7 +469,7 @@ enum counters_type {
 	COUNTERS_BE,
 	COUNTERS_SV,
 	COUNTERS_LI,
-	COUNTERS_RSLV,
+	COUNTERS_DNS,
 
 	COUNTERS_OFF_END
 };
@@ -502,7 +501,7 @@ struct extra_counters {
 /* stats_domain is used in a flag as a 1 byte field */
 enum stats_domain {
 	STATS_DOMAIN_PROXY = 0,
-	STATS_DOMAIN_RESOLVERS,
+	STATS_DOMAIN_DNS,
 	STATS_DOMAIN_COUNT,
 
 	STATS_DOMAIN_MASK  = 0xff

@@ -673,7 +673,7 @@ static inline int is_addr(const struct sockaddr_storage *addr)
 }
 
 /* returns port in network byte order */
-static inline int get_net_port(const struct sockaddr_storage *addr)
+static inline int get_net_port(struct sockaddr_storage *addr)
 {
 	switch (addr->ss_family) {
 	case AF_INET:
@@ -685,7 +685,7 @@ static inline int get_net_port(const struct sockaddr_storage *addr)
 }
 
 /* returns port in host byte order */
-static inline int get_host_port(const struct sockaddr_storage *addr)
+static inline int get_host_port(struct sockaddr_storage *addr)
 {
 	switch (addr->ss_family) {
 	case AF_INET:
@@ -981,7 +981,7 @@ void dump_addr_and_bytes(struct buffer *buf, const char *pfx, const void *addr, 
 void dump_hex(struct buffer *out, const char *pfx, const void *buf, int len, int unsafe);
 int may_access(const void *ptr);
 const void *resolve_sym_name(struct buffer *buf, const char *pfx, const void *addr);
-const char *get_exec_path(void);
+const char *get_exec_path();
 void *get_sym_curr_addr(const char *name);
 void *get_sym_next_addr(const char *name);
 
@@ -1027,7 +1027,7 @@ int parse_dotted_uints(const char *s, unsigned int **nums, size_t *sz);
 void ha_generate_uuid(struct buffer *output);
 void ha_random_seed(const unsigned char *seed, size_t len);
 void ha_random_jump96(uint32_t dist);
-uint64_t ha_random64(void);
+uint64_t ha_random64();
 
 static inline uint32_t ha_random32()
 {
@@ -1096,7 +1096,5 @@ static inline void update_char_fingerprint(uint8_t *fp, char prev, char curr)
 
 /* compare the current OpenSSL version to a string */
 int openssl_compare_current_version(const char *version);
-/* compare the current OpenSSL name to a string */
-int openssl_compare_current_name(const char *name);
 
 #endif /* _HAPROXY_TOOLS_H */

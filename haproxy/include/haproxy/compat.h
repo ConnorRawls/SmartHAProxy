@@ -23,6 +23,8 @@
 #define _HAPROXY_COMPAT_H
 
 #include <limits.h>
+#include <signal.h>
+#include <time.h>
 #include <unistd.h>
 /* This is needed on Linux for Netfilter includes */
 #include <sys/param.h>
@@ -81,16 +83,6 @@ typedef struct { } empty_t;
 
 #ifndef BITS_PER_INT
 #define BITS_PER_INT    (8*sizeof(int))
-#endif
-
-#ifndef __WORDSIZE
-# if defined(__SIZEOF_LONG__) && __SIZEOF_LONG__ == 4
-#  define __WORDSIZE 32
-# elif defined(__SIZEOF_LONG__) && __SIZEOF_LONG__ == 8
-#  define __WORDSIZE 64
-# else
-#  error "Unknown machine word size (__WORDSIZE, __SIZEOF_LONG)"
-# endif
 #endif
 
 #ifndef MIN
@@ -153,6 +145,24 @@ typedef struct { } empty_t;
 #define F_SETPIPE_SZ (1024 + 7)
 #endif
 
+/* On FreeBSD we don't have SI_TKILL but SI_LWP instead */
+#if !defined(SI_TKILL) && defined(SI_LWP)
+#define SI_TKILL SI_LWP
+#endif
+
+/* systems without such defines do not know clockid_t or timer_t */
+#if !(_POSIX_TIMERS > 0)
+#undef clockid_t
+#define clockid_t empty_t
+#undef timer_t
+#define timer_t empty_t
+#endif
+
+/* define a dummy value to designate "no timer". Use only 32 bits. */
+#ifndef TIMER_INVALID
+#define TIMER_INVALID ((timer_t)(unsigned long)(0xfffffffful))
+#endif
+
 #if defined(USE_TPROXY) && defined(USE_NETFILTER)
 #include <linux/types.h>
 #include <linux/netfilter_ipv6.h>
@@ -187,9 +197,9 @@ typedef struct { } empty_t;
  * USE_NETFILTER define.
  */
 #if !defined(SO_REUSEPORT) && defined(USE_NETFILTER)
-#if defined(SO_REUSEADDR) && (SO_REUSEADDR == 2)
+#if    (SO_REUSEADDR == 2)
 #define SO_REUSEPORT 15
-#elif defined(SO_REUSEADDR) && (SO_REUSEADDR == 0x0004)
+#elif  (SO_REUSEADDR == 0x0004)
 #define SO_REUSEPORT 0x0200
 #endif /* SO_REUSEADDR */
 #endif /* SO_REUSEPORT */
@@ -262,12 +272,6 @@ typedef struct { } empty_t;
 #define HA_HAVE_FAST_MALLOC
 #endif
 
-/* glibc 2.33 provides mallinfo2() that overcomes mallinfo()'s type limitations */
-#if (defined(__GNU_LIBRARY__) && (__GLIBC__ > 2 || __GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
-#include <malloc.h>
-#define HA_HAVE_MALLINFO2
-#endif
-
 /* FreeBSD also has malloc_usable_size() but it requires malloc_np.h */
 #if defined(USE_MEMORY_PROFILING) && defined(__FreeBSD__) && (__FreeBSD_version >= 700002)
 #include <malloc_np.h>
@@ -283,6 +287,13 @@ typedef struct { } empty_t;
  * able to send 253 fds per sendmsg(), not sure about the other OSes.
  */
 #define MAX_SEND_FD 253
+
+/* Make the new complex name for the xxhash function easier to remember
+ * and use.
+ */
+#ifndef XXH3
+#define XXH3(data, len, seed) XXH3_64bits_withSeed(data, len, seed)
+#endif
 
 #endif /* _HAPROXY_COMPAT_H */
 

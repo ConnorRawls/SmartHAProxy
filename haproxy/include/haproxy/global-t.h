@@ -111,7 +111,7 @@ struct global {
 	int rlimit_memmax_all;	/* default all-process memory limit in megs ; 0=unset */
 	int rlimit_memmax;	/* default per-process memory limit in megs ; 0=unset */
 	long maxzlibmem;        /* max RAM for zlib in bytes */
-	int nbtgroups;          /* number of thread groups (IDs start at 1) */
+
 	int spread_checks;
 	int max_spread_checks;
 	int max_syslog_len;
@@ -179,7 +179,6 @@ struct global {
 	struct freq_ctr comp_bps_in;	/* bytes per second, before http compression */
 	struct freq_ctr comp_bps_out;	/* bytes per second, after http compression */
 	struct freq_ctr out_32bps;      /* #of 32-byte blocks emitted per second */
-	uint sslconns, totalsslconns;   /* active, total # of SSL conns */
 	unsigned long long out_bytes;   /* total #of bytes emitted */
 	unsigned long long spliced_out_bytes; /* total #of bytes emitted though a kernel pipe */
 	int cps_lim, cps_max;

@@ -20,8 +20,6 @@
 #include <ctype.h>
 #include <time.h>
 
-#include <haproxy/compiler.h>
-
 #include <import/eb32tree.h>
 #include <import/eb64tree.h>
 #include <import/ebistree.h>
@@ -119,9 +117,7 @@ struct url_stat {
 #define FILT_COUNT_COOK_CODES 0x40000000
 #define FILT_COUNT_IP_COUNT   0x80000000
 
-#define FILT2_TIMESTAMP         0x01
-#define FILT2_PRESERVE_QUERY    0x02
-#define FILT2_EXTRACT_CAPTURE   0x04
+#define FILT2_TIMESTAMP	0x01
 
 unsigned int filter = 0;
 unsigned int filter2 = 0;
@@ -142,21 +138,17 @@ void filter_count_term_codes(const char *accept_field, const char *time_field, s
 void filter_count_status(const char *accept_field, const char *time_field, struct timer **tptr);
 void filter_graphs(const char *accept_field, const char *time_field, struct timer **tptr);
 void filter_output_line(const char *accept_field, const char *time_field, struct timer **tptr);
-void filter_extract_capture(const char *accept_field, const char *time_field, unsigned int, unsigned int);
 void filter_accept_holes(const char *accept_field, const char *time_field, struct timer **tptr);
 
 void usage(FILE *output, const char *msg)
 {
 	fprintf(output,
 		"%s"
-		"Usage:\n"
-		"  halog [-h|--help] for long help\n"
-		"  halog [input_filters]* [modifiers]* [output_format] < log\n"
-		"    inp = [-e|-E] [-H] [-Q|-QS] [-rt|-RT <time>] [-ad <delay>] [-ac <count>]\n"
-		"          [-hs|-HS [min][:[max]]] [-tcn|-TCN <termcode>] [-time [min][:[max]]]\n"
-		"    mod = [-q] [-v] [-m <lines>] [-s <skipflds>] [-query]\n"
-		"    out = {-c|-u|-uc|-ue|-ua|-ut|-uao|-uto|-uba|-ubt|-hdr <block>:<field>|\n"
-		"           -cc|-gt|-pct|-st|-tc|-srv|-ic}\n"
+		"Usage: halog [-h|--help] for long help\n"
+		"       halog [-q] [-c] [-m <lines>]\n"
+		"       {-cc|-gt|-pct|-st|-tc|-srv|-u|-uc|-ue|-ua|-ut|-uao|-uto|-uba|-ubt|-ic}\n"
+		"       [-s <skip>] [-e|-E] [-H] [-rt|-RT <time>] [-ad <delay>] [-ac <count>]\n"
+		"       [-v] [-Q|-QS] [-tcn|-TCN <termcode>] [ -hs|-HS [min][:[max]] ] [ -time [min][:[max]] ] < log\n"
 		"\n",
 		msg ? msg : ""
 		);
@@ -172,7 +164,7 @@ void help()
 {
 	usage(stdout, NULL);
 	printf(
-	       "Input filters - several filters may be combined\n"
+	       "Input filters (several filters may be combined) :\n"
 	       " -H                      only match lines containing HTTP logs (ignore TCP)\n"
 	       " -E                      only match lines without any error (no 5xx status)\n"
 	       " -e                      only match lines with errors (status 5xx or negative)\n"
@@ -188,11 +180,10 @@ void help()
 	       " -v                      invert the input filtering condition\n"
 	       " -q                      don't report errors/warnings\n"
 	       " -m <lines>              limit output to the first <lines> lines\n"
-	       " -s <skip_n_fields>      skip n fields from the beginning of a line (default %d)\n"
-	       "                         you can also use -n to start from earlier then field %d\n"
-	       " -query                  preserve the query string for per-URL (-u*) statistics\n"
-	       "\n"
-	       "Output format - only one may be used at a time\n"
+               " -s <skip_n_fields>      skip n fields from the beginning of a line (default %d)\n"
+               "                         you can also use -n to start from earlier then field %d\n"
+               "\n"
+	       "Output filters - only one may be used at a time\n"
 	       " -c    only report the number of lines that would have been printed\n"
 	       " -pct  output connect and response times percentiles\n"
 	       " -st   output number of requests per HTTP status code\n"
@@ -205,9 +196,8 @@ void help()
 	       "       -u : by URL, -uc : request count, -ue : error count\n"
 	       "       -ua : average response time, -ut : average total time\n"
 	       "       -uao, -uto: average times computed on valid ('OK') requests\n"
-	       "       -uba, -ubt: average bytes returned, total bytes returned\n"
-	       " -hdr  output captured header at the given <block>:<field>\n",
-	       SOURCE_FIELD,SOURCE_FIELD
+	       "       -uba, -ubt: average bytes returned, total bytes returned\n",
+               SOURCE_FIELD,SOURCE_FIELD
 	       );
 	exit(0);
 }
@@ -255,16 +245,6 @@ const char *field_stop(const char *p)
 }
 #endif
 
-/* return non-zero if the argument contains at least one zero byte. See principle above. */
-static inline __attribute__((unused)) unsigned long long has_zero64(unsigned long long x)
-{
-	unsigned long long y;
-
-	y = x - 0x0101010101010101ULL; /* generate a carry */
-	y &= ~x;                       /* clear the bits that were already set */
-	return y & 0x8080808080808080ULL;
-}
-
 /* return field <field> (starting from 1) in string <p>. Only consider
  * contiguous spaces (or tabs) as one delimiter. May return pointer to
  * last char if field is not found. Equivalent to awk '{print $field}'.
@@ -277,10 +257,12 @@ const char *field_start(const char *p, int field)
 		/* skip spaces */
 		while (1) {
 			c = *(p++);
-			if (!c) /* end of line */
-				return p-1;
+			if (c > ' ')
+				break;
 			if (c == ' ')
 				continue;
+			if (!c) /* end of line */
+				return p-1;
 			/* other char => new field */
 			break;
 		}
@@ -292,31 +274,13 @@ const char *field_start(const char *p, int field)
 
 		/* skip this field */
 		while (1) {
-#if defined(HA_UNALIGNED_LE64)
-			unsigned long long l = *(unsigned long long *)p;
-			if (!has_zero64(l)) {
-				l ^= 0x2020202020202020;
-				l = has_zero64(l);
-				if (!l) {
-					p += 8;
-					continue;
-				}
-				/* there is at least one space, find it and
-				 * skip it now. The lowest byte in <l> with
-				 * a 0x80 is the right one, but checking for
-				 * it remains slower than testing each byte,
-				 * probably due to the numerous short fields.
-				 */
-				while (*(p++) != ' ')
-					;
-				break;
-			}
-#endif
 			c = *(p++);
-			if (c == '\0')
-				return p - 1;
 			if (c == ' ')
 				break;
+			if (c > ' ')
+				continue;
+			if (c == '\0')
+				return p - 1;
 		}
 	}
 #else
@@ -479,6 +443,22 @@ int str2ic(const char *s)
 }
 
 
+/* Equivalent to strtoul with a length. */
+static inline unsigned int __strl2ui(const char *s, int len)
+{
+	unsigned int i = 0;
+	while (len-- > 0) {
+		i = i * 10 - '0';
+		i += (unsigned char)*s++;
+	}
+	return i;
+}
+
+unsigned int strl2ui(const char *s, int len)
+{
+	return __strl2ui(s, len);
+}
+
 /* Convert "[04/Dec/2008:09:49:40.555]" to an integer equivalent to the time of
  * the day in milliseconds. It returns -1 for all unparsable values. The parser
  * looks ugly but gcc emits far better code that way.
@@ -564,8 +544,7 @@ int convert_date_to_timestamp(const char *field)
 	d = mo = y = h = m = s = 0;
 	e = field;
 
-	e++; // remove '['
-
+	c = *(e++); // remove '['
 	/* day + '/' */
 	while (1) {
 		c = *(e++) - '0';
@@ -718,7 +697,6 @@ int main(int argc, char **argv)
 	int filter_time_resp = 0;
 	int filt_http_status_low = 0, filt_http_status_high = 0;
 	unsigned int filt2_timestamp_low = 0, filt2_timestamp_high = 0;
-	unsigned int filt2_capture_block = 0, filt2_capture_field = 0;
 	int skip_fields = 1;
 
 	void (*line_filter)(const char *accept_field, const char *time_field, struct timer **tptr) = NULL;
@@ -729,36 +707,36 @@ int main(int argc, char **argv)
 			break;
 
 		if (strcmp(argv[0], "-ad") == 0) {
-			if (argc < 2) die("missing option for -ad\n");
+			if (argc < 2) die("missing option for -ad");
 			argc--; argv++;
 			filter |= FILT_ACC_DELAY;
 			filter_acc_delay = atol(*argv);
 		}
 		else if (strcmp(argv[0], "-ac") == 0) {
-			if (argc < 2) die("missing option for -ac\n");
+			if (argc < 2) die("missing option for -ac");
 			argc--; argv++;
 			filter |= FILT_ACC_COUNT;
 			filter_acc_count = atol(*argv);
 		}
 		else if (strcmp(argv[0], "-rt") == 0) {
-			if (argc < 2) die("missing option for -rt\n");
+			if (argc < 2) die("missing option for -rt");
 			argc--; argv++;
 			filter |= FILT_TIME_RESP;
 			filter_time_resp = atol(*argv);
 		}
 		else if (strcmp(argv[0], "-RT") == 0) {
-			if (argc < 2) die("missing option for -RT\n");
+			if (argc < 2) die("missing option for -RT");
 			argc--; argv++;
 			filter |= FILT_TIME_RESP | FILT_INVERT_TIME_RESP;
 			filter_time_resp = atol(*argv);
 		}
 		else if (strcmp(argv[0], "-s") == 0) {
-			if (argc < 2) die("missing option for -s\n");
+			if (argc < 2) die("missing option for -s");
 			argc--; argv++;
 			skip_fields = atol(*argv);
 		}
 		else if (strcmp(argv[0], "-m") == 0) {
-			if (argc < 2) die("missing option for -m\n");
+			if (argc < 2) die("missing option for -m");
 			argc--; argv++;
 			lines_max = atol(*argv);
 		}
@@ -791,13 +769,13 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[0], "-tc") == 0)
 			filter |= FILT_COUNT_TERM_CODES;
 		else if (strcmp(argv[0], "-tcn") == 0) {
-			if (argc < 2) die("missing option for -tcn\n");
+			if (argc < 2) die("missing option for -tcn");
 			argc--; argv++;
 			filter |= FILT_TERM_CODE_NAME;
 			filter_term_code_name = *argv;
 		}
 		else if (strcmp(argv[0], "-TCN") == 0) {
-			if (argc < 2) die("missing option for -TCN\n");
+			if (argc < 2) die("missing option for -TCN");
 			argc--; argv++;
 			filter |= FILT_TERM_CODE_NAME | FILT_INVERT_TERM_CODE_NAME;
 			filter_term_code_name = *argv;
@@ -805,7 +783,7 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[0], "-hs") == 0 || strcmp(argv[0], "-HS") == 0) {
 			char *sep, *str;
 
-			if (argc < 2) die("missing option for -hs/-HS ([min]:[max])\n");
+			if (argc < 2) die("missing option for -hs/-HS ([min]:[max])");
 			filter |= FILT_HTTP_STATUS;
 			if (argv[0][1] == 'H')
 				filter |= FILT_INVERT_HTTP_STATUS;
@@ -823,7 +801,7 @@ int main(int argc, char **argv)
 		else if (strcmp(argv[0], "-time") == 0) {
 			char *sep, *str;
 
-			if (argc < 2) die("missing option for -time ([min]:[max])\n");
+			if (argc < 2) die("missing option for -time ([min]:[max])");
 			filter2 |= FILT2_TIMESTAMP;
 
 			argc--; argv++;
@@ -853,30 +831,8 @@ int main(int argc, char **argv)
 			filter |= FILT_COUNT_URL_BAVG;
 		else if (strcmp(argv[0], "-ubt") == 0)
 			filter |= FILT_COUNT_URL_BTOT;
-		else if (strcmp(argv[0], "-query") == 0)
-			filter2 |= FILT2_PRESERVE_QUERY;
 		else if (strcmp(argv[0], "-ic") == 0)
 			filter |= FILT_COUNT_IP_COUNT;
-		else if (strcmp(argv[0], "-hdr") == 0) {
-			char *sep, *str;
-
-			if (argc < 2) die("missing option for -hdr (<block>:<field>)\n");
-			filter2 |= FILT2_EXTRACT_CAPTURE;
-
-			argc--; argv++;
-			str = *argv;
-			sep = strchr(str, ':');
-			if (!sep)
-				die("missing colon in -hdr (<block>:<field>)\n");
-			else
-				*sep++ = 0;
-
-			filt2_capture_block = *str ? atol(str) : 1;
-			filt2_capture_field = *sep ? atol(sep) : 1;
-
-			if (filt2_capture_block < 1 || filt2_capture_field < 1)
-				die("block and field must be at least 1 for -hdr (<block>:<field>)\n");
-		}
 		else if (strcmp(argv[0], "-o") == 0) {
 			if (output_file)
 				die("Fatal: output file name already specified.\n");
@@ -890,7 +846,7 @@ int main(int argc, char **argv)
 		argv++;
 	}
 
-	if (!filter && !filter2)
+	if (!filter)
 		die("No action specified.\n");
 
 	if (filter & FILT_ACC_COUNT && !filter_acc_count)
@@ -1104,8 +1060,6 @@ int main(int argc, char **argv)
 		if (line_filter) {
 			if (filter & FILT_COUNT_IP_COUNT)
 				filter_count_ip(source_field, accept_field, time_field, &t);
-			else if (filter2 & FILT2_EXTRACT_CAPTURE)
-				filter_extract_capture(accept_field, time_field, filt2_capture_block, filt2_capture_field);
 			else
 				line_filter(accept_field, time_field, &t);
 		}
@@ -1162,12 +1116,13 @@ int main(int argc, char **argv)
 		/* sort all timers */
 		for (f = 0; f < 5; f++) {
 			struct eb32_node *n;
+			int val;
 
+			val = 0;
 			n = eb32_first(&timers[f]);
 			while (n) {
 				int i;
 				double d;
-				int val;
 
 				t = container_of(n, struct timer, node);
 				last = n->key;
@@ -1361,79 +1316,6 @@ int main(int argc, char **argv)
 void filter_output_line(const char *accept_field, const char *time_field, struct timer **tptr)
 {
 	puts(line);
-	lines_out++;
-}
-
-void filter_extract_capture(const char *accept_field, const char *time_field, unsigned int block, unsigned int field)
-{
-	const char *e, *f;
-
-	if (time_field)
-		e = field_start(time_field, METH_FIELD - TIME_FIELD + 1);
-	else
-		e = field_start(accept_field, METH_FIELD - ACCEPT_FIELD + 1);
-
-	while (block-- > 0) {
-		/* Scan until the start of a capture block ('{') until the URL ('"'). */
-		while ((*e != '"' && *e != '{') && *e) {
-			/* Note: some syslog servers escape quotes ! */
-			if (*e == '\\' && e[1] == '"')
-				break;
-
-			e = field_start(e, 2);
-		}
-
-		if (unlikely(!*e)) {
-			truncated_line(linenum, line);
-			return;
-		}
-
-		/* We reached the URL, no more captures will follow. */
-		if (*e != '{') {
-			puts("");
-			lines_out++;
-			return;
-		}
-
-		/* e points the the opening brace of the capture block. */
-
-		e++;
-	}
-
-	/* We are in the first field of the selected capture block. */
-
-	while (--field > 0) {
-		while ((*e != '|' && *e != '}') && *e)
-			e++;
-
-		if (unlikely(!*e)) {
-			truncated_line(linenum, line);
-			return;
-		}
-
-		if (*e != '|') {
-			puts("");
-			lines_out++;
-			return;
-		}
-
-		/* e points to the pipe. */
-
-		e++;
-	}
-
-	f = e;
-
-	while ((*f != '|' && *f != '}') && *f)
-		f++;
-
-	if (unlikely(!*f)) {
-		truncated_line(linenum, line);
-		return;
-	}
-
-	fwrite(e, f - e, 1, stdout);
-	putchar('\n');
 	lines_out++;
 }
 
@@ -1694,8 +1576,7 @@ void filter_count_url(const char *accept_field, const char *time_field, struct t
 	/* stop at end of field or first ';' or '?', takes avg 64 ns per line */
 	e = b;
 	do {
-		if (*e == ' '||
-		    (!(filter2 & FILT2_PRESERVE_QUERY) && (*e == '?' || *e == ';'))) {
+		if (*e == ' ' || *e == '?' || *e == ';') {
 			*(char *)e = 0;
 			break;
 		}

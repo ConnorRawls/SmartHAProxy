@@ -385,8 +385,8 @@ static inline struct ist htx_get_blk_name(const struct htx *htx, const struct ht
 	switch (type) {
 		case HTX_BLK_HDR:
 		case HTX_BLK_TLR:
-			ret = ist2(htx_get_blk_ptr(htx, blk),
-				   blk->info & 0xff);
+			ret.ptr = htx_get_blk_ptr(htx, blk);
+			ret.len = blk->info & 0xff;
 			break;
 
 		default:
@@ -407,15 +407,15 @@ static inline struct ist htx_get_blk_value(const struct htx *htx, const struct h
 	switch (type) {
 		case HTX_BLK_HDR:
 		case HTX_BLK_TLR:
-			ret = ist2(htx_get_blk_ptr(htx, blk) + (blk->info & 0xff),
-				   (blk->info >> 8) & 0xfffff);
+			ret.ptr = htx_get_blk_ptr(htx, blk) + (blk->info & 0xff);
+			ret.len = (blk->info >> 8) & 0xfffff;
 			break;
 
 		case HTX_BLK_REQ_SL:
 		case HTX_BLK_RES_SL:
 		case HTX_BLK_DATA:
-			ret = ist2(htx_get_blk_ptr(htx, blk),
-				   blk->info & 0xfffffff);
+			ret.ptr = htx_get_blk_ptr(htx, blk);
+			ret.len = blk->info & 0xfffffff;
 			break;
 
 		default:
@@ -517,19 +517,12 @@ static inline struct htx_blk *htx_add_endof(struct htx *htx, enum htx_blk_type t
 
 /* Add all headers from the list <hdrs> into the HTX message <htx>, followed by
  * the EOH. On success, it returns the last block inserted (the EOH), otherwise
- * NULL is returned.
- *
- * Headers with a NULL value (.ptr == NULL) are ignored but not those with empty
- * value (.len == 0 but .ptr != NULL)
- */
+ * NULL is returned. */
 static inline struct htx_blk *htx_add_all_headers(struct htx *htx, const struct http_hdr *hdrs)
 {
 	int i;
 
 	for (i = 0; hdrs[i].n.len; i++) {
-		/* Don't check the value length because a header value may be empty */
-		if (isttest(hdrs[i].v) == 0)
-			continue;
 		if (!htx_add_header(htx, hdrs[i].n, hdrs[i].v))
 			return NULL;
 	}
@@ -538,19 +531,12 @@ static inline struct htx_blk *htx_add_all_headers(struct htx *htx, const struct 
 
 /* Add all trailers from the list <hdrs> into the HTX message <htx>, followed by
  * the EOT. On success, it returns the last block inserted (the EOT), otherwise
- * NULL is returned.
- *
- * Trailers with a NULL value (.ptr == NULL) are ignored but not those with
- * empty value (.len == 0 but .ptr != NULL)
- */
+ * NULL is returned. */
 static inline struct htx_blk *htx_add_all_trailers(struct htx *htx, const struct http_hdr *hdrs)
 {
 	int i;
 
 	for (i = 0; hdrs[i].n.len; i++) {
-		/* Don't check the value length because a header value may be empty */
-		if (isttest(hdrs[i].v) == 0)
-			continue;
 		if (!htx_add_trailer(htx, hdrs[i].n, hdrs[i].v))
 			return NULL;
 	}
@@ -604,17 +590,6 @@ static inline uint32_t htx_free_data_space(const struct htx *htx)
 	if (free < sizeof(struct htx_blk))
 		return 0;
 	return (free - sizeof(struct htx_blk));
-}
-
-/* Returns non-zero only if the HTX message free space wraps */
-static inline int htx_space_wraps(const struct htx *htx)
-{
-	uint32_t headroom, tailroom;
-
-	headroom = (htx->end_addr - htx->head_addr);
-	tailroom = (htx_pos_to_addr(htx, htx->tail) - htx->tail_addr);
-
-	return (headroom && tailroom);
 }
 
 /* Returns the maximum size for a block, not exceeding <max> bytes. <max> may be

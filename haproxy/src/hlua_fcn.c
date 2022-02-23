@@ -21,8 +21,6 @@
 #include <lua.h>
 #include <lualib.h>
 
-#include <import/ebmbtree.h>
-
 #include <haproxy/cli-t.h>
 #include <haproxy/errors.h>
 #include <haproxy/hlua-t.h>
@@ -34,7 +32,6 @@
 #include <haproxy/server.h>
 #include <haproxy/stats.h>
 #include <haproxy/stick_table.h>
-#include <haproxy/stream-t.h>
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
 

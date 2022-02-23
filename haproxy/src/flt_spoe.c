@@ -17,7 +17,6 @@
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
 #include <haproxy/cfgparse.h>
-#include <haproxy/check.h>
 #include <haproxy/filters.h>
 #include <haproxy/freq_ctr.h>
 #include <haproxy/frontend.h>
@@ -1990,7 +1989,7 @@ spoe_create_appctx(struct spoe_config *conf)
 	struct session     *sess;
 	struct stream      *strm;
 
-	if ((appctx = appctx_new(&spoe_applet)) == NULL)
+	if ((appctx = appctx_new(&spoe_applet, tid_bit)) == NULL)
 		goto out_error;
 
 	appctx->ctx.spoe.ptr = pool_zalloc(pool_head_spoe_appctx);
@@ -1998,7 +1997,7 @@ spoe_create_appctx(struct spoe_config *conf)
 		goto out_free_appctx;
 
 	appctx->st0 = SPOE_APPCTX_ST_CONNECT;
-	if ((SPOE_APPCTX(appctx)->task = task_new_here()) == NULL)
+	if ((SPOE_APPCTX(appctx)->task = task_new(tid_bit)) == NULL)
 		goto out_free_spoe_appctx;
 
 	SPOE_APPCTX(appctx)->owner           = appctx;
@@ -2867,7 +2866,7 @@ spoe_acquire_buffer(struct buffer *buf, struct buffer_wait *buffer_wait)
 	if (b_alloc(buf))
 		return 1;
 
-	LIST_APPEND(&th_ctx->buffer_wq, &buffer_wait->list);
+	LIST_APPEND(&ti->buffer_wq, &buffer_wait->list);
 	return 0;
 }
 

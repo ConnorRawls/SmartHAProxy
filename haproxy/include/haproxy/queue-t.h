@@ -22,7 +22,7 @@
 #ifndef _HAPROXY_QUEUE_T_H
 #define _HAPROXY_QUEUE_T_H
 
-#include <import/ebtree-t.h>
+#include <import/eb32tree.h>
 #include <haproxy/api-t.h>
 
 struct proxy;

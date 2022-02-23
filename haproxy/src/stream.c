@@ -429,7 +429,7 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin, struct bu
 	s->pcli_flags = 0;
 	s->unique_id = IST_NULL;
 
-	if ((t = task_new_here()) == NULL)
+	if ((t = task_new(tid_bit)) == NULL)
 		goto out_fail_alloc;
 
 	s->task = t;
@@ -465,9 +465,6 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin, struct bu
 			s->si[0].flags |= SI_FL_CLEAN_ABRT;
 		if (cs->conn->mux->flags & MX_FL_HTX)
 			s->flags |= SF_HTX;
-
-		if (cs->flags & CS_FL_WEBSOCKET)
-			s->flags |= SF_WEBSOCKET;
 	}
         /* Set SF_HTX flag for HTTP frontends. */
 	if (sess->fe->mode == PR_MODE_HTTP)
@@ -494,6 +491,7 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin, struct bu
 
 	stream_init_srv_conn(s);
 	s->target = sess->listener ? sess->listener->default_target : NULL;
+	s->target_addr = NULL;
 
 	s->pend_pos = NULL;
 	s->priority_class = 0;
@@ -550,7 +548,7 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin, struct bu
 
 	s->tunnel_timeout = TICK_ETERNITY;
 
-	LIST_APPEND(&th_ctx->streams, &s->list);
+	LIST_APPEND(&ti->streams, &s->list);
 
 	if (flt_stream_init(s) < 0 || flt_stream_start(s) < 0)
 		goto out_fail_accept;
@@ -682,7 +680,7 @@ static void stream_free(struct stream *s)
 		HA_SPIN_LOCK(DNS_LOCK, &resolvers->lock);
 		ha_free(&s->resolv_ctx.hostname_dn);
 		s->resolv_ctx.hostname_dn_len = 0;
-		resolv_unlink_resolution(s->resolv_ctx.requester);
+		resolv_unlink_resolution(s->resolv_ctx.requester, 0);
 		HA_SPIN_UNLOCK(DNS_LOCK, &resolvers->lock);
 
 		pool_free(resolv_requester_pool, s->resolv_ctx.requester);
@@ -722,7 +720,7 @@ static void stream_free(struct stream *s)
 		 * only touch their node under thread isolation.
 		 */
 		LIST_DEL_INIT(&bref->users);
-		if (s->list.n != &th_ctx->streams)
+		if (s->list.n != &ti->streams)
 			LIST_APPEND(&LIST_ELEM(s->list.n, struct stream *, list)->back_refs, &bref->users);
 		bref->ref = s->list.n;
 		__ha_barrier_store();
@@ -745,14 +743,11 @@ static void stream_free(struct stream *s)
 		session_free(sess);
 	}
 
-	sockaddr_free(&s->si[0].src);
-	sockaddr_free(&s->si[0].dst);
-	sockaddr_free(&s->si[1].src);
-	sockaddr_free(&s->si[1].dst);
+	sockaddr_free(&s->target_addr);
 	pool_free(pool_head_stream, s);
 
 	/* We may want to free the maximum amount of pools if the proxy is stopping */
-	if (fe && unlikely(fe->flags & (PR_FL_DISABLED|PR_FL_STOPPED))) {
+	if (fe && unlikely(fe->disabled)) {
 		pool_flush(pool_head_buffer);
 		pool_flush(pool_head_http_txn);
 		pool_flush(pool_head_requri);
@@ -783,7 +778,7 @@ static int stream_alloc_work_buffer(struct stream *s)
 	if (b_alloc(&s->res.buf))
 		return 1;
 
-	LIST_APPEND(&th_ctx->buffer_wq, &s->buffer_wait.list);
+	LIST_APPEND(&ti->buffer_wq, &s->buffer_wait.list);
 	return 0;
 }
 
@@ -2013,7 +2008,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 	if (unlikely(!(s->flags & SF_ERR_MASK))) {
 		if (req->flags & (CF_READ_ERROR|CF_READ_TIMEOUT|CF_WRITE_ERROR|CF_WRITE_TIMEOUT)) {
 			/* Report it if the client got an error or a read timeout expired */
-			req->analysers &= AN_REQ_FLT_END;
+			req->analysers = 0;
 			if (req->flags & CF_READ_ERROR) {
 				_HA_ATOMIC_INC(&s->be->be_counters.cli_aborts);
 				_HA_ATOMIC_INC(&sess->fe->fe_counters.cli_aborts);
@@ -2067,7 +2062,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 		}
 		else if (res->flags & (CF_READ_ERROR|CF_READ_TIMEOUT|CF_WRITE_ERROR|CF_WRITE_TIMEOUT)) {
 			/* Report it if the server got an error or a read timeout expired */
-			res->analysers &= AN_RES_FLT_END;
+			res->analysers = 0;
 			if (res->flags & CF_READ_ERROR) {
 				_HA_ATOMIC_INC(&s->be->be_counters.srv_aborts);
 				_HA_ATOMIC_INC(&sess->fe->fe_counters.srv_aborts);
@@ -2752,18 +2747,14 @@ void stream_dump(struct buffer *buf, const struct stream *s, const char *pfx, ch
 		dst = acb->applet->name;
 
 	chunk_appendf(buf,
-	              "%sstrm=%p,%x src=%s fe=%s be=%s dst=%s%c"
-		      "%stxn=%p,%x txn.req=%s,%x txn.rsp=%s,%x%c"
+	              "%sstrm=%p src=%s fe=%s be=%s dst=%s%c"
 	              "%srqf=%x rqa=%x rpf=%x rpa=%x sif=%s,%x sib=%s,%x%c"
 	              "%saf=%p,%u csf=%p,%x%c"
 	              "%sab=%p,%u csb=%p,%x%c"
 	              "%scof=%p,%x:%s(%p)/%s(%p)/%s(%d)%c"
 	              "%scob=%p,%x:%s(%p)/%s(%p)/%s(%d)%c"
 	              "",
-	              pfx, s, s->flags, src, s->sess->fe->id, s->be->id, dst, eol,
-		      pfx, s->txn, (s->txn ? s->txn->flags : 0),
-		           (s->txn ? h1_msg_state_str(s->txn->req.msg_state): "-"), (s->txn ? s->txn->req.flags : 0),
-		           (s->txn ? h1_msg_state_str(s->txn->rsp.msg_state): "-"), (s->txn ? s->txn->rsp.flags : 0), eol,
+	              pfx, s, src, s->sess->fe->id, s->be->id, dst, eol,
 	              pfx, req->flags, req->analysers, res->flags, res->analysers,
 	                   si_state_str(si_f->state), si_f->flags,
 	                   si_state_str(si_b->state), si_b->flags, eol,
@@ -2827,7 +2818,7 @@ static void init_stream()
 	int thr;
 
 	for (thr = 0; thr < MAX_THREADS; thr++)
-		LIST_INIT(&ha_thread_ctx[thr].streams);
+		LIST_INIT(&ha_thread_info[thr].streams);
 }
 INITCALL0(STG_INIT, init_stream);
 
@@ -3019,7 +3010,7 @@ static enum act_parse_ret stream_parse_switch_mode(const char **args, int *cur_a
 			return ACT_RET_PRS_ERR;
 		}
 
-		proto = ist(args[*cur_arg + 2]);
+		proto = ist2(args[*cur_arg+2], strlen(args[*cur_arg+2]));
 		mux_proto = get_mux_proto(proto);
 		if (!mux_proto) {
 			memprintf(err, "'%s %s': '%s' expects a valid MUX protocol, if specified (got '%s')",
@@ -3391,12 +3382,6 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 				      (htx->tail >= htx->head) ? "NO" : "YES",
 				      (unsigned long long)htx->extra);
 		}
-		if (HAS_FILTERS(strm) && strm_flt(strm)->current[0]) {
-			struct filter *flt = strm_flt(strm)->current[0];
-
-			chunk_appendf(&trash, "      current_filter=%p (id=\"%s\" flags=0x%x pre=0x%x post=0x%x) \n",
-				      flt, flt->config->id, flt->flags, flt->pre_analyzers, flt->post_analyzers);
-		}
 
 		chunk_appendf(&trash,
 			     "  res=%p (f=0x%06x an=0x%x pipe=%d tofwd=%d total=%lld)\n"
@@ -3434,17 +3419,6 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 				      htx, htx->flags, htx->size, htx->data, htx_nbblks(htx),
 				      (htx->tail >= htx->head) ? "NO" : "YES",
 				      (unsigned long long)htx->extra);
-		}
-		if (HAS_FILTERS(strm) && strm_flt(strm)->current[1]) {
-			struct filter *flt = strm_flt(strm)->current[1];
-
-			chunk_appendf(&trash, "      current_filter=%p (id=\"%s\" flags=0x%x pre=0x%x post=0x%x) \n",
-				      flt, flt->config->id, flt->flags, flt->pre_analyzers, flt->post_analyzers);
-		}
-
-		if (strm->current_rule_list && strm->current_rule) {
-			const struct act_rule *rule = strm->current_rule;
-			chunk_appendf(&trash, "  current_rule=\"%s\" [%s:%d]\n", rule->kw->kw, rule->conf.file, rule->conf.line);
 		}
 
 		if (ci_putchk(si_ic(si), &trash) == -1)
@@ -3521,7 +3495,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 		 * pointer points back to the head of the streams list.
 		 */
 		LIST_INIT(&appctx->ctx.sess.bref.users);
-		appctx->ctx.sess.bref.ref = ha_thread_ctx[appctx->ctx.sess.thr].streams.n;
+		appctx->ctx.sess.bref.ref = ha_thread_info[appctx->ctx.sess.thr].streams.n;
 		appctx->st2 = STAT_ST_LIST;
 		/* fall through */
 
@@ -3538,7 +3512,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 			struct stream *curr_strm;
 			int done= 0;
 
-			if (appctx->ctx.sess.bref.ref == &ha_thread_ctx[appctx->ctx.sess.thr].streams)
+			if (appctx->ctx.sess.bref.ref == &ha_thread_info[appctx->ctx.sess.thr].streams)
 				done = 1;
 			else {
 				/* check if we've found a stream created after issuing the "show sess" */
@@ -3551,7 +3525,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 				appctx->ctx.sess.thr++;
 				if (appctx->ctx.sess.thr >= global.nbthread)
 					break;
-				appctx->ctx.sess.bref.ref = ha_thread_ctx[appctx->ctx.sess.thr].streams.n;
+				appctx->ctx.sess.bref.ref = ha_thread_info[appctx->ctx.sess.thr].streams.n;
 				continue;
 			}
 
@@ -3758,7 +3732,7 @@ static int cli_parse_shutdown_session(char **args, char *payload, struct appctx 
 
 	/* first, look for the requested stream in the stream table */
 	for (thr = 0; !strm && thr < global.nbthread; thr++) {
-		list_for_each_entry(strm, &ha_thread_ctx[thr].streams, list) {
+		list_for_each_entry(strm, &ha_thread_info[thr].streams, list) {
 			if (strm == ptr) {
 				stream_shutdown(strm, SF_ERR_KILLED);
 				break;

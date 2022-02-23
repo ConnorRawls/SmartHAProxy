@@ -24,7 +24,6 @@
 #include <haproxy/channel.h>
 #include <haproxy/connection.h>
 #include <haproxy/dynbuf.h>
-#include <haproxy/http_ana.h>
 #include <haproxy/http_htx.h>
 #include <haproxy/pipe-t.h>
 #include <haproxy/pipe.h>
@@ -33,6 +32,7 @@
 #include <haproxy/stream_interface.h>
 #include <haproxy/task.h>
 #include <haproxy/ticks.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 
 
@@ -838,7 +838,7 @@ void si_update_rx(struct stream_interface *si)
 	else
 		si_rx_chan_rdy(si);
 
-	if (!channel_is_empty(ic) || !channel_may_recv(ic)) {
+	if (!channel_is_empty(ic)) {
 		/* stop reading, imposed by channel's policy or contents */
 		si_rx_room_blk(si);
 	}
@@ -1336,25 +1336,6 @@ int si_cs_recv(struct conn_stream *cs)
 	if (!si_alloc_ibuf(si, &(si_strm(si)->buffer_wait)))
 		goto end_recv;
 
-	/* For an HTX stream, if the buffer is stuck (no output data with some
-	 * input data) and if the HTX message is fragmented or if its free space
-	 * wraps, we force an HTX deframentation. It is a way to have a
-	 * contiguous free space nad to let the mux to copy as much data as
-	 * possible.
-	 *
-	 * NOTE: A possible optim may be to let the mux decides if defrag is
-	 *       required or not, depending on amount of data to be xferred.
-	 */
-	if (IS_HTX_STRM(si_strm(si)) && !co_data(ic)) {
-		struct htx *htx = htxbuf(&ic->buf);
-
-		if (htx_is_not_empty(htx) && ((htx->flags & HTX_FL_FRAGMENTED) || htx_space_wraps(htx)))
-			htx_defrag(htxbuf(&ic->buf), NULL, 0);
-	}
-
-	/* Instruct the mux it must subscribed for read events */
-	flags |= ((!conn_is_back(conn) && (si_strm(si)->be->options & PR_O_ABRT_CLOSE)) ? CO_RFL_KEEP_RECV : 0);
-
 	/* Important note : if we're called with POLL_IN|POLL_HUP, it means the read polling
 	 * was enabled, which implies that the recv buffer was not full. So we have a guarantee
 	 * that if such an event is not handled above in splice, it will be handled here by
@@ -1363,26 +1344,15 @@ int si_cs_recv(struct conn_stream *cs)
 	while ((cs->flags & CS_FL_RCV_MORE) ||
 	    (!(conn->flags & (CO_FL_ERROR | CO_FL_HANDSHAKE)) &&
 	       (!(cs->flags & (CS_FL_ERROR|CS_FL_EOS))) && !(ic->flags & CF_SHUTR))) {
-		int cur_flags = flags;
-
-		/* Compute transient CO_RFL_* flags */
-		if (co_data(ic)) {
-			cur_flags |= (CO_RFL_BUF_WET | CO_RFL_BUF_NOT_STUCK);
-		}
-
 		/* <max> may be null. This is the mux responsibility to set
 		 * CS_FL_RCV_MORE on the CS if more space is needed.
 		 */
 		max = channel_recv_max(ic);
-		ret = cs->conn->mux->rcv_buf(cs, &ic->buf, max, cur_flags);
+		flags |= ((!conn_is_back(conn) && (si_strm(si)->be->options & PR_O_ABRT_CLOSE)) ? CO_RFL_KEEP_RECV : 0);
+		ret = cs->conn->mux->rcv_buf(cs, &ic->buf, max, flags | (co_data(ic) ? CO_RFL_BUF_WET : 0));
 
-		if (cs->flags & CS_FL_WANT_ROOM) {
+		if (cs->flags & CS_FL_WANT_ROOM)
 			si_rx_room_blk(si);
-			/* Add READ_PARTIAL because some data are pending but
-			 * cannot be xferred to the channel
-			 */
-			ic->flags |= CF_READ_PARTIAL;
-		}
 
 		if (ret <= 0) {
 			/* if we refrained from reading because we asked for a
@@ -1410,14 +1380,6 @@ int si_cs_recv(struct conn_stream *cs)
 
 		ic->flags |= CF_READ_PARTIAL;
 		ic->total += ret;
-
-		/* End-of-input reached, we can leave. In this case, it is
-		 * important to break the loop to not block the SI because of
-		 * the channel's policies.This way, we are still able to receive
-		 * shutdowns.
-		 */
-		if (cs->flags & CS_FL_EOI)
-			break;
 
 		if ((ic->flags & CF_READ_DONTWAIT) || --read_poll <= 0) {
 			/* we're stopped by the channel's policy */

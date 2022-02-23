@@ -11,7 +11,6 @@
  */
 
 #include <import/eb32tree.h>
-#include <import/ebmbtree.h>
 #include <haproxy/api.h>
 #include <haproxy/cfgparse.h>
 #include <haproxy/connection.h>
@@ -61,7 +60,7 @@ static const struct h2s *h2_idle_stream;
 #define H2_CF_DEM_BLOCK_ANY     0x000001F0  // aggregate of the demux flags above except DALLOC/DFULL
                                             // (SHORT_READ is also excluded)
 
-#define H2_CF_DEM_SHORT_READ    0x00000200  // demux blocked on incomplete frame
+#define H2_CF_DEM_SHORT_READ    0x00080200  // demux blocked on incomplete frame
 
 /* other flags */
 #define H2_CF_GOAWAY_SENT       0x00001000  // a GOAWAY frame was successfully sent
@@ -71,8 +70,6 @@ static const struct h2s *h2_idle_stream;
 #define H2_CF_WINDOW_OPENED     0x00010000  // demux increased window already advertised
 #define H2_CF_RCVD_SHUT         0x00020000  // a recv() attempt already failed on a shutdown
 #define H2_CF_END_REACHED       0x00040000  // pending data too short with RCVD_SHUT present
-
-#define H2_CF_RCVD_RFC8441      0x00100000  // settings from RFC8441 has been received indicating support for Extended CONNECT
 
 /* H2 connection state, in h2c->st0 */
 enum h2_cs {
@@ -819,7 +816,7 @@ static inline struct buffer *h2_get_buf(struct h2c *h2c, struct buffer *bptr)
 	    unlikely((buf = b_alloc(bptr)) == NULL)) {
 		h2c->buf_wait.target = h2c;
 		h2c->buf_wait.wakeup_cb = h2_buf_available;
-		LIST_APPEND(&th_ctx->buffer_wq, &h2c->buf_wait.list);
+		LIST_APPEND(&ti->buffer_wq, &h2c->buf_wait.list);
 	}
 	return buf;
 }
@@ -948,7 +945,7 @@ static int h2_init(struct connection *conn, struct proxy *prx, struct session *s
 	h2c->proxy = prx;
 	h2c->task = NULL;
 	if (tick_isset(h2c->timeout)) {
-		t = task_new_here();
+		t = task_new(tid_bit);
 		if (!t)
 			goto fail;
 
@@ -1125,19 +1122,7 @@ static void h2_release(struct h2c *h2c)
 		TRACE_DEVEL("freeing conn", H2_EV_H2C_END, conn);
 
 		conn_stop_tracking(conn);
-
-		/* there might be a GOAWAY frame still pending in the TCP
-		 * stack, and if the peer continues to send (i.e. window
-		 * updates etc), this can result in losing the GOAWAY. For
-		 * this reason we try to drain anything received in between.
-		 */
-		conn->flags |= CO_FL_WANT_DRAIN;
-
-		conn_xprt_shutw(conn);
-		conn_xprt_close(conn);
-		conn_sock_shutw(conn, !conn_is_back(conn));
-		conn_ctrl_close(conn);
-
+		conn_full_close(conn);
 		if (conn->destroy_cb)
 			conn->destroy_cb(conn);
 		conn_free(conn);
@@ -1509,7 +1494,7 @@ static struct h2s *h2s_new(struct h2c *h2c, int id)
  * responsible of it. On error, <input> is unchanged, thus the mux must still
  * take care of it.
  */
-static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *input, uint32_t flags)
+static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *input)
 {
 	struct session *sess = h2c->conn->owner;
 	struct conn_stream *cs;
@@ -1532,12 +1517,6 @@ static struct h2s *h2c_frt_stream_new(struct h2c *h2c, int id, struct buffer *in
 	h2s->cs = cs;
 	cs->ctx = h2s;
 	h2c->nb_cs++;
-
-	/* FIXME wrong analogy between ext-connect and websocket, this need to
-	 * be refine.
-	 */
-	if (flags & H2_SF_EXT_CONNECT_RCVD)
-		cs->flags |= CS_FL_WEBSOCKET;
 
 	if (stream_create_from_cs(cs, input) < 0)
 		goto out_free_cs;
@@ -2247,8 +2226,8 @@ static int h2c_handle_settings(struct h2c *h2c)
 			}
 			break;
 		case H2_SETTINGS_ENABLE_CONNECT_PROTOCOL:
-			if (arg == 1)
-				h2c->flags |= H2_CF_RCVD_RFC8441;
+			/* nothing to do here as this settings is automatically
+			 * transmits to the client */
 			break;
 		}
 	}
@@ -2688,12 +2667,8 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 			if (h2c->st0 >= H2_CS_ERROR)
 				goto out;
 
-			if (error == 0) {
-				/* Demux not blocked because of the stream, it is an incomplete frame */
-				if (!(h2c->flags &H2_CF_DEM_BLOCK_ANY))
-					h2c->flags |= H2_CF_DEM_SHORT_READ;
+			if (error == 0)
 				goto out; // missing data
-			}
 
 			if (error < 0) {
 				/* Failed to decode this frame (e.g. too large request)
@@ -2730,12 +2705,8 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 		goto out;
 
 	if (error <= 0) {
-		if (error == 0) {
-			/* Demux not blocked because of the stream, it is an incomplete frame */
-			if (!(h2c->flags &H2_CF_DEM_BLOCK_ANY))
-				h2c->flags |= H2_CF_DEM_SHORT_READ;
+		if (error == 0)
 			goto out; // missing data
-		}
 
 		/* Failed to decode this stream (e.g. too large request)
 		 * but the HPACK decompressor is still synchronized.
@@ -2753,7 +2724,7 @@ static struct h2s *h2c_frt_handle_headers(struct h2c *h2c, struct h2s *h2s)
 	 * Xfer the rxbuf to the stream. On success, the new stream owns the
 	 * rxbuf. On error, it is released here.
 	 */
-	h2s = h2c_frt_stream_new(h2c, h2c->dsi, &rxbuf, flags);
+	h2s = h2c_frt_stream_new(h2c, h2c->dsi, &rxbuf);
 	if (!h2s) {
 		h2s = (struct h2s*)h2_refused_stream;
 		goto send_rst;
@@ -2853,12 +2824,8 @@ static struct h2s *h2c_bck_handle_headers(struct h2c *h2c, struct h2s *h2s)
 	}
 
 	if (error <= 0) {
-		if (error == 0) {
-			/* Demux not blocked because of the stream, it is an incomplete frame */
-			if (!(h2c->flags &H2_CF_DEM_BLOCK_ANY))
-				h2c->flags |= H2_CF_DEM_SHORT_READ;
+		if (error == 0)
 			goto fail; // missing data
-		}
 
 		/* stream error : send RST_STREAM */
 		TRACE_ERROR("couldn't decode response HEADERS", H2_EV_RX_FRAME|H2_EV_RX_HDR, h2c->conn, h2s);
@@ -3689,7 +3656,7 @@ static int h2_recv(struct h2c *h2c)
 
 	if (h2c->flags & H2_CF_RCVD_SHUT) {
 		TRACE_DEVEL("leaving on rcvd_shut", H2_EV_H2C_RECV, h2c->conn);
-		return 1;
+		return 0;
 	}
 
 	if (!b_data(buf)) {
@@ -3791,7 +3758,7 @@ static int h2_send(struct h2c *h2c)
 			done = 1; // we won't go further without extra buffers
 
 		if ((conn->flags & (CO_FL_SOCK_WR_SH|CO_FL_ERROR)) ||
-		    (h2c->flags & H2_CF_GOAWAY_FAILED))
+		    (h2c->st0 == H2_CS_ERROR2) || (h2c->flags & H2_CF_GOAWAY_FAILED))
 			break;
 
 		if (h2c->flags & (H2_CF_MUX_MFULL | H2_CF_DEM_MBUSY | H2_CF_DEM_MROOM))
@@ -3945,7 +3912,7 @@ static int h2_process(struct h2c *h2c)
 	}
 	h2_send(h2c);
 
-	if (unlikely(h2c->proxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) && !(h2c->flags & H2_CF_IS_BACK)) {
+	if (unlikely(h2c->proxy->disabled) && !(h2c->flags & H2_CF_IS_BACK)) {
 		/* frontend is stopping, reload likely in progress, let's try
 		 * to announce a graceful shutdown if not yet done. We don't
 		 * care if it fails, it will be tried again later.
@@ -5321,18 +5288,12 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 				continue;
 
 			/* Convert connection: upgrade to Extended connect from rfc 8441 */
-			if ((sl->flags & HTX_SL_F_CONN_UPG) && isteqi(list[hdr].n, ist("connection"))) {
+			if (isteqi(list[hdr].n, ist("connection"))) {
 				/* rfc 7230 #6.1 Connection = list of tokens */
 				struct ist connection_ist = list[hdr].v;
 				do {
 					if (isteqi(iststop(connection_ist, ','),
 					           ist("upgrade"))) {
-						if (!(h2c->flags & H2_CF_RCVD_RFC8441)) {
-							TRACE_STATE("reject upgrade because of no RFC8441 support", H2_EV_TX_FRAME|H2_EV_TX_HDR, h2c->conn, h2s);
-							goto fail;
-						}
-
-						TRACE_STATE("convert upgrade to extended connect method", H2_EV_TX_FRAME|H2_EV_TX_HDR, h2c->conn, h2s);
 						h2s->flags |= (H2_SF_BODY_TUNNEL|H2_SF_EXT_CONNECT_SENT);
 						sl->info.req.meth = HTTP_METH_CONNECT;
 						meth = ist("CONNECT");
@@ -5345,7 +5306,7 @@ static size_t h2s_bck_make_req_headers(struct h2s *h2s, struct htx *htx)
 				} while (istlen(connection_ist));
 			}
 
-			if ((sl->flags & HTX_SL_F_CONN_UPG) && isteq(list[hdr].n, ist("upgrade"))) {
+			if (isteq(list[hdr].n, ist("upgrade"))) {
 				/* rfc 7230 #6.7 Upgrade = list of protocols
 				 * rfc 8441 #4 Extended connect = :protocol is single-valued
 				 *
@@ -6294,18 +6255,7 @@ static int h2_unsubscribe(struct conn_stream *cs, int event_type, struct wait_ev
 }
 
 
-/* Called from the upper layer, to receive data
- *
- * The caller is responsible for defragmenting <buf> if necessary. But <flags>
- * must be tested to know the calling context. If CO_RFL_BUF_FLUSH is set, it
- * means the caller wants to flush input data (from the mux buffer and the
- * channel buffer) to be able to use kernel splicing or any kind of mux-to-mux
- * xfer. If CO_RFL_KEEP_RECV is set, the mux must always subscribe for read
- * events before giving back. CO_RFL_BUF_WET is set if <buf> is congested with
- * data scheduled for leaving soon. CO_RFL_BUF_NOT_STUCK is set to instruct the
- * mux it may optimize the data copy to <buf> if necessary. Otherwise, it should
- * copy as much data as possible.
- */
+/* Called from the upper layer, to receive data */
 static size_t h2_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t count, int flags)
 {
 	struct h2s *h2s = cs->ctx;
@@ -6675,7 +6625,7 @@ static int h2_takeover(struct connection *conn, int orig_tid)
 		__ha_barrier_store();
 		task_kill(task);
 
-		h2c->task = task_new_here();
+		h2c->task = task_new(tid_bit);
 		if (!h2c->task) {
 			h2_release(h2c);
 			return -1;

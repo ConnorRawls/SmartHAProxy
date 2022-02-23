@@ -86,17 +86,6 @@ download_boringssl () {
     fi
 }
 
-download_quictls () {
-    if [ ! -d "download-cache/quictls" ]; then
-        git clone --depth=1 https://github.com/quictls/openssl download-cache/quictls
-    else
-       (
-        cd download-cache/quictls
-        git pull
-       )
-    fi
-}
-
 if [ ! -z ${LIBRESSL_VERSION+x} ]; then
 	download_libressl
 	build_libressl
@@ -132,15 +121,3 @@ if [ ! -z ${BORINGSSL+x} ]; then
 	)
 fi
 
-if [ ! -z ${QUICTLS+x} ]; then
-        (
-
-        download_quictls
-        cd download-cache/quictls
-
-        ./config shared --prefix="${HOME}/opt" --openssldir="${HOME}/opt" --libdir=lib -DPURIFY
-        make -j$(nproc) build_sw
-        make install_sw
-
-        )
-fi

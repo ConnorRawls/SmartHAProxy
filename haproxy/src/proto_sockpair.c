@@ -38,6 +38,7 @@
 #include <haproxy/protocol.h>
 #include <haproxy/proto_sockpair.h>
 #include <haproxy/sock.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 #include <haproxy/version.h>
 
@@ -87,7 +88,6 @@ struct protocol proto_sockpair = {
 	.fam            = &proto_fam_sockpair,
 
 	/* socket layer */
-	.proto_type     = PROTO_TYPE_STREAM,
 	.sock_type      = SOCK_STREAM,
 	.sock_prot      = 0,
 	.rx_enable      = sock_enable,
@@ -158,12 +158,12 @@ int sockpair_bind_receiver(struct receiver *rx, char **errmsg)
 
 	rx->flags |= RX_F_BOUND;
 
-	fd_insert(rx->fd, rx->owner, rx->iocb, thread_mask(rx->bind_thread) & all_threads_mask);
+	fd_insert(rx->fd, rx->owner, rx->iocb, thread_mask(rx->settings->bind_thread) & all_threads_mask);
 	return err;
 
  bind_return:
 	if (errmsg && *errmsg)
-		memprintf(errmsg, "%s for [fd %d]", *errmsg, rx->fd);
+		memprintf(errmsg, "%s [fd %d]", *errmsg, rx->fd);
 
 	return err;
 
@@ -330,6 +330,10 @@ static int sockpair_connect_server(struct connection *conn, int flags)
 		conn->flags |= CO_FL_ERROR;
 		return SF_ERR_INTERNAL;
 	}
+
+	/* if a send_proxy is there, there are data */
+	if (conn->send_proxy_ofs)
+		flags |= CONNECT_HAS_DATA;
 
 	if (global.tune.server_sndbuf)
                 setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &global.tune.server_sndbuf, sizeof(global.tune.server_sndbuf));

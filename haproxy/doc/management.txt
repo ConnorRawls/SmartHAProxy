@@ -1507,11 +1507,8 @@ add server <backend>/<server> [args]*
   - backup
   - ca-file
   - check
-  - check-alpn
   - check-proto
   - check-send-proxy
-  - check-sni
-  - check-ssl
   - check-via-socks4
   - ciphers
   - ciphersuites
@@ -1520,7 +1517,6 @@ add server <backend>/<server> [args]*
   - disabled
   - downinter
   - enabled
-  - error-limit
   - fall
   - fastinter
   - force-sslv3/tlsv10/tlsv11/tlsv12/tlsv13
@@ -1533,10 +1529,6 @@ add server <backend>/<server> [args]*
   - no-sslv3/tlsv10/tlsv11/tlsv12/tlsv13
   - no-tls-tickets
   - npn
-  - observe
-  - on-error
-  - on-marked-down
-  - on-marked-up
   - pool-low-conn
   - pool-max-conn
   - pool-purge-delay
@@ -1548,7 +1540,6 @@ add server <backend>/<server> [args]*
   - send-proxy-v2
   - send-proxy-v2-ssl
   - send-proxy-v2-ssl-cn
-  - slowstart
   - sni
   - source
   - ssl
@@ -1561,7 +1552,6 @@ add server <backend>/<server> [args]*
   - verify
   - verifyhost
   - weight
-  - ws
 
   Their syntax is similar to the server line from the configuration file,
   please refer to their individual documentation for details.
@@ -1991,12 +1981,6 @@ help [<command>]
   the requested one. The same help screen is also displayed for unknown
   commands.
 
-httpclient <method> <URI>
-  Launch an HTTP client request and print the response on the CLI. Only
-  supported on a CLI connection running in expert mode (see "expert-mode on").
-  It's only meant for debugging. It currently can't resolve FQDN so your URI must
-  contains an IP.
-
 new ssl ca-file <cafile>
   Create a new empty CA file tree entry to be filled with a set of CA
   certificates and added to a crt-list. This command should be used in
@@ -2205,19 +2189,7 @@ set ssl cert <filename> <payload>
   Once the modification are done, you have to "commit ssl cert" the
   transaction.
 
-  Injection of files over the CLI must be done with caution since an empty line
-  is used to notify the end of the payload. It is recommended to inject a PEM
-  file which has been sanitized. A simple method would be to remove every empty
-  line and only leave what are in the PEM sections. It could be achieved with a
-  sed command.
-
   Example:
-
-   # With some simple sanitizing
-    echo -e "set ssl cert localhost.pem <<\n$(sed -n '/^$/d;/-BEGIN/,/-END/p' 127.0.0.1.pem)\n" | \
-    socat /var/run/haproxy.stat -
-
-    # Complete example with commit
     echo -e "set ssl cert localhost.pem <<\n$(cat 127.0.0.1.pem)\n" | \
     socat /var/run/haproxy.stat -
     echo -e \
@@ -3565,21 +3537,19 @@ Example:
    # haproxy -Ws -S /tmp/master-socket,uid,1000,gid,1000,mode,600 -f test1.cfg
    # haproxy -W -S /tmp/master-socket,level,user -f test1.cfg
 
-The master CLI introduces a 'show proc' command to surpervise the
+The master CLI introduces a new 'show proc' command to surpervise the
 processes:
 
 Example:
 
   $ echo 'show proc' | socat /var/run/haproxy-master.sock -
-  #<PID>          <type>          <reloads>       <uptime>        <version>
-  1162            master          5 [failed: 0]   0d00h02m07s     2.5-dev13
+  #<PID>          <type>          <relative PID>  <reloads>       <uptime>        <version>
+  1162            master          0               5               0d00h02m07s     2.0-dev7-0124c9-7
   # workers
-  1271            worker          1               0d00h00m00s     2.5-dev13
+  1271            worker          1               0               0d00h00m00s     2.0-dev7-0124c9-7
+  1272            worker          2               0               0d00h00m00s     2.0-dev7-0124c9-7
   # old workers
-  1233            worker          3               0d00h00m43s     2.0-dev3-6019f6-289
-  # programs
-  1244            foo             0               0d00h00m00s     -
-  1255            bar             0               0d00h00m00s     -
+  1233            worker          [was: 1]        3               0d00h00m43s     2.0-dev3-6019f6-289
 
 
 In this example, the master has been reloaded 5 times but one of the old

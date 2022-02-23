@@ -23,14 +23,23 @@
 #define _HAPROXY_STREAM_T_H
 
 #include <sys/time.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include <haproxy/api-t.h>
 #include <haproxy/channel-t.h>
 #include <haproxy/dynbuf-t.h>
 #include <haproxy/filters-t.h>
+#include <haproxy/hlua-t.h>
+#include <haproxy/http_ana-t.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/proxy-t.h>
+#include <haproxy/queue-t.h>
+#include <haproxy/server-t.h>
+#include <haproxy/session-t.h>
 #include <haproxy/stick_table-t.h>
 #include <haproxy/stream_interface-t.h>
+#include <haproxy/task-t.h>
 #include <haproxy/vars-t.h>
 
 
@@ -80,21 +89,13 @@
 
 #define SF_SRV_REUSED   0x00100000	/* the server-side connection was reused */
 #define SF_SRV_REUSED_ANTICIPATED  0x00200000  /* the connection was reused but the mux is not ready yet */
-#define SF_WEBSOCKET    0x00400000	/* websocket stream */
+
 
 /* flags for the proxy of the master CLI */
 /* 0x1.. to 0x3 are reserved for ACCESS_LVL_MASK */
 
 #define PCLI_F_PROMPT          0x4
 #define PCLI_F_PAYLOAD         0x8
-
-struct hlua;
-struct proxy;
-struct pendconn;
-struct session;
-struct server;
-struct task;
-struct sockaddr_storage;
 
 /* some external definitions */
 struct strm_logs {
@@ -154,6 +155,7 @@ struct stream {
 		struct stktable *table;
 	} store[8];                     /* tracked stickiness values to store */
 
+	struct sockaddr_storage *target_addr;   /* the address to join if not null */
 	struct stkctr stkctr[MAX_SESS_STKCTR];  /* content-aware stick counters */
 
 	struct strm_flt strm_flt;               /* current state of filters active on this stream */

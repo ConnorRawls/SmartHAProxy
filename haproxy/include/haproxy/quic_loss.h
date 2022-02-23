@@ -27,6 +27,7 @@
 #endif
 
 #include <haproxy/ticks.h>
+#include <haproxy/time.h>
 #include <haproxy/xprt_quic-t.h>
 
 #include <haproxy/trace.h>
@@ -109,10 +110,9 @@ static inline struct quic_pktns *quic_loss_pktns(struct quic_conn *qc)
 
 	pktns = &qc->pktns[QUIC_TLS_PKTNS_INITIAL];
 	TRACE_PROTO("pktns", QUIC_EV_CONN_SPTO, qc->conn, pktns);
-	for (i = QUIC_TLS_PKTNS_HANDSHAKE; i < QUIC_TLS_PKTNS_MAX; i++) {
+	for (i = QUIC_TLS_PKTNS_01RTT; i < QUIC_TLS_PKTNS_MAX; i++) {
 		TRACE_PROTO("pktns", QUIC_EV_CONN_SPTO, qc->conn, &qc->pktns[i]);
-		if (tick_isset(pktns->tx.loss_time) &&
-		    qc->pktns[i].tx.loss_time < pktns->tx.loss_time)
+		if (qc->pktns[i].tx.loss_time < pktns->tx.loss_time)
 			pktns = &qc->pktns[i];
 	}
 

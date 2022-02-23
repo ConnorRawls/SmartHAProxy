@@ -122,7 +122,7 @@ void mworker_proc_list_to_env()
 			type = 'w';
 
 		if (child->pid > -1)
-			memprintf(&msg, "%s|type=%c;fd=%d;pid=%d;reloads=%d;failedreloads=%d;timestamp=%d;id=%s;version=%s", msg ? msg : "", type, child->ipc_fd[0], child->pid, child->reloads, child->failedreloads, child->timestamp, child->id ? child->id : "", child->version);
+			memprintf(&msg, "%s|type=%c;fd=%d;pid=%d;rpid=%d;reloads=%d;timestamp=%d;id=%s;version=%s", msg ? msg : "", type, child->ipc_fd[0], child->pid, 1, child->reloads, child->timestamp, child->id ? child->id : "", child->version);
 	}
 	if (msg)
 		setenv("HAPROXY_PROCESSES", msg, 1);
@@ -134,14 +134,13 @@ void mworker_proc_list_to_env()
 int mworker_env_to_proc_list()
 {
 	char *msg, *token = NULL, *s1;
-	struct mworker_proc *child;
-	int minreloads = INT_MAX; /* minimum number of reloads to chose which processes are "current" ones */
 
 	msg = getenv("HAPROXY_PROCESSES");
 	if (!msg)
 		return 0;
 
 	while ((token = strtok_r(msg, "|", &s1))) {
+		struct mworker_proc *child;
 		char *subtoken = NULL;
 		char *s2;
 
@@ -175,13 +174,8 @@ int mworker_env_to_proc_list()
 			} else if (strncmp(subtoken, "pid=", 4) == 0) {
 				child->pid = atoi(subtoken+4);
 			} else if (strncmp(subtoken, "reloads=", 8) == 0) {
-				/* we only increment the number of asked reload */
-				child->reloads = atoi(subtoken+8);
-
-				if (child->reloads < minreloads)
-					minreloads = child->reloads;
-			} else if (strncmp(subtoken, "failedreloads=", 14) == 0) {
-				child->failedreloads = atoi(subtoken+14);
+				/* we reloaded this process once more */
+				child->reloads = atoi(subtoken+8) + 1;
 			} else if (strncmp(subtoken, "timestamp=", 10) == 0) {
 				child->timestamp = atoi(subtoken+10);
 			} else if (strncmp(subtoken, "id=", 3) == 0) {
@@ -191,17 +185,13 @@ int mworker_env_to_proc_list()
 			}
 		}
 		if (child->pid) {
+			/* this is a process inherited from a reload that should be leaving */
+			child->options |= PROC_O_LEAVING;
+
 			LIST_APPEND(&proc_list, &child->list);
 		} else {
 			mworker_free_child(child);
 		}
-	}
-
-	/* set the leaving processes once we know which number of reloads are the current processes */
-
-	list_for_each_entry(child, &proc_list, list) {
-		if (child->reloads > minreloads)
-			child->options |= PROC_O_LEAVING;
 	}
 
 	unsetenv("HAPROXY_PROCESSES");
@@ -306,9 +296,9 @@ restart_wait:
 			if (!(child->options & PROC_O_LEAVING)) {
 				if (child->options & PROC_O_TYPE_WORKER) {
 					if (status < 128)
-						ha_warning("Current worker (%d) exited with code %d (%s)\n", exitpid, status, "Exit");
+						ha_warning("Current worker #%d (%d) exited with code %d (%s)\n", 1, exitpid, status, "Exit");
 					else
-						ha_alert("Current worker (%d) exited with code %d (%s)\n", exitpid, status, strsignal(status - 128));
+						ha_alert("Current worker #%d (%d) exited with code %d (%s)\n", 1, exitpid, status, strsignal(status - 128));
 				}
 				else if (child->options & PROC_O_TYPE_PROG)
 					ha_alert("Current program '%s' (%d) exited with code %d (%s)\n", child->id, exitpid, status, (status >= 128) ? strsignal(status - 128) : "Exit");
@@ -323,7 +313,7 @@ restart_wait:
 					exitcode = status;
 			} else {
 				if (child->options & PROC_O_TYPE_WORKER) {
-					ha_warning("Former worker (%d) exited with code %d (%s)\n", exitpid, status, (status >= 128) ? strsignal(status - 128) : "Exit");
+					ha_warning("Former worker #%d (%d) exited with code %d (%s)\n", 1, exitpid, status, (status >= 128) ? strsignal(status - 128) : "Exit");
 					delete_oldpid(exitpid);
 				} else if (child->options & PROC_O_TYPE_PROG) {
 					ha_warning("Former program '%s' (%d) exited with code %d (%s)\n", child->id, exitpid, status, (status >= 128) ? strsignal(status - 128) : "Exit");
@@ -453,7 +443,7 @@ void mworker_cleanlisteners()
 		}
 		/* if the proxy shouldn't be in the master, we stop it */
 		if (!listen_in_master)
-			curproxy->flags |= PR_FL_DISABLED;
+			curproxy->disabled = PR_DISABLED;
 	}
 }
 
@@ -465,18 +455,15 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 	int old = 0;
 	int up = now.tv_sec - proc_self->timestamp;
 	char *uptime = NULL;
-	char *reloadtxt = NULL;
 
 	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
 		return 1;
 
 	chunk_reset(&trash);
 
-	memprintf(&reloadtxt, "%d [failed: %d]", proc_self->reloads, proc_self->failedreloads);
-	chunk_printf(&trash, "#%-14s %-15s %-15s %-15s %-15s\n", "<PID>", "<type>", "<reloads>", "<uptime>", "<version>");
+	chunk_printf(&trash, "#%-14s %-15s %-15s %-15s %-15s %-15s\n", "<PID>", "<type>", "<relative PID>", "<reloads>", "<uptime>", "<version>");
 	memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-	chunk_appendf(&trash, "%-15u %-15s %-15s %-15s %-15s\n", (unsigned int)getpid(), "master", reloadtxt, uptime, haproxy_version);
-	ha_free(&reloadtxt);
+	chunk_appendf(&trash, "%-15u %-15s %-15u %-15d %-15s %-15s\n", (unsigned int)getpid(), "master", 0, proc_self->reloads, uptime, haproxy_version);
 	ha_free(&uptime);
 
 	/* displays current processes */
@@ -493,7 +480,7 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 			continue;
 		}
 		memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-		chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s\n", child->pid, "worker", child->reloads, uptime, child->version);
+		chunk_appendf(&trash, "%-15u %-15s %-15u %-15d %-15s %-15s\n", child->pid, "worker", 1, child->reloads, uptime, child->version);
 		ha_free(&uptime);
 	}
 
@@ -510,8 +497,9 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 				continue;
 
 			if (child->options & PROC_O_LEAVING) {
+				memprintf(&msg, "[was: %u]", 1);
 				memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-				chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s\n", child->pid, "worker", child->reloads, uptime, child->version);
+				chunk_appendf(&trash, "%-15u %-15s %-15s %-15d %-15s %-15s\n", child->pid, "worker", msg, child->reloads, uptime, child->version);
 				ha_free(&uptime);
 			}
 		}
@@ -532,7 +520,7 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 			continue;
 		}
 		memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-		chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s\n", child->pid, child->id, child->reloads, uptime, "-");
+		chunk_appendf(&trash, "%-15u %-15s %-15s %-15d %-15s %-15s\n", child->pid, child->id, "-", child->reloads, uptime, "-");
 		ha_free(&uptime);
 	}
 
@@ -546,7 +534,7 @@ static int cli_io_handler_show_proc(struct appctx *appctx)
 
 			if (child->options & PROC_O_LEAVING) {
 				memprintf(&uptime, "%dd%02dh%02dm%02ds", up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60));
-				chunk_appendf(&trash, "%-15u %-15s %-15d %-15s %-15s\n", child->pid, child->id, child->reloads, uptime, "-");
+				chunk_appendf(&trash, "%-15u %-15s %-15s %-15d %-15s %-15s\n", child->pid, child->id, "-", child->reloads, uptime, "-");
 				ha_free(&uptime);
 			}
 		}

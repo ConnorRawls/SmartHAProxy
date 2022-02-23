@@ -107,6 +107,28 @@ static inline int chunk_cpy(struct buffer *chk, const struct buffer *src)
 	return 1;
 }
 
+/* appends chunk <src> after <chk>. Returns 0 in case of failure. */
+static inline int chunk_cat(struct buffer *chk, const struct buffer *src)
+{
+	if (unlikely(chk->data + src->data > chk->size))
+		return 0;
+
+	memcpy(chk->area + chk->data, src->area, src->data);
+	chk->data += src->data;
+	return 1;
+}
+
+/* appends ist <src> after <chk>. Returns 0 in case of failure. */
+static inline int chunk_istcat(struct buffer *chk, const struct ist src)
+{
+	if (unlikely(chk->data + src.len > chk->size))
+		return 0;
+
+	memcpy(chk->area + chk->data, src.ptr, src.len);
+	chk->data += src.len;
+	return 1;
+}
+
 /* copies memory area <src> into <chk> for <len> bytes. Returns 0 in
  * case of failure. No trailing zero is added.
  */
@@ -134,18 +156,6 @@ static inline int chunk_memcat(struct buffer *chk, const char *src,
 	memcpy(chk->area + chk->data, src, len);
 	chk->data += len;
 	return 1;
-}
-
-/* appends ist <src> after <chk>. Returns 0 in case of failure. */
-static inline int chunk_istcat(struct buffer *chk, const struct ist src)
-{
-	return chunk_memcat(chk, istptr(src), istlen(src));
-}
-
-/* appends chunk <src> after <chk>. Returns 0 in case of failure. */
-static inline int chunk_cat(struct buffer *chk, const struct buffer *src)
-{
-	return chunk_memcat(chk, src->area, src->data);
 }
 
 /* copies str into <chk> followed by a trailing zero. Returns 0 in
@@ -200,6 +210,19 @@ static inline int chunk_strcat(struct buffer *chk, const char *str)
 
 	memcpy(chk->area + chk->data, str, len + 1);
 	chk->data += len;
+	return 1;
+}
+
+/* appends <nb> characters from str after <chk>.
+ * Returns 0 in case of failure.
+ */
+static inline int chunk_strncat(struct buffer *chk, const char *str, int nb)
+{
+	if (unlikely(chk->data + nb >= chk->size))
+		return 0;
+
+	memcpy(chk->area + chk->data, str, nb);
+	chk->data += nb;
 	return 1;
 }
 

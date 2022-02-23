@@ -14,8 +14,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <arpa/inet.h>
-
-#include <haproxy/xxhash.h>
+#include <import/xxhash.h>
 
 __attribute__((noreturn)) void die(int code, const char *format, ...)
 {

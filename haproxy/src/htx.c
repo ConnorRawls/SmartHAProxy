@@ -79,7 +79,6 @@ struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk, uint32_t blkinf
 	htx->tail = new - 1;
 	htx->head_addr = htx->end_addr = 0;
 	htx->tail_addr = addr;
-	htx->flags &= ~HTX_FL_FRAGMENTED;
 	memcpy((void *)htx->blocks, (void *)tmp->blocks, htx->size);
 
 	return ((blkpos == -1) ? NULL : htx_get_blk(htx, blkpos));
@@ -340,10 +339,10 @@ struct htx_blk *htx_remove_blk(struct htx *htx, struct htx_blk *blk)
 
 	/* This is the last block in use */
 	if (htx->head == htx->tail) {
-		uint32_t flags = (htx->flags & ~HTX_FL_FRAGMENTED); /* Preserve flags except FRAGMENTED */
+		uint32_t flags = htx->flags; /* Preserve flags */
 
 		htx_reset(htx);
-		htx->flags = flags; /* restore flags */
+		htx->flags |= flags;
 		return NULL;
 	}
 
@@ -369,9 +368,6 @@ struct htx_blk *htx_remove_blk(struct htx *htx, struct htx_blk *blk)
 		blk = NULL;
 		goto end;
 	}
-	else
-		htx->flags |= HTX_FL_FRAGMENTED;
-
 	blk = htx_get_blk(htx, pos+1);
 
   end:
@@ -463,7 +459,7 @@ struct htx_ret htx_drain(struct htx *htx, uint32_t count)
 	struct htx_ret htxret = { .blk = NULL, .ret = 0 };
 
 	if (count == htx->data) {
-		uint32_t flags = (htx->flags & ~HTX_FL_FRAGMENTED); /* Preserve flags except FRAGMENTED */
+		uint32_t flags = htx->flags;
 
 		htx_reset(htx);
 		htx->flags = flags; /* restore flags */
@@ -601,13 +597,11 @@ struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 		if (delta <= 0) {
 			/* compression: copy new data first then move the end */
 			memcpy(old.ptr, new.ptr, new.len);
-			memmove(old.ptr + new.len, istend(old),
-				istend(v) - istend(old));
+			memmove(old.ptr + new.len, old.ptr + old.len, (v.ptr + v.len) - (old.ptr + old.len));
 		}
 		else {
 			/* expansion: move the end first then copy new data */
-			memmove(old.ptr + new.len, istend(old),
-				istend(v) - istend(old));
+			memmove(old.ptr + new.len, old.ptr + old.len, (v.ptr + v.len) - (old.ptr + old.len));
 			memcpy(old.ptr, new.ptr, new.len);
 		}
 
@@ -631,7 +625,7 @@ struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 		ptr += new.len;
 
 		/* Copy value after old part, if any */
-		memcpy(ptr, istend(old), istend(v) - istend(old));
+		memcpy(ptr, old.ptr + old.len, (v.ptr + v.len) - (old.ptr + old.len));
 
 		/* set the new block size and update HTX message */
 		htx_set_blk_value_len(blk, v.len + delta);
@@ -656,8 +650,7 @@ struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 
 		/* move the end first and copy new data
 		 */
-		memmove(old.ptr + offset + new.len, old.ptr + offset + old.len,
-			istend(v) - istend(old));
+		memmove(old.ptr + offset + new.len, old.ptr + offset + old.len, (v.ptr + v.len) - (old.ptr + old.len));
 		memcpy(old.ptr + offset, new.ptr, new.len);
 	}
 	return blk;

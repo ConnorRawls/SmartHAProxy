@@ -28,8 +28,9 @@
 #include <netinet/ip.h>
 #include <netinet/ip6.h>
 
-#include <import/ebtree-t.h>
+#include <import/ebmbtree.h>
 #include <import/ist.h>
+#include <import/xxhash.h>
 
 #include <haproxy/api-t.h>
 #include <haproxy/buf-t.h>
@@ -49,7 +50,6 @@ struct session;
 struct pipe;
 struct quic_conn;
 struct bind_conf;
-struct qcs;
 
 /* Note: subscribing to these events is only valid after the caller has really
  * attempted to perform the operation, and failed to proceed or complete.
@@ -86,9 +86,6 @@ enum {
 	 * the stream-interface :
 	 */
 	CS_FL_NOT_FIRST     = 0x00100000,  /* this stream is not the first one */
-
-	/* flags set by the mux relayed to the stream */
-	CS_FL_WEBSOCKET     = 0x00200000,  /* websocket stream */
 };
 
 /* cs_shutr() modes */
@@ -134,7 +131,7 @@ enum {
 	CO_FL_CTRL_READY    = 0x00000100, /* FD was registered, fd_delete() needed */
 	CO_FL_XPRT_READY    = 0x00000200, /* xprt_start() done, xprt can be used */
 
-	CO_FL_WANT_DRAIN    = 0x00000400, /* try to drain pending data when closing */
+	/* unused : 0x00000400 */
 
 	/* This flag is used by data layers to indicate they had to stop
 	 * receiving data because a buffer was full. The connection handler
@@ -199,8 +196,8 @@ enum {
 
 /* Possible connection error codes.
  * Warning: Do not reorder the codes, they are fetchable through the
- * "fc_err" sample fetch. If a new code is added, please add an error label
- * in conn_err_code_str and in the "fc_err_str" sample fetch documentation.
+ * "fc_conn_err" sample fetch. If a new code is added, please add an error label
+ * in conn_err_code_str and in the "fc_conn_err_str" sample fetch documentation.
  */
 enum {
 	CO_ER_NONE,             /* no error */
@@ -252,8 +249,6 @@ enum {
 	CO_ER_SOCKS4_RECV,       /* SOCKS4 Proxy read error during handshake */
 	CO_ER_SOCKS4_DENY,       /* SOCKS4 Proxy deny the request */
 	CO_ER_SOCKS4_ABORT,      /* SOCKS4 Proxy handshake aborted by server */
-
-	CO_ERR_SSL_FATAL,        /* SSL fatal error during a SSL_read or SSL_write */
 };
 
 /* error return codes for accept_conn() */
@@ -280,11 +275,10 @@ enum {
 
 /* flags that can be passed to xprt->rcv_buf() and mux->rcv_buf() */
 enum {
-	CO_RFL_BUF_WET       = 0x0001,    /* Buffer still has some output data present */
-	CO_RFL_BUF_FLUSH     = 0x0002,    /* Flush mux's buffers but don't read more data */
-	CO_RFL_READ_ONCE     = 0x0004,    /* don't loop even if the request/response is small */
-	CO_RFL_KEEP_RECV     = 0x0008,    /* Instruct the mux to still wait for read events  */
-	CO_RFL_BUF_NOT_STUCK = 0x0010,    /* Buffer is not stuck. Optims are possible during data copy */
+	CO_RFL_BUF_WET     = 0x0001,    /* Buffer still has some output data present */
+	CO_RFL_BUF_FLUSH   = 0x0002,    /* Flush mux's buffers but don't read more data */
+	CO_RFL_READ_ONCE   = 0x0004,    /* don't loop even if the request/response is small */
+	CO_RFL_KEEP_RECV   = 0x0008,    /* Instruct the mux to still wait for read events  */
 };
 
 /* flags that can be passed to xprt->snd_buf() and mux->snd_buf() */
@@ -427,13 +421,7 @@ struct mux_ops {
 	int (*show_fd)(struct buffer *, struct connection *); /* append some data about connection into chunk for "show fd"; returns non-zero if suspicious */
 	int (*subscribe)(struct conn_stream *cs, int event_type,  struct wait_event *es); /* Subscribe <es> to events, such as "being able to send" */
 	int (*unsubscribe)(struct conn_stream *cs, int event_type,  struct wait_event *es); /* Unsubscribe <es> from events */
-	int (*ruqs_subscribe)(struct qcs *qcs, int event_type,  struct wait_event *es); /* Subscribe <es> to events, "being able to receive" only */
-	int (*ruqs_unsubscribe)(struct qcs *qcs, int event_type,  struct wait_event *es); /* Unsubscribe <es> from events */
-	int (*luqs_subscribe)(struct qcs *qcs, int event_type,  struct wait_event *es); /* Subscribe <es> to events, "being able to send" only */
-	int (*luqs_unsubscribe)(struct qcs *qcs, int event_type,  struct wait_event *es); /* Unsubscribe <es> from events */
 	int (*avail_streams)(struct connection *conn); /* Returns the number of streams still available for a connection */
-	int (*avail_streams_bidi)(struct connection *conn); /* Returns the number of bidirectional streams still available for a connection */
-	int (*avail_streams_uni)(struct connection *conn); /* Returns the number of unidirectional streams still available for a connection */
 	int (*used_streams)(struct connection *conn);  /* Returns the number of streams in use on a connection. */
 	void (*destroy)(void *ctx); /* Let the mux know one of its users left, so it may have to disappear */
 	int (*ctl)(struct connection *conn, enum mux_ctl_type mux_ctl, void *arg); /* Provides information about the mux */
@@ -521,11 +509,11 @@ enum conn_hash_params_t {
  * connection hash.
  */
 struct conn_hash_params {
-	uint64_t sni_prehash;
-	uint64_t proxy_prehash;
 	void *target;
+	XXH64_hash_t sni_prehash;
 	struct sockaddr_storage *src_addr;
 	struct sockaddr_storage *dst_addr;
+	XXH64_hash_t proxy_prehash;
 };
 
 /* This structure describes a connection with its methods and data.

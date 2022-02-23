@@ -77,7 +77,6 @@ enum ht_auth_m {
 	HTTP_AUTH_UNKNOWN	= 0,
 	HTTP_AUTH_BASIC,
 	HTTP_AUTH_DIGEST,
-	HTTP_AUTH_BEARER,
 } __attribute__((packed));
 
 /* All implemented HTTP status codes */
@@ -93,7 +92,6 @@ enum {
 	HTTP_ERR_410,
 	HTTP_ERR_413,
 	HTTP_ERR_421,
-	HTTP_ERR_422,
 	HTTP_ERR_425,
 	HTTP_ERR_429,
 	HTTP_ERR_500,

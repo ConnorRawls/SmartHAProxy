@@ -22,7 +22,7 @@
 #ifndef _HAPROXY_DNS_T_H
 #define _HAPROXY_DNS_T_H
 
-#include <import/ebtree-t.h>
+#include <import/eb32tree.h>
 
 #include <haproxy/connection-t.h>
 #include <haproxy/buf-t.h>
@@ -157,23 +157,19 @@ struct dns_counters {
 	char *pid;
 	long long sent;         /* - queries sent */
 	long long snd_error;    /* - sending errors */
-	union {
-		struct {
-			long long valid;        /* - valid response */
-			long long update;       /* - valid response used to update server's IP */
-			long long cname;        /* - CNAME response requiring new resolution */
-			long long cname_error;  /* - error when resolving CNAMEs */
-			long long any_err;      /* - void response (usually because ANY qtype) */
-			long long nx;           /* - NX response */
-			long long timeout;      /* - queries which reached timeout */
-			long long refused;      /* - queries refused */
-			long long other;        /* - other type of response */
-			long long invalid;      /* - malformed DNS response */
-			long long too_big;      /* - too big response */
-			long long outdated;     /* - outdated response (server slower than the other ones) */
-			long long truncated;    /* - truncated response */;
-		} resolver;
-	} app;         /* application specific counteurs */
+	long long valid;        /* - valid response */
+	long long update;       /* - valid response used to update server's IP */
+	long long cname;        /* - CNAME response requiring new resolution */
+	long long cname_error;  /* - error when resolving CNAMEs */
+	long long any_err;      /* - void response (usually because ANY qtype) */
+	long long nx;           /* - NX response */
+	long long timeout;      /* - queries which reached timeout */
+	long long refused;      /* - queries refused */
+	long long other;        /* - other type of response */
+	long long invalid;      /* - malformed DNS response */
+	long long too_big;      /* - too big response */
+	long long outdated;     /* - outdated response (server slower than the other ones) */
+	long long truncated;    /* - truncated response */;
 };
 
 #endif /* _HAPROXY_DNS_T_H */

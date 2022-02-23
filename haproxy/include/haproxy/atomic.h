@@ -23,6 +23,8 @@
 #ifndef _HAPROXY_ATOMIC_H
 #define _HAPROXY_ATOMIC_H
 
+#include <string.h>
+
 /* A few notes for the macros and functions here:
  *  - this file is painful to edit, most operations exist in 3 variants,
  *    no-thread, threads with gcc<4.7, threads with gcc>=4.7. Be careful when
@@ -696,7 +698,7 @@ __ha_barrier_atomic_full(void)
  */
 #define __ha_cpu_relax() ({ asm volatile("isb" ::: "memory"); 1; })
 
-#if defined(__ARM_FEATURE_ATOMICS) && !defined(__clang__) // ARMv8.1-A atomics
+#if defined(__ARM_FEATURE_ATOMICS) // ARMv8.1-A atomics
 
 /* returns 0 on failure, non-zero on success */
 static forceinline int __ha_cas_dw(void *target, void *compare, const void *set)
@@ -736,7 +738,7 @@ static forceinline int __ha_cas_dw(void *target, void *compare, const void *set)
 	return ret;
 }
 
-#elif defined(__SIZEOF_INT128__) && defined(_ARM_FEATURE_ATOMICS) // 128-bit and ARMv8.1-A will work
+#elif defined(__SIZEOF_INT128__) && defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16) // no ARMv8.1-A atomics but 128-bit atomics
 
 /* According to https://gcc.gnu.org/onlinedocs/gcc/_005f_005fatomic-Builtins.html
  * we can use atomics on __int128. The availability of CAS is defined there:
@@ -750,8 +752,8 @@ static forceinline int __ha_cas_dw(void *target, void *compare, const void *set)
 /* returns 0 on failure, non-zero on success */
 static __inline int __ha_cas_dw(void *target, void *compare, const void *set)
 {
-	return __atomic_compare_exchange_n((__int128*)target, (__int128*)compare, *(const __int128*)set,
-	                                   0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+	return __atomic_compare_exchange((__int128*)target, (__int128*)compare, (const __int128*)set,
+	                                 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
 }
 
 #else // neither ARMv8.1-A atomics nor 128-bit atomics
@@ -779,8 +781,7 @@ static __inline int __ha_cas_dw(void *target, void *compare, void *set)
                              : "r" (target), "r" (((void **)(compare))[0]), "r" (((void **)(compare))[1]), "r" (((void **)(set))[0]), "r" (((void **)(set))[1])
                              : "cc", "memory");
 
-	((void **)(compare))[0] = value[0];
-	((void **)(compare))[1] = value[1];
+	memcpy(compare, &value, sizeof(value));
         return (tmp1);
 }
 #endif // ARMv8.1-A atomics

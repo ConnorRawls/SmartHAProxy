@@ -30,6 +30,8 @@
 #include <haproxy/global.h>
 #include <haproxy/pipe.h>
 #include <haproxy/stream_interface.h>
+#include <haproxy/ticks.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 
 

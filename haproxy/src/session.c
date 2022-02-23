@@ -56,8 +56,6 @@ struct session *session_new(struct proxy *fe, struct listener *li, enum obj_type
 		LIST_INIT(&sess->srv_list);
 		sess->idle_conns = 0;
 		sess->flags = SESS_FL_NONE;
-		sess->src = NULL;
-		sess->dst = NULL;
 	}
 	return sess;
 }
@@ -92,8 +90,6 @@ void session_free(struct session *sess)
 		}
 		pool_free(pool_head_sess_srv_list, srv_list);
 	}
-	sockaddr_free(&sess->src);
-	sockaddr_free(&sess->dst);
 	pool_free(pool_head_session, sess);
 	_HA_ATOMIC_DEC(&jobs);
 }
@@ -252,7 +248,7 @@ int session_accept_fd(struct connection *cli_conn)
 	 *          conn -- owner ---> task <-----+
 	 */
 	if (cli_conn->flags & (CO_FL_WAIT_XPRT | CO_FL_EARLY_SSL_HS)) {
-		if (unlikely((sess->task = task_new_here()) == NULL))
+		if (unlikely((sess->task = task_new(tid_bit)) == NULL))
 			goto out_free_sess;
 
 		sess->task->context = sess;
@@ -302,20 +298,19 @@ int session_accept_fd(struct connection *cli_conn)
  */
 static void session_prepare_log_prefix(struct session *sess)
 {
-	const struct sockaddr_storage *src;
 	struct tm tm;
 	char pn[INET6_ADDRSTRLEN];
 	int ret;
 	char *end;
+	struct connection *cli_conn = __objt_conn(sess->origin);
 
-	src = sess_src(sess);
-	ret = (src ? addr_to_str(src, pn, sizeof(pn)) : 0);
+	ret = conn_get_src(cli_conn) ? addr_to_str(cli_conn->src, pn, sizeof(pn)) : 0;
 	if (ret <= 0)
 		chunk_printf(&trash, "unknown [");
 	else if (ret == AF_UNIX)
 		chunk_printf(&trash, "%s:%d [", pn, sess->listener->luid);
 	else
-		chunk_printf(&trash, "%s:%d [", pn, get_host_port(src));
+		chunk_printf(&trash, "%s:%d [", pn, get_host_port(cli_conn->src));
 
 	get_localtime(sess->accept_date.tv_sec, &tm);
 	end = date2str_log(trash.area + trash.data, &tm, &(sess->accept_date),

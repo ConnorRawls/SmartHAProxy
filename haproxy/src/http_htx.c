@@ -146,7 +146,8 @@ static int __http_find_header(const struct htx *htx, const void *pattern, struct
 			goto next_blk;
 		/* Skip comma */
 		if (*(v.ptr) == ',') {
-			v = istnext(v);
+			v.ptr++;
+			v.len--;
 		}
 
 		goto return_hdr;
@@ -195,8 +196,7 @@ static int __http_find_header(const struct htx *htx, const void *pattern, struct
 				if (istlen(n) < istlen(name))
 					goto next_blk;
 
-				n = ist2(istend(n) - istlen(name),
-					 istlen(name));
+				n = ist2(istptr(n) + istlen(n) - istlen(name), istlen(name));
 				if (!isteqi(n, name))
 					goto next_blk;
 				break;
@@ -216,13 +216,13 @@ static int __http_find_header(const struct htx *htx, const void *pattern, struct
 		ctx->lws_before = 0;
 		ctx->lws_after = 0;
 		while (v.len && HTTP_IS_LWS(*v.ptr)) {
-			v = istnext(v);
+			v.ptr++;
+			v.len--;
 			ctx->lws_before++;
 		}
 		if (!(flags & HTTP_FIND_FL_FULL))
-			v.len = http_find_hdr_value_end(v.ptr, istend(v)) - v.ptr;
-
-		while (v.len && HTTP_IS_LWS(*(istend(v) - 1))) {
+			v.len = http_find_hdr_value_end(v.ptr, v.ptr + v.len) - v.ptr;
+		while (v.len && HTTP_IS_LWS(*(v.ptr + v.len - 1))) {
 			v.len--;
 			ctx->lws_after++;
 		}
@@ -432,7 +432,7 @@ int http_replace_req_path(struct htx *htx, const struct ist path, int with_qs)
 	vsn = ist2(temp->area + meth.len, HTX_SL_REQ_VLEN(sl));
 
 	chunk_memcat(temp, uri.ptr, p.ptr - uri.ptr);         /* uri: host part */
-	chunk_istcat(temp, path);                             /* uri: new path */
+	chunk_memcat(temp, path.ptr, path.len);               /* uri: new path */
 	chunk_memcat(temp, p.ptr + plen, p.len - plen);       /* uri: QS part */
 	uri = ist2(temp->area + meth.len + vsn.len, uri.len - plen + path.len);
 
@@ -457,14 +457,16 @@ int http_replace_req_query(struct htx *htx, const struct ist query)
 	uri = htx_sl_req_uri(sl);
 	q = uri;
 	while (q.len > 0 && *(q.ptr) != '?') {
-		q = istnext(q);
+		q.ptr++;
+		q.len--;
 	}
 
 	/* skip the question mark or indicate that we must insert it
 	 * (but only if the format string is not empty then).
 	 */
 	if (q.len) {
-		q = istnext(q);
+		q.ptr++;
+		q.len--;
 	}
 	else if (query.len > 1)
 		offset = 0;
@@ -711,8 +713,8 @@ int http_update_authority(struct htx *htx, struct htx_sl *sl, const struct ist h
 	vsn = ist2(temp->area + meth.len, HTX_SL_REQ_VLEN(sl));
 
 	chunk_memcat(temp, uri.ptr, authority.ptr - uri.ptr);
-	chunk_istcat(temp, host);
-	chunk_memcat(temp, istend(authority), istend(uri) - istend(authority));
+	chunk_memcat(temp, host.ptr, host.len);
+	chunk_memcat(temp, authority.ptr + authority.len, uri.ptr + uri.len - (authority.ptr + authority.len));
 	uri = ist2(temp->area + meth.len + vsn.len, host.len + uri.len - authority.len); /* uri */
 
 	return http_replace_stline(htx, meth, uri, vsn);
@@ -919,7 +921,7 @@ int http_str_to_htx(struct buffer *buf, struct ist raw, char **errmsg)
 
 	h1m_init_res(&h1m);
 	h1m.flags |= H1_MF_NO_PHDR;
-	ret = h1_headers_to_hdr_list(raw.ptr, istend(raw),
+	ret = h1_headers_to_hdr_list(raw.ptr, raw.ptr + raw.len,
 				     hdrs, sizeof(hdrs)/sizeof(hdrs[0]), &h1m, &h1sl);
 	if (ret <= 0) {
 		memprintf(errmsg, "unabled to parse headers (error offset: %d)", h1m.err_pos);
@@ -1390,7 +1392,7 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 	struct stat stat;
 	const char *act_arg = NULL;
 	char *obj = NULL;
-	int cur_arg, cap = 0, objlen = 0, fd = -1;
+	int cur_arg, cap, objlen = 0, fd = -1;
 
 
 	reply = calloc(1, sizeof(*reply));
@@ -1404,12 +1406,10 @@ struct http_reply *http_parse_http_reply(const char **args, int *orig_arg, struc
 
 	if (px->conf.args.ctx == ARGC_HERR)
 		cap = (SMP_VAL_REQUEST | SMP_VAL_RESPONSE);
-	else {
-		if (px->cap & PR_CAP_FE)
-			cap |= ((px->conf.args.ctx == ARGC_HRQ) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_FE_HRS_HDR);
-		if (px->cap & PR_CAP_BE)
-			cap |= ((px->conf.args.ctx == ARGC_HRQ) ? SMP_VAL_BE_HRQ_HDR : SMP_VAL_BE_HRS_HDR);
-	}
+	else
+		cap = ((px->conf.args.ctx == ARGC_HRQ)
+		       ? ((px->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR)
+		       : ((px->cap & PR_CAP_BE) ? SMP_VAL_BE_HRS_HDR : SMP_VAL_FE_HRS_HDR));
 
 	cur_arg = *orig_arg;
 	while (*args[cur_arg]) {

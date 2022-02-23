@@ -27,11 +27,13 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <import/ist.h>
+#include <haproxy/activity.h>
 #include <haproxy/api.h>
-#include <haproxy/atomic.h>
 #include <haproxy/fd-t.h>
 #include <haproxy/global.h>
 #include <haproxy/thread.h>
+#include <haproxy/ticks.h>
+#include <haproxy/time.h>
 
 /* public variables */
 
@@ -70,8 +72,6 @@ ssize_t fd_write_frag_line(int fd, size_t maxlen, const struct ist pfx[], size_t
 /* close all FDs starting from <start> */
 void my_closefrom(int start);
 
-int compute_poll_timeout(int next);
-
 /* disable the specified poller */
 void disable_poller(const char *poller_name);
 
@@ -82,12 +82,12 @@ void poller_pipe_io_handler(int fd);
  * If none works, returns 0, otherwise 1.
  * The pollers register themselves just before main() is called.
  */
-int init_pollers(void);
+int init_pollers();
 
 /*
  * Deinitialize the pollers.
  */
-void deinit_pollers(void);
+void deinit_pollers();
 
 /*
  * Some pollers may lose their connection after a fork(). It may be necessary
@@ -96,7 +96,7 @@ void deinit_pollers(void);
  * the the current poller is destroyed and the caller is responsible for trying
  * another one by calling init_pollers() again.
  */
-int fork_poller(void);
+int fork_poller();
 
 /*
  * Lists the known pollers on <out>.
@@ -338,6 +338,30 @@ static inline void fd_insert(int fd, void *owner, void (*iocb)(int fd), unsigned
 	/* the two directions are ready until proven otherwise */
 	fd_may_both(fd);
 	_HA_ATOMIC_INC(&ha_used_fds);
+}
+
+/* Computes the bounded poll() timeout based on the next expiration timer <next>
+ * by bounding it to MAX_DELAY_MS. <next> may equal TICK_ETERNITY. The pollers
+ * just needs to call this function right before polling to get their timeout
+ * value. Timeouts that are already expired (possibly due to a pending event)
+ * are accounted for in activity.poll_exp.
+ */
+static inline int compute_poll_timeout(int next)
+{
+	int wait_time;
+
+	if (!tick_isset(next))
+		wait_time = MAX_DELAY_MS;
+	else if (tick_is_expired(next, now_ms)) {
+		activity[tid].poll_exp++;
+		wait_time = 0;
+	}
+	else {
+		wait_time = TICKS_TO_MS(tick_remain(now_ms, next)) + 1;
+		if (wait_time > MAX_DELAY_MS)
+			wait_time = MAX_DELAY_MS;
+	}
+	return wait_time;
 }
 
 /* These are replacements for FD_SET, FD_CLR, FD_ISSET, working on uints */

@@ -28,20 +28,17 @@
 
 #include <stdint.h>
 
-#include <import/eb64tree.h>
-
 #include <haproxy/buf.h>
 #include <haproxy/chunk.h>
 #include <haproxy/net_helper.h>
 #include <haproxy/openssl-compat.h>
 #include <haproxy/ticks.h>
+#include <haproxy/time.h>
 
 #include <haproxy/listener.h>
 #include <haproxy/quic_cc.h>
-#include <haproxy/quic_enc.h>
 #include <haproxy/quic_frame.h>
 #include <haproxy/quic_loss.h>
-#include <haproxy/mux_quic.h>
 #include <haproxy/xprt_quic-t.h>
 
 #include <openssl/rand.h>
@@ -49,12 +46,6 @@
 extern struct pool_head *pool_head_quic_connection_id;
 
 int ssl_quic_initial_ctx(struct bind_conf *bind_conf);
-
-/* Update the mux stream-related transport parameters from <qc> connection */
-static inline void quic_transport_params_update(struct quic_conn *qc)
-{
-	quic_mux_transport_params_update(qc->qcc);
-}
 
 /* Returns the required length in bytes to encode <cid> QUIC connection ID. */
 static inline size_t sizeof_quic_cid(const struct quic_cid *cid)
@@ -116,12 +107,6 @@ static inline void quic_cid_dump(struct buffer *buf, struct quic_cid *cid)
 	for (i = 0; i < cid->len; i++)
 		chunk_appendf(buf, "%02x", cid->data[i]);
 	chunk_appendf(buf, ")");
-}
-
-/* Simply compute a thread ID from a CID */
-static inline unsigned long quic_get_cid_tid(const struct quic_cid *cid)
-{
-	return cid->data[0] % global.nbthread;
 }
 
 /* Free the CIDs attached to <conn> QUIC connection.
@@ -243,6 +228,46 @@ static inline int quic_write_uint32(unsigned char **buf,
 	return 1;
 }
 
+
+/* Returns enough log2 of first powers of two to encode QUIC variable length
+ * integers.
+ * Returns -1 if <val> if out of the range of lengths supported by QUIC.
+ */
+static inline int quic_log2(unsigned int val)
+{
+	switch (val) {
+	case 8:
+		return 3;
+	case 4:
+		return 2;
+	case 2:
+		return 1;
+	case 1:
+		return 0;
+	default:
+		return -1;
+	}
+}
+
+/* Returns the size in bytes required to encode a 64bits integer if
+ * not out of range (< (1 << 62)), or 0 if out of range.
+ */
+static inline size_t quic_int_getsize(uint64_t val)
+{
+	switch (val) {
+	case 0 ... QUIC_VARINT_1_BYTE_MAX:
+		return 1;
+	case QUIC_VARINT_1_BYTE_MAX + 1 ... QUIC_VARINT_2_BYTE_MAX:
+		return 2;
+	case QUIC_VARINT_2_BYTE_MAX + 1 ... QUIC_VARINT_4_BYTE_MAX:
+		return 4;
+	case QUIC_VARINT_4_BYTE_MAX + 1 ... QUIC_VARINT_8_BYTE_MAX:
+		return 8;
+	default:
+		return 0;
+	}
+}
+
 /* Return the difference between the encoded length of <val> and the encoded
  * length of <val+1>.
  */
@@ -361,6 +386,59 @@ static inline size_t max_stream_data_size(size_t sz, size_t ilen, size_t dlen)
 	return 0;
 }
 
+/* Decode a QUIC variable-length integer from <buf> buffer into <val>.
+ * Note that the result is a 64-bits integer but with the less significant
+ * 62 bits as relevant information. The most significant 2 remaining bits encode
+ * the length of the integer.
+ * Returns 1 if succeeded there was enough data in <buf>), 0 if not.
+ */
+static inline int quic_dec_int(uint64_t *val,
+                               const unsigned char **buf,
+                               const unsigned char *end)
+{
+	size_t len;
+
+	if (*buf >= end)
+		return 0;
+
+	len = 1 << (**buf >> QUIC_VARINT_BYTE_0_SHIFT);
+	if (*buf + len > end)
+		return 0;
+
+	*val = *(*buf)++ & QUIC_VARINT_BYTE_0_BITMASK;
+	while (--len)
+		*val = (*val << 8) | *(*buf)++;
+
+	return 1;
+}
+
+/* Encode a QUIC variable-length integer from <val> into <buf> buffer with <end> as first
+ * byte address after the end of this buffer.
+ * Returns 1 if succeeded (there was enough room in buf), 0 if not.
+ */
+static inline int quic_enc_int(unsigned char **buf, const unsigned char *end, uint64_t val)
+{
+	size_t len;
+	unsigned int shift;
+	unsigned char size_bits, *head;
+
+	len = quic_int_getsize(val);
+	if (!len || end - *buf < len)
+		return 0;
+
+	shift = (len - 1) * 8;
+	/* set the bits of byte#0 which gives the length of the encoded integer */
+	size_bits = quic_log2(len) << QUIC_VARINT_BYTE_0_SHIFT;
+	head = *buf;
+	while (len--) {
+		*(*buf)++ = val >> shift;
+		shift -= 8;
+	}
+	*head |= size_bits;
+
+	return 1;
+}
+
 /* Return the length in bytes of <pn> packet number depending on
  * <largest_acked_pn> the largest ackownledged packet number.
  */
@@ -421,19 +499,17 @@ static inline void quic_packet_number_encode(unsigned char **buf,
 static inline unsigned int quic_ack_delay_ms(struct quic_ack *ack_frm,
                                              struct quic_conn *conn)
 {
-	return ack_frm->ack_delay << conn->tx.params.ack_delay_exponent;
+	return ack_frm->ack_delay << conn->rx_tps.ack_delay_exponent;
 }
 
-/* Initialize <dst> transport parameters with default values (when absent)
- * from <quic_dflt_trasports_params>.
+/* Initialize <dst> transport parameters from <quic_dflt_trasports_parame>.
  * Never fails.
  */
 static inline void quic_dflt_transport_params_cpy(struct quic_transport_params *dst)
 {
-	dst->max_udp_payload_size = quic_dflt_transport_params.max_udp_payload_size;
-	dst->ack_delay_exponent   = quic_dflt_transport_params.ack_delay_exponent;
-	dst->max_ack_delay        = quic_dflt_transport_params.max_ack_delay;
-	dst->active_connection_id_limit = quic_dflt_transport_params.active_connection_id_limit;
+	dst->max_packet_size    = quic_dflt_transport_params.max_packet_size;
+	dst->ack_delay_exponent = quic_dflt_transport_params.ack_delay_exponent;
+	dst->max_ack_delay      = quic_dflt_transport_params.max_ack_delay;
 }
 
 /* Initialize <p> transport parameters depending <server> boolean value which
@@ -444,10 +520,9 @@ static inline void quic_dflt_transport_params_cpy(struct quic_transport_params *
 static inline void quic_transport_params_init(struct quic_transport_params *p,
                                               int server)
 {
-	/* Default values (when absent) */
 	quic_dflt_transport_params_cpy(p);
 
-	p->max_idle_timeout                    = 30000;
+	p->idle_timeout                        = 30000;
 
 	p->initial_max_data                    = 1 * 1024 * 1024;
 	p->initial_max_stream_data_bidi_local  = 256 * 1024;
@@ -553,7 +628,6 @@ static inline int quic_transport_param_decode(struct quic_transport_params *p,
 {
 	const unsigned char *end = *buf + len;
 
-	quic_dflt_transport_params_cpy(p);
 	switch (type) {
 	case QUIC_TP_ORIGINAL_DESTINATION_CONNECTION_ID:
 		if (!server || len >= sizeof p->original_destination_connection_id.data)
@@ -589,12 +663,12 @@ static inline int quic_transport_param_decode(struct quic_transport_params *p,
 			return 0;
 		p->with_preferred_address = 1;
 		break;
-	case QUIC_TP_MAX_IDLE_TIMEOUT:
-		if (!quic_dec_int(&p->max_idle_timeout, buf, end))
+	case QUIC_TP_IDLE_TIMEOUT:
+		if (!quic_dec_int(&p->idle_timeout, buf, end))
 			return 0;
 		break;
-	case QUIC_TP_MAX_UDP_PAYLOAD_SIZE:
-		if (!quic_dec_int(&p->max_udp_payload_size, buf, end))
+	case QUIC_TP_MAX_PACKET_SIZE:
+		if (!quic_dec_int(&p->max_packet_size, buf, end))
 			return 0;
 		break;
 	case QUIC_TP_INITIAL_MAX_DATA:
@@ -767,16 +841,16 @@ static inline int quic_transport_params_encode(unsigned char *buf,
 	                                  p->initial_source_connection_id.len))
 		return 0;
 
-	if (p->max_idle_timeout &&
-	    !quic_transport_param_enc_int(&pos, end, QUIC_TP_MAX_IDLE_TIMEOUT, p->max_idle_timeout))
+	if (p->idle_timeout &&
+	    !quic_transport_param_enc_int(&pos, end, QUIC_TP_IDLE_TIMEOUT, p->idle_timeout))
 		return 0;
 
 	/*
 	 * "max_packet_size" transport parameter must be transmitted only if different
 	 * of the default value.
 	 */
-	if (p->max_udp_payload_size != QUIC_DFLT_MAX_UDP_PAYLOAD_SIZE &&
-	    !quic_transport_param_enc_int(&pos, end, QUIC_TP_MAX_UDP_PAYLOAD_SIZE, p->max_udp_payload_size))
+	if (p->max_packet_size != QUIC_DFLT_MAX_PACKET_SIZE &&
+	    !quic_transport_param_enc_int(&pos, end, QUIC_TP_MAX_PACKET_SIZE, p->max_packet_size))
 		return 0;
 
 	if (p->initial_max_data &&
@@ -830,7 +904,6 @@ static inline int quic_transport_params_encode(unsigned char *buf,
 		return 0;
 
 	if (p->active_connection_id_limit &&
-	    p->active_connection_id_limit != QUIC_ACTIVE_CONNECTION_ID_LIMIT &&
 	    !quic_transport_param_enc_int(&pos, end, QUIC_TP_ACTIVE_CONNECTION_ID_LIMIT,
 	                                  p->active_connection_id_limit))
 	    return 0;
@@ -885,11 +958,11 @@ static inline int quic_transport_params_store(struct quic_conn *conn, int server
                                               const unsigned char *buf,
                                               const unsigned char *end)
 {
-	if (!quic_transport_params_decode(&conn->tx.params, server, buf, end))
+	if (!quic_transport_params_decode(&conn->rx_tps, server, buf, end))
 		return 0;
 
-	if (conn->tx.params.max_ack_delay)
-		conn->max_ack_delay = conn->tx.params.max_ack_delay;
+	if (conn->rx_tps.max_ack_delay)
+		conn->max_ack_delay = conn->rx_tps.max_ack_delay;
 
 	return 1;
 }
@@ -899,7 +972,7 @@ static inline int quic_transport_params_store(struct quic_conn *conn, int server
  */
 static inline void quic_pktns_init(struct quic_pktns *pktns)
 {
-	MT_LIST_INIT(&pktns->tx.frms);
+	LIST_INIT(&pktns->tx.frms);
 	pktns->tx.next_pn = -1;
 	pktns->tx.pkts = EB_ROOT_UNIQUE;
 	pktns->tx.largest_acked_pn = -1;
@@ -908,6 +981,7 @@ static inline void quic_pktns_init(struct quic_pktns *pktns)
 	pktns->tx.in_flight = 0;
 
 	pktns->rx.largest_pn = -1;
+	pktns->rx.nb_ack_eliciting = 0;
 	pktns->rx.arngs.root = EB_ROOT_UNIQUE;
 	pktns->rx.arngs.sz = 0;
 	pktns->rx.arngs.enc_sz = 0;
@@ -937,13 +1011,13 @@ static inline void quic_pktns_discard(struct quic_pktns *pktns,
 	node = eb64_first(&pktns->tx.pkts);
 	while (node) {
 		struct quic_tx_packet *pkt;
-		struct quic_frame *frm, *frmbak;
+		struct quic_tx_frm *frm, *frmbak;
 
 		pkt = eb64_entry(&node->node, struct quic_tx_packet, pn_node);
 		node = eb64_next(node);
 		list_for_each_entry_safe(frm, frmbak, &pkt->frms, list) {
 			LIST_DELETE(&frm->list);
-			pool_free(pool_head_quic_frame, frm);
+			pool_free(pool_head_quic_tx_frm, frm);
 		}
 		eb64_delete(&pkt->pn_node);
 		pool_free(pool_head_quic_tx_packet, pkt);
@@ -1020,79 +1094,140 @@ static inline int c_buf_consumed(struct quic_enc_level *qel)
 	return qel->tx.crypto.offset == qel->tx.crypto.sz;
 }
 
+
+/* QUIC buffer handling functions */
+
+/* Returns the current buffer which may be used to build outgoing packets. */
+static inline struct q_buf *q_wbuf(struct quic_conn *qc)
+{
+	return qc->tx.bufs[qc->tx.wbuf];
+}
+
+static inline struct q_buf *q_rbuf(struct quic_conn *qc)
+{
+	return qc->tx.bufs[qc->tx.rbuf];
+}
+
+/* Returns the next buffer to be used to send packets from. */
+static inline struct q_buf *q_next_rbuf(struct quic_conn *qc)
+{
+	qc->tx.rbuf = (qc->tx.rbuf + 1) & (QUIC_CONN_TX_BUFS_NB - 1);
+	return q_rbuf(qc);
+}
+
+/* Return the next buffer which may be used to build outgoing packets.
+ * Also decrement by one the number of remaining probing datagrams
+ * which may be sent.
+ */
+static inline struct q_buf *q_next_wbuf(struct quic_conn *qc)
+{
+	qc->tx.wbuf = (qc->tx.wbuf + 1) & (QUIC_CONN_TX_BUFS_NB - 1);
+	/* Decrement the number of prepared datagrams (only when probing). */
+	if (qc->tx.nb_pto_dgrams)
+		--qc->tx.nb_pto_dgrams;
+	return q_wbuf(qc);
+}
+
+/* Return the position of <buf> buffer to be used to write outgoing packets. */
+static inline unsigned char *q_buf_getpos(struct q_buf *buf)
+{
+	return buf->pos;
+}
+
+/* Return the pointer to one past the end of <buf> buffer. */
+static inline const unsigned char *q_buf_end(struct q_buf *buf)
+{
+	return buf->end;
+}
+
+/* Set the position of <buf> buffer to <pos> value. */
+static inline void q_buf_setpos(struct q_buf *buf, unsigned char *pos)
+{
+	buf->pos = pos;
+}
+
+/* Returns the remaining amount of room left in <buf> buffer. */
+static inline ssize_t q_buf_room(struct q_buf *buf)
+{
+	return q_buf_end(buf) - q_buf_getpos(buf);
+}
+
+/* Reset (or empty) <buf> buffer to prepare it for the next writing. */
+static inline void q_buf_reset(struct q_buf *buf)
+{
+	buf->pos = buf->area;
+	buf->data = 0;
+}
+
+/* Returns 1 if <buf> is empty, 0 if not. */
+static inline int q_buf_empty(struct q_buf *buf)
+{
+	return !buf->data;
+}
+
 /* Return 1 if <pkt> header form is long, 0 if not. */
 static inline int qc_pkt_long(const struct quic_rx_packet *pkt)
 {
 	return pkt->type != QUIC_PACKET_TYPE_SHORT;
 }
 
-/* Release the memory for the RX packets which are no more referenced
- * and consume their payloads which have been copied to the RX buffer
- * for the connection.
- * Always succeeds.
- */
-static inline void quic_rx_packet_pool_purge(struct quic_conn *qc)
-{
-	struct quic_rx_packet *pkt, *pktback;
-
-	list_for_each_entry_safe(pkt, pktback, &qc->rx.pkt_list, qc_rx_pkt_list) {
-		if (pkt->data != (unsigned char *)b_head(&qc->rx.buf))
-			break;
-
-		if (!HA_ATOMIC_LOAD(&pkt->refcnt)) {
-			b_del(&qc->rx.buf, pkt->raw_len);
-			LIST_DELETE(&pkt->qc_rx_pkt_list);
-			pool_free(pool_head_quic_rx_packet, pkt);
-		}
-	}
-}
-
 /* Increment the reference counter of <pkt> */
 static inline void quic_rx_packet_refinc(struct quic_rx_packet *pkt)
 {
-	HA_ATOMIC_ADD(&pkt->refcnt, 1);
+	pkt->refcnt++;
 }
 
 /* Decrement the reference counter of <pkt> */
 static inline void quic_rx_packet_refdec(struct quic_rx_packet *pkt)
 {
-	if (HA_ATOMIC_SUB_FETCH(&pkt->refcnt, 1))
-		return;
-
-	if (!pkt->qc) {
-		/* It is possible the connection for this packet has not already been
-		 * identified. In such a case, we only need to free this packet.
-		 */
+	if (!--pkt->refcnt)
 		pool_free(pool_head_quic_rx_packet, pkt);
-	}
-	else {
-		struct quic_conn *qc = pkt->qc;
-
-		HA_RWLOCK_WRLOCK(QUIC_LOCK, &qc->rx.buf_rwlock);
-		if (pkt->data == (unsigned char *)b_head(&qc->rx.buf)) {
-			b_del(&qc->rx.buf, pkt->raw_len);
-			LIST_DELETE(&pkt->qc_rx_pkt_list);
-			pool_free(pool_head_quic_rx_packet, pkt);
-			quic_rx_packet_pool_purge(qc);
-		}
-		HA_RWLOCK_WRUNLOCK(QUIC_LOCK, &qc->rx.buf_rwlock);
-	}
 }
 
-/* Increment the reference counter of <pkt> */
-static inline void quic_tx_packet_refinc(struct quic_tx_packet *pkt)
+/* Add <pkt> RX packet to <list>, incrementing its reference counter. */
+static inline void quic_rx_packet_list_addq(struct list *list,
+                                            struct quic_rx_packet *pkt)
 {
-	HA_ATOMIC_ADD(&pkt->refcnt, 1);
+	LIST_APPEND(list, &pkt->list);
+	quic_rx_packet_refinc(pkt);
 }
 
-/* Decrement the reference counter of <pkt> */
-static inline void quic_tx_packet_refdec(struct quic_tx_packet *pkt)
+/* Remove <pkt> RX packet from <list>, decrementing its reference counter. */
+static inline void quic_rx_packet_list_del(struct quic_rx_packet *pkt)
 {
-	if (!HA_ATOMIC_SUB_FETCH(&pkt->refcnt, 1))
-		pool_free(pool_head_quic_tx_packet, pkt);
+	LIST_DELETE(&pkt->list);
+	quic_rx_packet_refdec(pkt);
 }
 
-ssize_t quic_lstnr_dgram_read(struct buffer *buf, size_t len, void *owner,
+/* Add <pkt> RX packet to <root> tree, incrementing its reference counter. */
+static inline void quic_rx_packet_eb64_insert(struct eb_root *root,
+                                              struct eb64_node *node)
+{
+	eb64_insert(root, node);
+	quic_rx_packet_refinc(eb64_entry(node, struct quic_rx_packet, pn_node));
+}
+
+/* Delete <pkt> RX packet from <root> tree, decrementing its reference counter. */
+static inline void quic_rx_packet_eb64_delete(struct eb64_node *node)
+{
+	eb64_delete(node);
+	quic_rx_packet_refdec(eb64_entry(node, struct quic_rx_packet, pn_node));
+}
+
+/* Release the memory allocated for <pkt> RX packet. */
+static inline void free_quic_rx_packet(struct quic_rx_packet *pkt)
+{
+	quic_rx_packet_refdec(pkt);
+}
+
+int qc_new_conn_init(struct quic_conn *conn, int ipv4,
+                     struct eb_root *quic_initial_clients,
+                     struct eb_root *quic_clients,
+                     unsigned char *dcid, size_t dcid_len,
+                     unsigned char *scid, size_t scid_len);
+ssize_t quic_lstnr_dgram_read(char *buf, size_t len, void *owner,
                               struct sockaddr_storage *saddr);
+ssize_t quic_srv_dgram_read(char *buf, size_t len, void *owner,
+                            struct sockaddr_storage *saddr);
 #endif /* USE_QUIC */
 #endif /* _HAPROXY_XPRT_QUIC_H */

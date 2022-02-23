@@ -11,9 +11,6 @@ name: Windows
 on:
   push:
 
-permissions:
-  contents: read
-
 jobs:
   msys2:
     name: ${{ matrix.name }}

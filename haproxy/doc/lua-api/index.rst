@@ -819,14 +819,6 @@ Core class
 
   :returns: A :ref:`socket_class` object.
 
-.. js:function:: core.httpclient()
-
-  **context**: init, task, action
-
-  This function returns a new object of a *httpclient* class.
-
-  :returns: A :ref:`httpclient_class` object.
-
 .. js:function:: core.concat()
 
   **context**: body, init, task, action, sample-fetch, converter
@@ -1844,55 +1836,6 @@ HTTP class
   :param integer status: The new response status code.
   :param string reason: The new response reason (optional).
 
-.. _httpclient_class:
-
-HTTPClient class
-================
-
-.. js:class:: HTTPClient
-
-   The httpclient class allows issue of outbound HTTP requests through a simple
-   API without the knowledge of HAProxy internals.
-
-.. js:function:: HTTPClient.get(httpclient, request)
-.. js:function:: HTTPClient.head(httpclient, request)
-.. js:function:: HTTPClient.put(httpclient, request)
-.. js:function:: HTTPClient.post(httpclient, request)
-.. js:function:: HTTPClient.delete(httpclient, request)
-
-  Send an HTTP request and wait for a response. GET, HEAD PUT, POST and DELETE methods can be used.
-  The HTTPClient will send asynchronously the data and is able to send and receive more than an HAProxy bufsize.
-
-
-  :param class httpclient: Is the manipulated HTTPClient.
-  :param table request: Is a table containing the parameters of the request that will be send.
-  :param string request.url: Is a mandatory parameter for the request that contains the URL.
-  :param string request.body: Is an optional parameter for the request that contains the body to send.
-  :param table request.headers: Is an optional parameter for the request that contains the headers to send.
-  :returns: Lua table containing the response
-
-
-.. code-block:: lua
-
-  local httpclient = core.httpclient()
-  local response = httpclient:post{url="http://127.0.0.1", body=body}
-
-..
-
-.. code-block:: lua
-
- response = {
-    status  = 400,
-    reason  = "Bad request",
-    headers = {
-        ["content-type"]  = { "text/html" },
-        ["cache-control"] = { "no-cache", "no-store" },
-    },
-    body = "<html><body><h1>invalid request<h1></body></html>"
-  }
-..
-
-
 .. _txn_class:
 
 TXN class
@@ -2140,13 +2083,10 @@ TXN class
   processing after some data have been returned to the client (eg: a redirect).
   To do so, a reply may be provided. This object is optional and may contain a
   status code, a reason, a header list and a body. All these fields are
-  optional. When not provided, the default values are used. By default, with an
-  empty reply object, an empty HTTP 200 response is returned to the client. If
-  no reply object is provided, the transaction is terminated without any
-  reply. If a reply object is provided, it must not exceed the buffer size once
-  converted into the internal HTTP representing. Because for now there is no
-  easy way to be sure it fits, it is probably better to keep it reasonably
-  small.
+  optional. When not provided, the default values are used. By default, with
+  an empty reply object, an empty HTTP 200 response is returned to the
+  client. If no reply object is provided, the transaction is terminated without
+  any reply.
 
   The reply object may be fully created in lua or the class Reply may be used to
   create it.
@@ -2238,12 +2178,7 @@ Reply class
   **context**: action
 
   This class represents an HTTP response message. It provides some methods to
-  enrich it. Once converted into the internal HTTP representation, the response
-  message must not exceed the buffer size. Because for now there is no
-  easy way to be sure it fits, it is probably better to keep it reasonably
-  small.
-
-  See tune.bufsize in the configuration manual for dettails.
+  enrich it.
 
 .. code-block:: lua
 

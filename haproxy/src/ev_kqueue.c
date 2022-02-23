@@ -19,12 +19,11 @@
 
 #include <haproxy/activity.h>
 #include <haproxy/api.h>
-#include <haproxy/clock.h>
 #include <haproxy/fd.h>
 #include <haproxy/global.h>
 #include <haproxy/signal.h>
-#include <haproxy/task.h>
 #include <haproxy/ticks.h>
+#include <haproxy/time.h>
 
 
 /* private data */
@@ -146,7 +145,8 @@ static void _do_poll(struct poller *p, int exp, int wake)
 	/* now let's wait for events */
 	wait_time = wake ? 0 : compute_poll_timeout(exp);
 	fd = global.tune.maxpollevents;
-	clock_entering_poll();
+	tv_entering_poll();
+	activity_count_runtime();
 
 	do {
 		int timeout = (global.tune.options & GTUNE_BUSY_POLLING) ? 0 : wait_time;
@@ -160,7 +160,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 		                kev,       // struct kevent *eventlist
 		                fd,        // int nevents
 		                &timeout_ts); // const struct timespec *timeout
-		clock_update_date(timeout, status);
+		tv_update_date(timeout, status);
 
 		if (status) {
 			activity[tid].poll_io++;
@@ -174,7 +174,7 @@ static void _do_poll(struct poller *p, int exp, int wake)
 			break;
 	} while (1);
 
-	clock_leaving_poll(wait_time, status);
+	tv_leaving_poll(wait_time, status);
 
 	thread_harmless_end();
 	thread_idle_end();

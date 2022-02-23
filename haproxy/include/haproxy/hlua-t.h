@@ -27,7 +27,7 @@
 #include <lua.h>
 #include <lauxlib.h>
 
-#include <import/ebtree-t.h>
+#include <import/ebpttree.h>
 
 #include <haproxy/proxy-t.h>
 #include <haproxy/regex-t.h>
@@ -43,7 +43,6 @@
 #define CLASS_CHANNEL      "Channel"
 #define CLASS_HTTP         "HTTP"
 #define CLASS_HTTP_MSG     "HTTPMessage"
-#define CLASS_HTTPCLIENT   "HTTPClient"
 #define CLASS_MAP          "Map"
 #define CLASS_APPLET_TCP   "AppletTCP"
 #define CLASS_APPLET_HTTP  "AppletHTTP"
@@ -65,15 +64,8 @@ struct stream;
 #define HLUA_F_AS_STRING    0x01
 #define HLUA_F_MAY_USE_HTTP 0x02
 
-/* HLUA TXN flags */
 #define HLUA_TXN_NOTERM   0x00000001
 /* 0x00000002 .. 0x00000008 unused */
-
-/* The execution context (enum), bits values from 0x00000010 to
- * 0x00000030. These flags are mutually exclusives. Only one must be set at a
- * time.
- */
-#define HLUA_TXN_SMP_NONE 0x00000000 /* No specific execution context */
 #define HLUA_TXN_SMP_CTX  0x00000010 /* Executed from a sample fecth context */
 #define HLUA_TXN_ACT_CTX  0x00000020 /* Executed from a action context */
 #define HLUA_TXN_FLT_CTX  0x00000030 /* Executed from a filter context */
@@ -190,13 +182,6 @@ struct hlua_socket {
 struct hlua_concat {
 	int size;
 	int len;
-};
-
-/* This struct is used to store the httpclient */
-struct hlua_httpclient {
-	struct httpclient *hc; /* ptr to the httpclient instance */
-	size_t sent; /* payload sent */
-	luaL_Buffer b; /* buffer used to prepare strings. */
 };
 
 #else /* USE_LUA */

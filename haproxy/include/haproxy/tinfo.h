@@ -25,14 +25,8 @@
 #include <haproxy/api.h>
 #include <haproxy/tinfo-t.h>
 
-/* the structs are in thread.c */
-extern struct tgroup_info ha_tgroup_info[MAX_TGROUPS];
-extern THREAD_LOCAL const struct tgroup_info *tg;
-
+/* the struct is in thread.c */
 extern struct thread_info ha_thread_info[MAX_THREADS];
-extern THREAD_LOCAL const struct thread_info *ti;   /* thread_info for the current thread */
-
-extern struct thread_ctx ha_thread_ctx[MAX_THREADS];
-extern THREAD_LOCAL struct thread_ctx *th_ctx; /* ha_thread_ctx for the current thread */
+extern THREAD_LOCAL struct thread_info *ti; /* thread_info for the current thread */
 
 #endif /* _HAPROXY_TINFO_H */

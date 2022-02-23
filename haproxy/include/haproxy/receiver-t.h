@@ -41,6 +41,7 @@
 
 /* All the settings that are used to configure a receiver */
 struct rx_settings {
+	unsigned long bind_thread;        /* bitmask of threads allowed to use these listeners */
 	struct {                          /* UNIX socket permissions */
 		uid_t uid;                /* -1 to leave unchanged */
 		gid_t gid;                /* -1 to leave unchanged */
@@ -49,7 +50,6 @@ struct rx_settings {
 	char *interface;                  /* interface name or NULL */
 	const struct netns_entry *netns;  /* network namespace of the listener*/
 	unsigned int options;             /* receiver options (RX_O_*) */
-	uint shards;                      /* number of shards */
 };
 
 /* This describes a receiver with all its characteristics (address, options, etc) */
@@ -59,19 +59,12 @@ struct receiver {
 	struct protocol *proto;          /* protocol this receiver belongs to */
 	void *owner;                     /* receiver's owner (usually a listener) */
 	void (*iocb)(int fd);            /* generic I/O handler (typically accept callback) */
-	unsigned long bind_thread;       /* bitmask of threads allowed on this receiver */
-	uint bind_tgroup;                /* thread group ID: 0=global IDs, non-zero=local IDs */
 	struct rx_settings *settings;    /* points to the settings used by this receiver */
 	struct list proto_list;          /* list in the protocol header */
 #ifdef USE_QUIC
-	struct mt_list pkts;             /* QUIC Initial packets to accept new connections */
+	struct list qpkts;               /* QUIC Initial packets to accept new connections */
 	struct eb_root odcids;           /* QUIC original destination connection IDs. */
 	struct eb_root cids;             /* QUIC connection IDs. */
-	__decl_thread(HA_RWLOCK_T cids_lock); /* RW lock for connection IDs tree accesses */
-	struct qring *tx_qrings;         /* Array of rings (one by thread) */
-	struct mt_list tx_qring_list;    /* The same as ->qrings but arranged in a list */
-	struct rxbuf *rxbufs;            /* Array of buffers for RX (one by thread) */
-	struct mt_list rxbuf_list;       /* The same as ->rxbufs but arranged in a list */
 #endif
 	/* warning: this struct is huge, keep it at the bottom */
 	struct sockaddr_storage addr;    /* the address the socket is bound to */

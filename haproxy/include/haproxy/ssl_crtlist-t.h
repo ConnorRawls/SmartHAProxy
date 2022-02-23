@@ -23,7 +23,8 @@
 #define _HAPROXY_SSL_CRTLIST_T_H
 #ifdef USE_OPENSSL
 
-#include <import/ebtree-t.h>
+#include <import/ebmbtree.h>
+#include <import/ebpttree.h>
 
 
 /* forward declarations for structures below */

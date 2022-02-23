@@ -37,20 +37,18 @@
 #endif
 #endif
 
-/* The TLS extensions for QUIC transport parameters */
-#define TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS       0x0039
-#define TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS_DRAFT 0xffa5
+/* The TLS extension (enum) for QUIC transport parameters */
+#define TLS_EXTENSION_QUIC_TRANSPORT_PARAMETERS 0xffa5
 
 /* QUIC handshake states for both clients and servers. */
 enum quic_handshake_state {
-	QUIC_HS_ST_CLIENT_HANDSHAKE_FAILED,
-	QUIC_HS_ST_SERVER_HANDSHAKE_FAILED,
-
 	QUIC_HS_ST_CLIENT_INITIAL,
 	QUIC_HS_ST_CLIENT_HANDSHAKE,
+	QUIC_HS_ST_CLIENT_HANDSHAKE_FAILED,
 
 	QUIC_HS_ST_SERVER_INITIAL,
 	QUIC_HS_ST_SERVER_HANDSHAKE,
+	QUIC_HS_ST_SERVER_HANDSHAKE_FAILED,
 
 	/* Common to servers and clients */
 	QUIC_HS_ST_COMPLETE,
@@ -71,8 +69,8 @@ enum quic_tls_enc_level {
 /* QUIC packet number spaces */
 enum quic_tls_pktns {
 	QUIC_TLS_PKTNS_INITIAL,
-	QUIC_TLS_PKTNS_HANDSHAKE,
 	QUIC_TLS_PKTNS_01RTT,
+	QUIC_TLS_PKTNS_HANDSHAKE,
 	/* Please do not insert any value after this following one */
 	QUIC_TLS_PKTNS_MAX,
 };

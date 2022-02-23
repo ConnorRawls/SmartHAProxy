@@ -22,7 +22,7 @@
 #ifndef _HAPROXY_RESOLVERS_T_H
 #define _HAPROXY_RESOLVERS_T_H
 
-#include <import/ebtree-t.h>
+#include <import/eb32tree.h>
 
 #include <haproxy/connection-t.h>
 #include <haproxy/dns-t.h>
@@ -110,22 +110,19 @@ struct resolv_answer_item {
 	int16_t         priority;                    /* SRV type priority */
 	uint16_t        weight;                      /* SRV type weight */
 	uint16_t        port;                        /* SRV type port */
-	uint16_t        data_len;                    /* number of bytes in the <data> field below */
-	struct eb32_node link;                       /* linking node */
-	union {
-		struct sockaddr_in in4;              /* IPv4 address for RTYPE_A */
-		struct sockaddr_in6 in6;             /* IPv6 address for RTYPE_AAAA */
-		char target[DNS_MAX_NAME_SIZE+1];    /* Response data: SRV or CNAME type target */
-	} data;
+	uint16_t        data_len;                    /* number of bytes in target below */
+	struct sockaddr address;                     /* IPv4 or IPv6, network format */
+	char            target[DNS_MAX_NAME_SIZE+1]; /* Response data: SRV or CNAME type target */
 	unsigned int    last_seen;                   /* When was the answer was last seen */
 	struct resolv_answer_item *ar_item;          /* pointer to a RRset from the additional section, if exists */
 	struct list	attached_servers;            /* attached server head */
+	struct list     list;
 };
 
 struct resolv_response {
 	struct dns_header header;
 	struct list       query_list;
-	struct eb_root    answer_tree;
+	struct list       answer_list;
 	/* authority ignored for now */
 };
 

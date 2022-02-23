@@ -23,7 +23,9 @@
 #define _HAPROXY_SSL_SOCK_T_H
 #ifdef USE_OPENSSL
 
-#include <import/ebtree-t.h>
+#include <import/eb64tree.h>
+#include <import/ebmbtree.h>
+#include <import/ebpttree.h>
 
 #include <haproxy/buf-t.h>
 #include <haproxy/connection-t.h> /* struct wait_event */
@@ -241,7 +243,7 @@ struct ssl_sock_ctx {
 	struct wait_event wait_event;
 	struct wait_event *subs;
 	int xprt_st;                  /* transport layer state, initialized to zero */
-	unsigned long error_code;     /* last error code of the error stack */
+	unsigned long hsk_error_code; /* last handshake error code of the error stack */
 	struct buffer early_buf;      /* buffer to store the early data received */
 	int sent_early_data;          /* Amount of early data we sent so far */
 

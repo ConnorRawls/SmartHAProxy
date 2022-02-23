@@ -44,7 +44,6 @@
 #include <haproxy/list.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
-#include <haproxy/mworker.h>
 #include <haproxy/mworker-t.h>
 #include <haproxy/pattern-t.h>
 #include <haproxy/peers.h>
@@ -441,7 +440,6 @@ static int cli_parse_global(char **args, int section_type, struct proxy *curpx,
 		while (*args[cur_arg]) {
 			struct bind_kw *kw;
 			const char *best;
-			int code;
 
 			kw = bind_find_kw(args[cur_arg]);
 			if (kw) {
@@ -451,19 +449,7 @@ static int cli_parse_global(char **args, int section_type, struct proxy *curpx,
 					return -1;
 				}
 
-				code = kw->parse(args, cur_arg, global.cli_fe, bind_conf, err);
-
-				/* FIXME: this is ugly, we don't have a way to collect warnings,
-				 * yet some important bind keywords may report warnings that we
-				 * must display.
-				 */
-				if (((code & (ERR_WARN|ERR_FATAL|ERR_ALERT)) == ERR_WARN) && err && *err) {
-					indent_msg(err, 2);
-					ha_warning("parsing [%s:%d] : '%s %s' : %s\n", file, line, args[0], args[1], *err);
-					ha_free(err);
-				}
-
-				if (code & ~ERR_WARN) {
+				if (kw->parse(args, cur_arg, global.cli_fe, bind_conf, err) != 0) {
 					if (err && *err)
 						memprintf(err, "'%s %s' : '%s'", args[0], args[1], *err);
 					else
@@ -692,6 +678,22 @@ static int cli_parse_request(struct appctx *appctx)
 	end = p + appctx->chunk->data;
 
 	/*
+	 * Get the payload start if there is one.
+	 * For the sake of simplicity, the payload pattern is looked up
+	 * everywhere from the start of the input but it can only be found
+	 * at the end of the first line if APPCTX_CLI_ST1_PAYLOAD is set.
+	 *
+	 * The input string was zero terminated so it is safe to use
+	 * the str*() functions throughout the parsing
+	 */
+	if (appctx->st1 & APPCTX_CLI_ST1_PAYLOAD) {
+		payload = strstr(p, PAYLOAD_PATTERN);
+		end = payload;
+		/* skip the pattern */
+		payload += strlen(PAYLOAD_PATTERN);
+	}
+
+	/*
 	 * Get pointers on words.
 	 * One extra slot is reserved to store a pointer on a null byte.
 	 */
@@ -702,15 +704,6 @@ static int cli_parse_request(struct appctx *appctx)
 		p += strspn(p, " \t");
 		if (!*p)
 			break;
-
-		if (strcmp(p, PAYLOAD_PATTERN) == 0) {
-			/* payload pattern recognized here, this is not an arg anymore,
-			 * the payload starts at the first byte that follows the zero
-			 * after the pattern.
-			 */
-			payload = p + strlen(PAYLOAD_PATTERN) + 1;
-			break;
-		}
 
 		args[i] = p;
 		while (1) {
@@ -962,10 +955,8 @@ static void cli_io_handler(struct appctx *appctx)
 				 * Its location is not remembered here, this is just to switch
 				 * to a gathering mode.
 				 */
-				if (strcmp(appctx->chunk->area + appctx->chunk->data - strlen(PAYLOAD_PATTERN), PAYLOAD_PATTERN) == 0) {
+				if (strcmp(appctx->chunk->area + appctx->chunk->data - strlen(PAYLOAD_PATTERN), PAYLOAD_PATTERN) == 0)
 					appctx->st1 |= APPCTX_CLI_ST1_PAYLOAD;
-					appctx->chunk->data++; // keep the trailing \0 after '<<'
-				}
 				else {
 					/* no payload, the command is complete: parse the request */
 					cli_parse_request(appctx);
@@ -1381,10 +1372,8 @@ static int cli_io_handler_show_activity(struct appctx *appctx)
 		unsigned int _v[MAX_THREADS];				\
 		unsigned int _tot;					\
 		const unsigned int _nbt = global.nbthread;		\
-		_tot = t = 0;						\
-		do {							\
+		for (_tot = t = 0; t < _nbt; t++)			\
 			_tot += _v[t] = (x);				\
-		} while (++t < _nbt);					\
 		if (_nbt == 1) {					\
 			chunk_appendf(&trash, " %u\n", _tot);		\
 			break;						\
@@ -1401,10 +1390,8 @@ static int cli_io_handler_show_activity(struct appctx *appctx)
 		unsigned int _v[MAX_THREADS];				\
 		unsigned int _tot;					\
 		const unsigned int _nbt = global.nbthread;		\
-		_tot = t = 0;						\
-		do {							\
+		for (_tot = t = 0; t < _nbt; t++)			\
 			_tot += _v[t] = (x);				\
-		} while (++t < _nbt);					\
 		if (_nbt == 1) {					\
 			chunk_appendf(&trash, " %u\n", _tot);		\
 			break;						\
@@ -1732,11 +1719,11 @@ static int cli_parse_expert_experimental_mode(char **args, char *payload, struct
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
 
-	if (strcmp(args[0], "expert-mode") == 0) {
+	if (!strcmp(args[0], "expert-mode")) {
 		level = ACCESS_EXPERT;
 		level_str = "expert-mode";
 	}
-	else if (strcmp(args[0], "experimental-mode") == 0) {
+	else if (!strcmp(args[0], "experimental-mode")) {
 		level = ACCESS_EXPERIMENTAL;
 		level_str = "experimental-mode";
 	}
@@ -2085,7 +2072,7 @@ void pcli_write_prompt(struct stream *s)
 	} else {
 		if (s->pcli_next_pid == 0)
 			chunk_appendf(msg, "master%s> ",
-			              (proc_self->failedreloads > 0) ? "[ReloadFailed]" : "");
+			              (global.mode & MODE_MWORKER_WAIT) ? "[ReloadFailed]" : "");
 		else
 			chunk_appendf(msg, "%d> ", s->pcli_next_pid);
 	}
@@ -2590,7 +2577,7 @@ int pcli_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 			s->srv_conn = NULL;
 		}
 
-		sockaddr_free(&s->si[1].dst);
+		sockaddr_free(&s->target_addr);
 
 		s->si[1].state     = s->si[1].prev_state = SI_ST_INI;
 		s->si[1].err_type  = SI_ET_NONE;

@@ -28,9 +28,6 @@
 #include <haproxy/list.h>
 #include <haproxy/sample.h>
 
-struct resolv_requester;
-struct dns_counters;
-
 int act_resolution_cb(struct resolv_requester *requester, struct dns_counters *counters);
 int act_resolution_error_cb(struct resolv_requester *requester, int error_code);
 const char *action_suggest(const char *word, const struct list *keywords, const char **extra);
@@ -111,7 +108,6 @@ static inline void release_timeout_action(struct act_rule *rule)
 	release_sample_expr(rule->arg.timeout.expr);
 }
 
-struct act_rule *new_act_rule(enum act_from from, const char *file, int linenum);
 void free_act_rules(struct list *rules);
 
 #endif /* _HAPROXY_ACTION_H */

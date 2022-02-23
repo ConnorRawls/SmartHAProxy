@@ -27,7 +27,6 @@
 
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
-#include <haproxy/cbuf.h>
 #include <haproxy/connection.h>
 #include <haproxy/errors.h>
 #include <haproxy/fd.h>
@@ -45,7 +44,6 @@
 #include <haproxy/quic_sock.h>
 #include <haproxy/sock_inet.h>
 #include <haproxy/tools.h>
-#include <haproxy/xprt_quic-t.h>
 
 
 static void quic_add_listener(struct protocol *proto, struct listener *listener);
@@ -78,7 +76,6 @@ struct protocol proto_quic4 = {
 	.fam            = &proto_fam_inet4,
 
 	/* socket layer */
-	.proto_type     = PROTO_TYPE_DGRAM,
 	.sock_type      = SOCK_DGRAM,
 	.sock_prot      = IPPROTO_UDP,
 	.rx_enable      = sock_enable,
@@ -116,7 +113,6 @@ struct protocol proto_quic6 = {
 	.fam            = &proto_fam_inet6,
 
 	/* socket layer */
-	.proto_type     = PROTO_TYPE_DGRAM,
 	.sock_type      = SOCK_DGRAM,
 	.sock_prot      = IPPROTO_UDP,
 	.rx_enable      = sock_enable,
@@ -518,86 +514,10 @@ int quic_connect_server(struct connection *conn, int flags)
  */
 static void quic_add_listener(struct protocol *proto, struct listener *listener)
 {
-	MT_LIST_INIT(&listener->rx.pkts);
+	LIST_INIT(&listener->rx.qpkts);
 	listener->rx.odcids = EB_ROOT_UNIQUE;
 	listener->rx.cids = EB_ROOT_UNIQUE;
-	HA_RWLOCK_INIT(&listener->rx.cids_lock);
 	default_add_listener(proto, listener);
-}
-
-/* Allocate the TX ring buffers for <l> listener.
- * Return 1 if succeeded, 0 if not.
- */
-static int quic_alloc_tx_rings_listener(struct listener *l)
-{
-	struct qring *qr;
-	int i;
-
-	l->rx.tx_qrings = calloc(global.nbthread, sizeof *l->rx.tx_qrings);
-	if (!l->rx.tx_qrings)
-		return 0;
-
-	MT_LIST_INIT(&l->rx.tx_qring_list);
-	for (i = 0; i < global.nbthread; i++) {
-		unsigned char *buf;
-		struct qring *qr = &l->rx.tx_qrings[i];
-
-		buf = pool_alloc(pool_head_quic_tx_ring);
-		if (!buf)
-			goto err;
-
-		qr->cbuf = cbuf_new(buf, QUIC_TX_RING_BUFSZ);
-		if (!qr->cbuf) {
-			pool_free(pool_head_quic_tx_ring, buf);
-			goto err;
-		}
-
-		MT_LIST_APPEND(&l->rx.tx_qring_list, &qr->mt_list);
-	}
-
-	return 1;
-
- err:
-	while ((qr = MT_LIST_POP(&l->rx.tx_qring_list, typeof(qr), mt_list))) {
-		pool_free(pool_head_quic_tx_ring, qr->cbuf->buf);
-		cbuf_free(qr->cbuf);
-	}
-	free(l->rx.tx_qrings);
-	return 0;
-}
-
-/* Allocate the RX buffers for <l> listener.
- * Return 1 if succeeded, 0 if not.
- */
-static int quic_alloc_rxbufs_listener(struct listener *l)
-{
-	int i;
-	struct rxbuf *rxbuf;
-
-	l->rx.rxbufs = calloc(global.nbthread, sizeof *l->rx.rxbufs);
-	if (!l->rx.rxbufs)
-		return 0;
-
-	MT_LIST_INIT(&l->rx.rxbuf_list);
-	for (i = 0; i < global.nbthread; i++) {
-		char *buf;
-
-		rxbuf = &l->rx.rxbufs[i];
-		buf = pool_alloc(pool_head_quic_rxbuf);
-		if (!buf)
-			goto err;
-
-		rxbuf->buf = b_make(buf, QUIC_RX_BUFSZ, 0, 0);
-		MT_LIST_APPEND(&l->rx.rxbuf_list, &rxbuf->mt_list);
-	}
-
-	return 1;
-
- err:
-	while ((rxbuf = MT_LIST_POP(&l->rx.rxbuf_list, typeof(rxbuf), mt_list)))
-		pool_free(pool_head_quic_rxbuf, rxbuf->buf.area);
-	free(l->rx.rxbufs);
-	return 0;
 }
 
 /* This function tries to bind a QUIC4/6 listener. It may return a warning or
@@ -630,13 +550,6 @@ static int quic_bind_listener(struct listener *listener, char *errmsg, int errle
 		goto udp_return;
 	}
 
-	if (!quic_alloc_tx_rings_listener(listener) ||
-	    !quic_alloc_rxbufs_listener(listener)) {
-		msg = "could not initialize tx/rx rings";
-		err |= ERR_WARN;
-		goto udp_return;
-	}
-
 	listener_set_state(listener, LI_LISTEN);
 
  udp_return:
@@ -644,7 +557,7 @@ static int quic_bind_listener(struct listener *listener, char *errmsg, int errle
 		char pn[INET6_ADDRSTRLEN];
 
 		addr_to_str(&listener->rx.addr, pn, sizeof(pn));
-		snprintf(errmsg, errlen, "%s for [%s:%d]", msg, pn, get_host_port(&listener->rx.addr));
+		snprintf(errmsg, errlen, "%s [%s:%d]", msg, pn, get_host_port(&listener->rx.addr));
 	}
 	return err;
 }

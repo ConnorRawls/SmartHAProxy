@@ -39,7 +39,8 @@ int check_action_rules(struct list *rules, struct proxy *px, int *err_code)
 			err++;
 		}
 		*err_code |= warnif_tcp_http_cond(px, rule->cond);
-		ha_free(&errmsg);
+		free(errmsg);
+		errmsg = NULL;
 	}
 
 	return err;
@@ -284,23 +285,6 @@ const char *action_suggest(const char *word, const struct list *keywords, const 
 	return best_ptr;
 }
 
-/* allocates a rule for ruleset <from> (ACT_F_*), from file name <file> and
- * line <linenum>. <file> and <linenum> may be zero if unknown. Returns the
- * rule, otherwise NULL in case of memory allocation error.
- */
-struct act_rule *new_act_rule(enum act_from from, const char *file, int linenum)
-{
-	struct act_rule *rule;
-
-	rule = calloc(1, sizeof(*rule));
-	if (!rule)
-		return NULL;
-	rule->from = from;
-	rule->conf.file = file ? strdup(file) : NULL;
-	rule->conf.line = linenum;
-	return rule;
-}
-
 void free_act_rules(struct list *rules)
 {
 	struct act_rule *rule, *ruleb;
@@ -310,7 +294,6 @@ void free_act_rules(struct list *rules)
 		free_acl_cond(rule->cond);
 		if (rule->release_ptr)
 			rule->release_ptr(rule);
-		free(rule->conf.file);
 		free(rule);
 	}
 }

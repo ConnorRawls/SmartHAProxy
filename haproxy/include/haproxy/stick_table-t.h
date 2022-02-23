@@ -23,7 +23,12 @@
 #ifndef _HAPROXY_STICK_TABLE_T_H
 #define _HAPROXY_STICK_TABLE_T_H
 
-#include <import/ebtree-t.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+#include <import/eb32tree.h>
+#include <import/ebmbtree.h>
+#include <import/ebpttree.h>
 
 #include <haproxy/api-t.h>
 #include <haproxy/freq_ctr-t.h>
@@ -125,8 +130,7 @@ struct stktable_data_type {
 	const char *name; /* name of the data type */
 	int std_type;     /* standard type we can use for this data, STD_T_* */
 	int arg_type;     /* type of optional argument, ARG_T_* */
-	uint is_array:1;  /* this is an array of gpc/gpt */
-	uint is_local:1;  /* this is local only and never learned */
+	int is_array;
 };
 
 /* stick table keyword type */

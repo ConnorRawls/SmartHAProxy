@@ -32,14 +32,12 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/channel.h>
 #include <haproxy/cli.h>
-#include <haproxy/clock.h>
 #include <haproxy/connection.h>
 #include <haproxy/filters.h>
 #include <haproxy/h1.h>
 #include <haproxy/hlua.h>
 #include <haproxy/hlua_fcn.h>
 #include <haproxy/http_ana.h>
-#include <haproxy/http_client.h>
 #include <haproxy/http_fetch.h>
 #include <haproxy/http_htx.h>
 #include <haproxy/http_rules.h>
@@ -275,7 +273,6 @@ static int class_fetches_ref;
 static int class_converters_ref;
 static int class_http_ref;
 static int class_http_msg_ref;
-static int class_httpclient_ref;
 static int class_map_ref;
 static int class_applet_tcp_ref;
 static int class_applet_http_ref;
@@ -1326,7 +1323,7 @@ void hlua_hook(lua_State *L, lua_Debug *ar)
 		MAY_LJMP(hlua_yieldk(L, 0, 0, NULL, TICK_ETERNITY, HLUA_CTRLYIELD));
 
 	/* If we cannot yield, update the clock and check the timeout. */
-	clock_update_date(0, 1);
+	tv_update_date(0, 1);
 	hlua->run_time += now_ms - hlua->start_time;
 	if (hlua->max_time && hlua->run_time >= hlua->max_time) {
 		lua_pushfstring(L, "execution timeout");
@@ -1412,7 +1409,7 @@ resume_execution:
 		/* Check if the execution timeout is expired. It it is the case, we
 		 * break the Lua execution.
 		 */
-		clock_update_date(0, 1);
+		tv_update_date(0, 1);
 		lua->run_time += now_ms - lua->start_time;
 		if (lua->max_time && lua->run_time > lua->max_time) {
 			lua_settop(lua->T, 0); /* Empty the stack. */
@@ -2500,7 +2497,7 @@ static int hlua_socket_send(struct lua_State *L)
 }
 
 #define SOCKET_INFO_MAX_LEN sizeof("[0000:0000:0000:0000:0000:0000:0000:0000]:12345")
-__LJMP static inline int hlua_socket_info(struct lua_State *L, const struct sockaddr_storage *addr)
+__LJMP static inline int hlua_socket_info(struct lua_State *L, struct sockaddr_storage *addr)
 {
 	static char buffer[SOCKET_INFO_MAX_LEN];
 	int ret;
@@ -2553,7 +2550,7 @@ __LJMP static int hlua_socket_getpeername(struct lua_State *L)
 	struct xref *peer;
 	struct appctx *appctx;
 	struct stream_interface *si;
-	const struct sockaddr_storage *dst;
+	struct stream *s;
 	int ret;
 
 	MAY_LJMP(check_args(L, 1, "getpeername"));
@@ -2574,14 +2571,15 @@ __LJMP static int hlua_socket_getpeername(struct lua_State *L)
 	}
 	appctx = container_of(peer, struct appctx, ctx.hlua_cosocket.xref);
 	si = appctx->owner;
-	dst = si_dst(si_opposite(si));
-	if (!dst) {
+	s = si_strm(si);
+
+	if (!s->target_addr) {
 		xref_unlock(&socket->xref, peer);
 		lua_pushnil(L);
 		return 1;
 	}
 
-	ret = MAY_LJMP(hlua_socket_info(L, dst));
+	ret = MAY_LJMP(hlua_socket_info(L, s->target_addr));
 	xref_unlock(&socket->xref, peer);
 	return ret;
 }
@@ -2780,7 +2778,7 @@ __LJMP static int hlua_socket_connect(struct lua_State *L)
 	si = appctx->owner;
 	s = si_strm(si);
 
-	if (!sockaddr_alloc(&si_opposite(si)->dst, addr, sizeof(*addr))) {
+	if (!sockaddr_alloc(&s->target_addr, addr, sizeof(*addr))) {
 		xref_unlock(&socket->xref, peer);
 		WILL_LJMP(luaL_error(L, "connect: internal error"));
 	}
@@ -2942,7 +2940,7 @@ __LJMP static int hlua_socket_new(lua_State *L)
 	lua_setmetatable(L, -2);
 
 	/* Create the applet context */
-	appctx = appctx_new(&update_applet);
+	appctx = appctx_new(&update_applet, tid_bit);
 	if (!appctx) {
 		hlua_pusherror(L, "socket: out of memory");
 		goto out_fail_conf;
@@ -4750,7 +4748,7 @@ static int hlua_applet_http_new(lua_State *L, struct appctx *ctx)
 		char *p, *q, *end;
 
 		p = path.ptr;
-		end = istend(path);
+		end = path.ptr + path.len;
 		q = p;
 		while (q < end && *q != '?')
 			q++;
@@ -5355,19 +5353,8 @@ __LJMP static int hlua_applet_http_send_response(lua_State *L)
 			value = lua_tolstring(L, -1, &vlen);
 
 			/* Simple Protocol checks. */
-			if (isteqi(ist2(name, nlen), ist("transfer-encoding"))) {
-				int ret;
-
-				ret = h1_parse_xfer_enc_header(&h1m, ist2(value, vlen));
-				if (ret < 0) {
-					hlua_pusherror(L, "Lua applet http '%s': Invalid '%s' header.\n",
-						       luactx->appctx->rule->arg.hlua_rule->fcn->name,
-						       name);
-					WILL_LJMP(lua_error(L));
-				}
-				else if (ret == 0)
-					goto next; /* Skip it */
-			}
+			if (isteqi(ist2(name, nlen), ist("transfer-encoding")))
+				h1_parse_xfer_enc_header(&h1m, ist2(value, vlen));
 			else if (isteqi(ist2(name, nlen), ist("content-length"))) {
 				struct ist v = ist2(value, vlen);
 				int ret;
@@ -6076,7 +6063,7 @@ __LJMP static int hlua_http_msg_rep_hdr(lua_State *L)
 	return hlua_http_rep_hdr(L, msg, 1);
 }
 
-/* Matches all comma-separated values of all occurrences of an header in the HTTP
+/* Matches all comma-separated values of all occurences of an header in the HTTP
  * message given its name against a regex and replaces it if it matches. It
  * relies on hlua_http_rep_hdr().
  */
@@ -6328,32 +6315,30 @@ static int _hlua_http_msg_dup(struct http_msg *msg, lua_State *L, size_t offset,
 
 			case HTX_BLK_DATA:
 				v = htx_get_blk_value(htx, blk);
-				v = istadv(v, offset);
-				v = isttrim(v, len);
+				v.ptr += offset;
+				v.len -= offset;
+				if (v.len > len)
+					v.len = len;
 
 				luaL_addlstring(&b, v.ptr, v.len);
 				ret += v.len;
 				break;
 
 			default:
-				if (!ret)
-					goto no_data;
+				if (!ret) {
+					/* Remove the empty string and push nil on the stack */
+					lua_pop(L, 1);
+					lua_pushnil(L);
+				}
 				goto end;
 		}
 		offset = 0;
 	}
 
-end:
-	if (!ret && (htx->flags & HTX_FL_EOM))
-		goto no_data;
 	luaL_pushresult(&b);
-	return ret;
 
-  no_data:
-	/* Remove the empty string and push nil on the stack */
-	lua_pop(L, 1);
-	lua_pushnil(L);
-	return 0;
+end:
+	return ret;
 }
 
 /* Copies the string <str> to the HTTP message <msg> at the offset
@@ -6430,8 +6415,9 @@ static void _hlua_http_msg_delete(struct http_msg *msg, struct filter *filter, s
 			goto end;
 		v = htx_get_blk_value(htx, blk);
 		v.ptr += htxret.ret;
-		v = isttrim(v, len);
-		blk = htx_replace_blk_value(htx, blk, v, IST_NULL);
+		if (v.len > len)
+			v.len  = len;
+		blk = htx_replace_blk_value(htx, blk, v, ist2(NULL, 0));
 		len -= v.len;
 		ret += v.len;
 	}
@@ -6894,456 +6880,6 @@ __LJMP static int hlua_http_msg_unset_eom(lua_State *L)
 	htx = htxbuf(&msg->chn->buf);
 	htx->flags &= ~HTX_FL_EOM;
 	return 0;
-}
-
-/*
- *
- *
- * Class HTTPClient
- *
- *
- */
-__LJMP static struct hlua_httpclient *hlua_checkhttpclient(lua_State *L, int ud)
-{
-	return MAY_LJMP(hlua_checkudata(L, ud, class_httpclient_ref));
-}
-
-
-/* stops the httpclient and ask it to kill itself */
-__LJMP static int hlua_httpclient_gc(lua_State *L)
-{
-	struct hlua_httpclient *hlua_hc;
-
-	MAY_LJMP(check_args(L, 1, "__gc"));
-
-	hlua_hc = MAY_LJMP(hlua_checkhttpclient(L, 1));
-
-	httpclient_stop_and_destroy(hlua_hc->hc);
-
-	hlua_hc->hc = NULL;
-
-
-	return 0;
-}
-
-
-__LJMP static int hlua_httpclient_new(lua_State *L)
-{
-	struct hlua_httpclient *hlua_hc;
-	struct hlua *hlua;
-
-	/* Get hlua struct, or NULL if we execute from main lua state */
-	hlua = hlua_gethlua(L);
-	if (!hlua)
-		return 0;
-
-	/* Check stack size. */
-	if (!lua_checkstack(L, 3)) {
-		hlua_pusherror(L, "httpclient: full stack");
-		goto err;
-	}
-	/* Create the object: obj[0] = userdata. */
-	lua_newtable(L);
-	hlua_hc = MAY_LJMP(lua_newuserdata(L, sizeof(*hlua_hc)));
-	lua_rawseti(L, -2, 0);
-	memset(hlua_hc, 0, sizeof(*hlua_hc));
-
-	hlua_hc->hc = httpclient_new(hlua, 0, IST_NULL);
-	if (!hlua_hc->hc)
-		goto err;
-
-	/* Pop a class stream metatable and affect it to the userdata. */
-	lua_rawgeti(L, LUA_REGISTRYINDEX, class_httpclient_ref);
-	lua_setmetatable(L, -2);
-
-	return 1;
-
- err:
-	WILL_LJMP(lua_error(L));
-	return 0;
-}
-
-
-/*
- * Callback of the httpclient, this callback wakes the lua task up, once the
- * httpclient receives some data
- *
- */
-
-static void hlua_httpclient_cb(struct httpclient *hc)
-{
-	struct hlua *hlua = hc->caller;
-
-	if (!hlua || !hlua->task)
-		return;
-
-	task_wakeup(hlua->task, TASK_WOKEN_MSG);
-}
-
-/*
- * Fill the lua stack with headers from the httpclient response
- * This works the same way as the hlua_http_get_headers() function
- */
-__LJMP static int hlua_httpclient_get_headers(lua_State *L, struct hlua_httpclient *hlua_hc)
-{
-	struct http_hdr *hdr;
-
-	lua_newtable(L);
-
-	for (hdr = hlua_hc->hc->res.hdrs; hdr && isttest(hdr->n); hdr++) {
-		struct ist n, v;
-		int len;
-
-		n = hdr->n;
-		v = hdr->v;
-
-		/* Check for existing entry:
-		 * assume that the table is on the top of the stack, and
-		 * push the key in the stack, the function lua_gettable()
-		 * perform the lookup.
-		 */
-
-		lua_pushlstring(L, n.ptr, n.len);
-		lua_gettable(L, -2);
-
-		switch (lua_type(L, -1)) {
-			case LUA_TNIL:
-				/* Table not found, create it. */
-				lua_pop(L, 1); /* remove the nil value. */
-				lua_pushlstring(L, n.ptr, n.len);  /* push the header name as key. */
-				lua_newtable(L); /* create and push empty table. */
-				lua_pushlstring(L, v.ptr, v.len); /* push header value. */
-				lua_rawseti(L, -2, 0); /* index header value (pop it). */
-				lua_rawset(L, -3); /* index new table with header name (pop the values). */
-				break;
-
-			case LUA_TTABLE:
-				/* Entry found: push the value in the table. */
-				len = lua_rawlen(L, -1);
-				lua_pushlstring(L, v.ptr, v.len); /* push header value. */
-				lua_rawseti(L, -2, len+1); /* index header value (pop it). */
-				lua_pop(L, 1); /* remove the table (it is stored in the main table). */
-				break;
-
-			default:
-				/* Other cases are errors. */
-				hlua_pusherror(L, "internal error during the parsing of headers.");
-				WILL_LJMP(lua_error(L));
-		}
-	}
-	return 1;
-}
-
-/*
- * Allocate and return an array of http_hdr ist extracted from the <headers> lua table
- *
- * Caller must free the result
- */
-struct http_hdr *hlua_httpclient_table_to_hdrs(lua_State *L)
-{
-	struct http_hdr hdrs[global.tune.max_http_hdr];
-	struct http_hdr *result = NULL;
-	uint32_t hdr_num = 0;
-
-	lua_pushnil(L);
-	while (lua_next(L, -2) != 0) {
-		struct ist name, value;
-		const char *n, *v;
-		size_t nlen, vlen;
-
-		if (!lua_isstring(L, -2) || !lua_istable(L, -1)) {
-			/* Skip element if the key is not a string or if the value is not a table */
-			goto next_hdr;
-		}
-
-		n = lua_tolstring(L, -2, &nlen);
-		name = ist2(n, nlen);
-
-		/* Loop on header's values */
-		lua_pushnil(L);
-		while (lua_next(L, -2)) {
-			if (!lua_isstring(L, -1)) {
-				/* Skip the value if it is not a string */
-				goto next_value;
-			}
-
-			v = lua_tolstring(L, -1, &vlen);
-			value = ist2(v, vlen);
-			name = ist2(n, nlen);
-
-			hdrs[hdr_num].n = istdup(name);
-			hdrs[hdr_num].v = istdup(value);
-
-			hdr_num++;
-
-		  next_value:
-			lua_pop(L, 1);
-		}
-
-	  next_hdr:
-		lua_pop(L, 1);
-
-	}
-
-	if (hdr_num) {
-		/* alloc and copy the headers in the httpclient struct */
-		result = calloc((hdr_num + 1), sizeof(*result));
-		if (!result)
-			goto skip_headers;
-		memcpy(result, hdrs, sizeof(struct http_hdr) * (hdr_num + 1));
-
-		result[hdr_num].n = IST_NULL;
-		result[hdr_num].v = IST_NULL;
-	}
-
-skip_headers:
-	lua_pop(L, 1);
-
-	return result;
-}
-
-
-/*
- * For each yield, checks if there is some data in the httpclient and push them
- * in the lua buffer, once the httpclient finished its job, push the result on
- * the stack
- */
-__LJMP static int hlua_httpclient_rcv_yield(lua_State *L, int status, lua_KContext ctx)
-{
-	struct buffer *tr;
-	int res;
-	struct hlua *hlua = hlua_gethlua(L);
-	struct hlua_httpclient *hlua_hc = hlua_checkhttpclient(L, 1);
-
-
-	tr = get_trash_chunk();
-
-	res = httpclient_res_xfer(hlua_hc->hc, tr);
-	luaL_addlstring(&hlua_hc->b, b_orig(tr), res);
-
-	if (!httpclient_data(hlua_hc->hc) && httpclient_ended(hlua_hc->hc)) {
-
-		luaL_pushresult(&hlua_hc->b);
-		lua_settable(L, -3);
-
-		lua_pushstring(L, "status");
-		lua_pushinteger(L, hlua_hc->hc->res.status);
-		lua_settable(L, -3);
-
-
-		lua_pushstring(L, "reason");
-		lua_pushlstring(L, hlua_hc->hc->res.reason.ptr, hlua_hc->hc->res.reason.len);
-		lua_settable(L, -3);
-
-		lua_pushstring(L, "headers");
-		hlua_httpclient_get_headers(L, hlua_hc);
-		lua_settable(L, -3);
-
-		return 1;
-	}
-
-	if (httpclient_data(hlua_hc->hc))
-		task_wakeup(hlua->task, TASK_WOKEN_MSG);
-
-	MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_httpclient_rcv_yield, TICK_ETERNITY, 0));
-
-	return 0;
-}
-
-/*
- * Call this when trying to stream a body during a request
- */
-__LJMP static int hlua_httpclient_snd_yield(lua_State *L, int status, lua_KContext ctx)
-{
-	struct hlua *hlua;
-	struct hlua_httpclient *hlua_hc = hlua_checkhttpclient(L, 1);
-	const char *body_str = NULL;
-	int ret;
-	int end = 0;
-	size_t buf_len;
-	size_t to_send = 0;
-
-	hlua = hlua_gethlua(L);
-
-	if (!hlua || !hlua->task)
-		WILL_LJMP(luaL_error(L, "The 'get' function is only allowed in "
-		                     "'frontend', 'backend' or 'task'"));
-
-	ret = lua_getfield(L, -1, "body");
-	if (ret != LUA_TSTRING)
-		goto rcv;
-
-	body_str = lua_tolstring(L, -1, &buf_len);
-	lua_pop(L, 1);
-
-	to_send = MIN(buf_len - hlua_hc->sent, 1024);
-
-	if ((hlua_hc->sent + to_send) >= buf_len)
-		end = 1;
-
-	/* the end flag is always set since we are using the whole remaining size */
-	hlua_hc->sent += httpclient_req_xfer(hlua_hc->hc, ist2(body_str + hlua_hc->sent, to_send), end);
-
-	if (buf_len > hlua_hc->sent) {
-		/* still need to process the buffer */
-		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_httpclient_snd_yield, TICK_ETERNITY, 0));
-	} else {
-		goto rcv;
-		/* we sent the whole request buffer we can recv */
-	}
-	return 0;
-
-rcv:
-
-	/* we return a "res" object */
-	lua_newtable(L);
-
-	lua_pushstring(L, "body");
-	luaL_buffinit(L, &hlua_hc->b);
-
-	task_wakeup(hlua->task, TASK_WOKEN_MSG);
-	MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_httpclient_rcv_yield, TICK_ETERNITY, 0));
-
-	return 1;
-}
-
-/*
- * Send an HTTP request and wait for a response
- */
-
-__LJMP static int hlua_httpclient_send(lua_State *L, enum http_meth_t meth)
-{
-	struct hlua_httpclient *hlua_hc;
-	struct http_hdr *hdrs = NULL;
-	struct http_hdr *hdrs_i = NULL;
-	struct hlua *hlua;
-	const char *url_str = NULL;
-	const char *body_str = NULL;
-	size_t buf_len;
-	int ret;
-
-	hlua = hlua_gethlua(L);
-
-	if (!hlua || !hlua->task)
-		WILL_LJMP(luaL_error(L, "The 'get' function is only allowed in "
-		                     "'frontend', 'backend' or 'task'"));
-
-	if (lua_gettop(L) != 2 || lua_type(L, -1) != LUA_TTABLE)
-		WILL_LJMP(luaL_error(L, "'get' needs a table as argument"));
-
-	ret = lua_getfield(L, -1, "url");
-	if (ret == LUA_TSTRING) {
-		url_str = lua_tostring(L, -1);
-	}
-	lua_pop(L, 1);
-
-	ret = lua_getfield(L, -1, "headers");
-	if (ret == LUA_TTABLE) {
-		hdrs = hlua_httpclient_table_to_hdrs(L);
-	}
-	lua_pop(L, 1);
-
-	ret = lua_getfield(L, -1, "body");
-	if (ret == LUA_TSTRING) {
-		body_str = lua_tolstring(L, -1, &buf_len);
-	}
-
-	lua_pop(L, 1);
-
-	if (!url_str) {
-		WILL_LJMP(luaL_error(L, "'get' need a 'url' argument"));
-		return 0;
-	}
-
-	hlua_hc = hlua_checkhttpclient(L, 1);
-
-	hlua_hc->hc->req.url = istdup(ist(url_str));
-	hlua_hc->hc->req.meth = meth;
-
-	/* update the httpclient callbacks */
-	hlua_hc->hc->ops.res_stline = hlua_httpclient_cb;
-	hlua_hc->hc->ops.res_headers = hlua_httpclient_cb;
-	hlua_hc->hc->ops.res_payload = hlua_httpclient_cb;
-
-	/* a body is available, it will use the request callback */
-	if (body_str) {
-		hlua_hc->hc->ops.req_payload = hlua_httpclient_cb;
-	}
-
-	ret = httpclient_req_gen(hlua_hc->hc, hlua_hc->hc->req.url, meth, hdrs, IST_NULL);
-
-	/* free the temporary headers array */
-	hdrs_i = hdrs;
-	while (hdrs_i && isttest(hdrs_i->n)) {
-		istfree(&hdrs_i->n);
-		istfree(&hdrs_i->v);
-		hdrs_i++;
-	}
-	ha_free(&hdrs);
-
-
-	if (ret != ERR_NONE) {
-		WILL_LJMP(luaL_error(L, "Can't generate the HTTP request"));
-		return 0;
-	}
-
-	httpclient_start(hlua_hc->hc);
-
-	MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_httpclient_snd_yield, TICK_ETERNITY, 0));
-
-	return 0;
-}
-
-/*
- * Sends an HTTP HEAD request and wait for a response
- *
- * httpclient:head(url, headers, payload)
- */
-__LJMP static int hlua_httpclient_head(lua_State *L)
-{
-	return hlua_httpclient_send(L, HTTP_METH_HEAD);
-}
-
-/*
- * Send an HTTP GET request and wait for a response
- *
- * httpclient:get(url, headers, payload)
- */
-__LJMP static int hlua_httpclient_get(lua_State *L)
-{
-	return hlua_httpclient_send(L, HTTP_METH_GET);
-
-}
-
-/*
- * Sends an HTTP PUT request and wait for a response
- *
- * httpclient:put(url, headers, payload)
- */
-__LJMP static int hlua_httpclient_put(lua_State *L)
-{
-	return hlua_httpclient_send(L, HTTP_METH_PUT);
-}
-
-/*
- * Send an HTTP POST request and wait for a response
- *
- * httpclient:post(url, headers, payload)
- */
-__LJMP static int hlua_httpclient_post(lua_State *L)
-{
-	return hlua_httpclient_send(L, HTTP_METH_POST);
-}
-
-
-/*
- * Sends an HTTP DELETE request and wait for a response
- *
- * httpclient:delete(url, headers, payload)
- */
-__LJMP static int hlua_httpclient_delete(lua_State *L)
-{
-	return hlua_httpclient_send(L, HTTP_METH_DELETE);
 }
 
 /*
@@ -8286,7 +7822,7 @@ __LJMP static int hlua_log_alert(lua_State *L)
 __LJMP static int hlua_sleep_yield(lua_State *L, int status, lua_KContext ctx)
 {
 	int wakeup_ms = lua_tointeger(L, -1);
-	if (!tick_is_expired(wakeup_ms, now_ms))
+	if (now_ms < wakeup_ms)
 		MAY_LJMP(hlua_yieldk(L, 0, 0, hlua_sleep_yield, wakeup_ms, 0));
 	return 0;
 }
@@ -8485,9 +8021,9 @@ static int hlua_register_task(lua_State *L)
 	 * otherwise, inherit the current thread identifier
 	 */
 	if (state_id == 0)
-		task = task_new_anywhere();
+		task = task_new(MAX_THREADS_MASK);
 	else
-		task = task_new_here();
+		task = task_new(tid_bit);
 	if (!task)
 		goto alloc_error;
 
@@ -8502,7 +8038,7 @@ static int hlua_register_task(lua_State *L)
 	hlua->nargs = 0;
 
 	/* Schedule task. */
-	task_wakeup(task, TASK_WOKEN_INIT);
+	task_schedule(task, now_ms);
 
 	return 0;
 
@@ -9175,7 +8711,7 @@ static int hlua_applet_tcp_init(struct appctx *ctx, struct proxy *px, struct str
 	ctx->ctx.hlua_apptcp.flags = 0;
 
 	/* Create task used by signal to wakeup applets. */
-	task = task_new_here();
+	task = task_new(tid_bit);
 	if (!task) {
 		SEND_ERR(px, "Lua applet tcp '%s': out of memory.\n",
 		         ctx->rule->arg.hlua_rule->fcn->name);
@@ -9368,7 +8904,7 @@ static int hlua_applet_http_init(struct appctx *ctx, struct proxy *px, struct st
 		ctx->ctx.hlua_apphttp.flags |= APPLET_HTTP11;
 
 	/* Create task used by signal to wakeup applets. */
-	task = task_new_here();
+	task = task_new(tid_bit);
 	if (!task) {
 		SEND_ERR(px, "Lua applet http '%s': out of memory.\n",
 		         ctx->rule->arg.hlua_rule->fcn->name);
@@ -9987,7 +9523,7 @@ static int hlua_cli_parse_fct(char **args, char *payload, struct appctx *appctx,
 	 * We use the same wakeup function than the Lua applet_tcp and
 	 * applet_http. It is absolutely compatible.
 	 */
-	appctx->ctx.hlua_cli.task = task_new_here();
+	appctx->ctx.hlua_cli.task = task_new(tid_bit);
 	if (!appctx->ctx.hlua_cli.task) {
 		SEND_ERR(NULL, "Lua cli '%s': out of memory.\n", fcn->name);
 		goto error;
@@ -10469,7 +10005,6 @@ static int hlua_filter_new(struct stream *s, struct filter *filter)
 		/* Check stack size. */
 		if (!lua_checkstack(s->hlua->T, 1)) {
 			SEND_ERR(s->be, "Lua filter '%s': full stack.\n", conf->reg->name);
-			RESET_SAFE_LJMP(s->hlua);
 			ret = 0;
 			goto end;
 		}
@@ -11178,7 +10713,7 @@ static int hlua_load(char **args, int section_type, struct proxy *curpx,
 
 	/* loading for global state */
 	hlua_state_id = 0;
-	ha_set_thread(NULL);
+	ha_set_tid(0);
 	return hlua_load_state(args[1], hlua_states[0], err);
 }
 
@@ -11222,7 +10757,7 @@ static int hlua_load_per_thread(char **args, int section_type, struct proxy *cur
 
 	/* loading for thread 1 only */
 	hlua_state_id = 1;
-	ha_set_thread(NULL);
+	ha_set_tid(0);
 	return hlua_load_state(args[1], hlua_states[1], err);
 }
 
@@ -11285,31 +10820,8 @@ static int hlua_config_prepend_path(char **args, int section_type, struct proxy 
 	}
 	LIST_APPEND(&prepend_path_list, &p->l);
 
-	/* Handle the global state and the per-thread state for the first
-	 * thread. The remaining threads will be initialized based on
-	 * prepend_path_list.
-	 */
-	for (size_t i = 0; i < 2; i++) {
-		lua_State *L = hlua_states[i];
-		const char *error;
-
-		if (setjmp(safe_ljmp_env) != 0) {
-			lua_atpanic(L, hlua_panic_safe);
-			if (lua_type(L, -1) == LUA_TSTRING)
-				error = lua_tostring(L, -1);
-			else
-				error = "critical error";
-			fprintf(stderr, "lua-prepend-path: %s.\n", error);
-			exit(1);
-		} else {
-			lua_atpanic(L, hlua_panic_ljmp);
-		}
-
-		hlua_prepend_path(L, type, path);
-
-		lua_atpanic(L, hlua_panic_safe);
-	}
-
+	hlua_prepend_path(hlua_states[0], type, path);
+	hlua_prepend_path(hlua_states[1], type, path);
 	return 0;
 
 err2:
@@ -11452,7 +10964,7 @@ int hlua_post_init()
 
 	/* Perform post init of common thread */
 	hlua_state_id = 0;
-	ha_set_thread(&ha_thread_info[0]);
+	ha_set_tid(0);
 	ret = hlua_post_init_state(hlua_states[hlua_state_id]);
 	if (ret == 0)
 		return 0;
@@ -11461,7 +10973,7 @@ int hlua_post_init()
 	for (hlua_state_id = 2; hlua_state_id < global.nbthread + 1; hlua_state_id++) {
 
 		/* set thread context */
-		ha_set_thread(&ha_thread_info[hlua_state_id - 1]);
+		ha_set_tid(hlua_state_id - 1);
 
 		/* Init lua state */
 		hlua_states[hlua_state_id] = hlua_init_state(hlua_state_id);
@@ -11477,13 +10989,13 @@ int hlua_post_init()
 	}
 
 	/* Reset thread context */
-	ha_set_thread(NULL);
+	ha_set_tid(0);
 
 	/* Execute post init for all states */
 	for (hlua_state_id = 1; hlua_state_id < global.nbthread + 1; hlua_state_id++) {
 
 		/* set thread context */
-		ha_set_thread(&ha_thread_info[hlua_state_id - 1]);
+		ha_set_tid(hlua_state_id - 1);
 
 		/* run post init */
 		ret = hlua_post_init_state(hlua_states[hlua_state_id]);
@@ -11492,7 +11004,7 @@ int hlua_post_init()
 	}
 
 	/* Reset thread context */
-	ha_set_thread(NULL);
+	ha_set_tid(0);
 
 	/* control functions registering. Each function must have:
 	 *  - only the function_ref[0] set positive and all other to -1
@@ -11569,28 +11081,20 @@ int hlua_post_init()
  * indicated by <ptr> being NULL. A free is indicated by <nsize> being
  * zero. This one verifies that the limits are respected but is optimized
  * for the fast case where limits are not used, hence stats are not updated.
- *
- * Warning: while this API ressembles glibc's realloc() a lot, glibc surpasses
- * POSIX by making realloc(ptr,0) an effective free(), but others do not do
- * that and will simply allocate zero as if it were the result of malloc(0),
- * so mapping this onto realloc() will lead to memory leaks on non-glibc
- * systems.
  */
 static void *hlua_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
 {
 	struct hlua_mem_allocator *zone = ud;
 	size_t limit, old, new;
 
+	if (unlikely(!ptr && !nsize))
+		return NULL;
+
 	/* a limit of ~0 means unlimited and boot complete, so there's no need
 	 * for accounting anymore.
 	 */
-	if (likely(~zone->limit == 0)) {
-		if (!nsize)
-			ha_free(&ptr);
-		else
-			ptr = realloc(ptr, nsize);
-		return ptr;
-	}
+	if (likely(~zone->limit == 0))
+		return realloc(ptr, nsize);
 
 	if (!ptr)
 		osize = 0;
@@ -11604,10 +11108,7 @@ static void *hlua_alloc(void *ud, void *ptr, size_t osize, size_t nsize)
 			return NULL;
 	} while (!_HA_ATOMIC_CAS(&zone->allocated, &old, new));
 
-	if (!nsize)
-		ha_free(&ptr);
-	else
-		ptr = realloc(ptr, nsize);
+	ptr = realloc(ptr, nsize);
 
 	if (unlikely(!ptr && nsize)) // failed
 		_HA_ATOMIC_SUB(&zone->allocated, nsize - osize);
@@ -11708,7 +11209,6 @@ lua_State *hlua_init_state(int thread_num)
 	hlua_class_function(L, "set_map", hlua_set_map);
 	hlua_class_function(L, "del_map", hlua_del_map);
 	hlua_class_function(L, "tcp", hlua_socket_new);
-	hlua_class_function(L, "httpclient", hlua_httpclient_new);
 	hlua_class_function(L, "log", hlua_log);
 	hlua_class_function(L, "Debug", hlua_log_debug);
 	hlua_class_function(L, "Info", hlua_log_info);
@@ -12014,31 +11514,6 @@ lua_State *hlua_init_state(int thread_num)
 
 	/* Register previous table in the registry with reference and named entry. */
 	class_http_msg_ref = hlua_register_metatable(L, CLASS_HTTP_MSG);
-
-	/*
-	 *
-	 * Register class HTTPClient
-	 *
-	 */
-
-	/* Create and fill the metatable. */
-	lua_newtable(L);
-	lua_pushstring(L, "__index");
-	lua_newtable(L);
-	hlua_class_function(L, "get",         hlua_httpclient_get);
-	hlua_class_function(L, "head",        hlua_httpclient_head);
-	hlua_class_function(L, "put",         hlua_httpclient_put);
-	hlua_class_function(L, "post",        hlua_httpclient_post);
-	hlua_class_function(L, "delete",      hlua_httpclient_delete);
-	lua_settable(L, -3); /* Sets the __index entry. */
-	/* Register the garbage collector entry. */
-	lua_pushstring(L, "__gc");
-	lua_pushcclosure(L, hlua_httpclient_gc, 0);
-	lua_settable(L, -3); /* Push the last 2 entries in the table at index -3 */
-
-
-
-	class_httpclient_ref = hlua_register_metatable(L, CLASS_HTTPCLIENT);
 	/*
 	 *
 	 * Register class AppletTCP
@@ -12213,12 +11688,12 @@ void hlua_init(void) {
 
 	/* Init state for common/shared lua parts */
 	hlua_state_id = 0;
-	ha_set_thread(NULL);
+	ha_set_tid(0);
 	hlua_states[0] = hlua_init_state(0);
 
 	/* Init state 1 for thread 0. We have at least one thread. */
 	hlua_state_id = 1;
-	ha_set_thread(NULL);
+	ha_set_tid(0);
 	hlua_states[1] = hlua_init_state(1);
 
 	/* Proxy and server configuration initialisation. */

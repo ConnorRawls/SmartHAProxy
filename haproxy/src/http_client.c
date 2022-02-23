@@ -19,7 +19,6 @@
 #include <haproxy/cfgparse.h>
 #include <haproxy/connection.h>
 #include <haproxy/global.h>
-#include <haproxy/istbuf.h>
 #include <haproxy/h1_htx.h>
 #include <haproxy/http.h>
 #include <haproxy/http_client.h>
@@ -28,7 +27,6 @@
 #include <haproxy/log.h>
 #include <haproxy/proxy.h>
 #include <haproxy/server.h>
-#include <haproxy/ssl_sock-t.h>
 #include <haproxy/stream_interface.h>
 #include <haproxy/tools.h>
 
@@ -117,7 +115,6 @@ static int hc_cli_parse(char **args, char *payload, struct appctx *appctx, void 
 	enum http_meth_t meth;
 	char *meth_str;
 	struct ist uri;
-	struct ist body = IST_NULL;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
@@ -129,9 +126,6 @@ static int hc_cli_parse(char **args, char *payload, struct appctx *appctx, void 
 
 	meth_str = args[1];
 	uri = ist(args[2]);
-
-	if (payload)
-		body = ist(payload);
 
 	meth = find_http_meth(meth_str, strlen(meth_str));
 
@@ -149,7 +143,7 @@ static int hc_cli_parse(char **args, char *payload, struct appctx *appctx, void 
 	appctx->ctx.cli.p0 = hc; /* store the httpclient ptr in the applet */
 	appctx->ctx.cli.i0 = 0;
 
-	if (httpclient_req_gen(hc, hc->req.url, hc->req.meth, default_httpclient_hdrs, body) != ERR_NONE)
+	if (httpclient_req_gen(hc, hc->req.url, hc->req.meth, default_httpclient_hdrs) != ERR_NONE)
 		goto err;
 
 
@@ -179,7 +173,7 @@ static int hc_cli_io_handler(struct appctx *appctx)
 	if (!trash)
 		goto out;
 	if (appctx->ctx.cli.i0 & HC_CLI_F_RES_STLINE) {
-		chunk_appendf(trash, "%s %d %s\n",istptr(hc->res.vsn), hc->res.status, istptr(hc->res.reason));
+		chunk_appendf(trash, "%s %d %s\n",ist0(hc->res.vsn), hc->res.status, ist0(hc->res.reason));
 		if (ci_putchk(si_ic(si), trash) == -1)
 			si_rx_room_blk(si);
 		appctx->ctx.cli.i0 &= ~HC_CLI_F_RES_STLINE;
@@ -206,7 +200,7 @@ static int hc_cli_io_handler(struct appctx *appctx)
 		ret = httpclient_res_xfer(hc, &si_ic(si)->buf);
 		channel_add_input(si_ic(si), ret); /* forward what we put in the buffer channel */
 
-		if (!httpclient_data(hc)) {/* remove the flag if the buffer was emptied */
+		if (!b_data(&hc->res.buf)) {/* remove the flag if the buffer was emptied */
 			appctx->ctx.cli.i0 &= ~HC_CLI_F_RES_BODY;
 		}
 		goto out;
@@ -234,14 +228,14 @@ static void hc_cli_release(struct appctx *appctx)
 	struct httpclient *hc = appctx->ctx.cli.p0;
 
 	/* Everything possible was printed on the CLI, we can destroy the client */
-	httpclient_stop_and_destroy(hc);
+	httpclient_destroy(hc);
 
 	return;
 }
 
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
-	{ { "httpclient", NULL }, "httpclient <method> <URI>   : launch an HTTP request", hc_cli_parse, hc_cli_io_handler, hc_cli_release,  NULL, ACCESS_EXPERT},
+	{ { "httpclient", NULL }, "httpclient <method> <URI>   : launch an HTTP request", hc_cli_parse, hc_cli_io_handler, hc_cli_release},
 	{ { NULL }, NULL, NULL, NULL }
 }};
 
@@ -258,13 +252,13 @@ INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
  * If the buffer was filled correctly the function returns 0, if not it returns
  * an error_code but there is no guarantee that the buffer wasn't modified.
  */
-int httpclient_req_gen(struct httpclient *hc, const struct ist url, enum http_meth_t meth, const struct http_hdr *hdrs, const struct ist payload)
+int httpclient_req_gen(struct httpclient *hc, const struct ist url, enum http_meth_t meth, const struct http_hdr *hdrs)
 {
 	struct htx_sl *sl;
 	struct htx *htx;
 	int err_code = 0;
 	struct ist meth_ist, vsn;
-	unsigned int flags = HTX_SL_F_VER_11 | HTX_SL_F_NORMALIZED_URI | HTX_SL_F_HAS_SCHM;
+	unsigned int flags = HTX_SL_F_VER_11 | HTX_SL_F_BODYLESS | HTX_SL_F_XFER_LEN | HTX_SL_F_NORMALIZED_URI | HTX_SL_F_HAS_SCHM;
 
 	if (meth >= HTTP_METH_OTHER)
 		goto error;
@@ -283,31 +277,16 @@ int httpclient_req_gen(struct httpclient *hc, const struct ist url, enum http_me
 	sl->info.req.meth = meth;
 
 	/* Add Host Header from URL */
-	if (!htx_add_header(htx, ist("Host"), ist("h")))
+	if (!htx_add_header(htx, ist("Host"), IST_NULL))
 		goto error;
 	if (!http_update_host(htx, sl, url))
 		goto error;
 
 	/* add the headers and EOH */
-	if (hdrs) {
-		if (!htx_add_all_headers(htx, hdrs))
-			goto error;
-	} else {
-		if (!htx_add_endof(htx, HTX_BLK_EOH))
-			goto error;
-	}
+	if (hdrs && !htx_add_all_headers(htx, hdrs))
+		goto error;
 
-	if (isttest(payload)) {
-		/* add the payload if it can feat in the buffer, no need to set
-		 * the Content-Length, the data will be sent chunked */
-		if (!htx_add_data_atonce(htx, payload))
-			goto error;
-	}
-
-	/* If req.payload was set, does not set the end of stream which *MUST*
-	 * be set in the callback */
-	if (!hc->ops.req_payload)
-		htx->flags |= HTX_FL_EOM;
+	htx->flags |= HTX_FL_EOM;
 
 	htx_to_buf(htx, &hc->req.buf);
 
@@ -321,56 +300,18 @@ error:
  * transfer the response to the destination buffer and wakeup the HTTP client
  * applet so it could fill again its buffer.
  *
- * Return the number of bytes transferred.
+ * Return the number of bytes transfered.
  */
 int httpclient_res_xfer(struct httpclient *hc, struct buffer *dst)
 {
 	int ret;
 
-	ret = b_force_xfer(dst, &hc->res.buf, MIN(1024, b_data(&hc->res.buf)));
+	ret = b_xfer(dst, &hc->res.buf, MIN(1024, b_data(&hc->res.buf)));
 	/* call the client once we consumed all data */
 	if (!b_data(&hc->res.buf) && hc->appctx)
 		appctx_wakeup(hc->appctx);
 	return ret;
 }
-
-/*
- * Transfer raw HTTP payload from src, and insert it into HTX format in the
- * httpclient.
- *
- * Must be used to transfer the request body.
- * Then wakeup the httpclient so it can transfer it.
- *
- * <end> tries to add the ending data flag if it succeed to copy all data.
- *
- * Return the number of bytes copied from src.
- */
-int httpclient_req_xfer(struct httpclient *hc, struct ist src, int end)
-{
-	int ret = 0;
-	struct htx *htx;
-
-	htx = htx_from_buf(&hc->req.buf);
-	if (!htx)
-		goto error;
-
-	if (hc->appctx)
-		appctx_wakeup(hc->appctx);
-
-	ret += htx_add_data(htx, src);
-
-
-	/* if we copied all the data and the end flag is set */
-	if ((istlen(src) == ret) && end) {
-		htx->flags |= HTX_FL_EOM;
-	}
-	htx_to_buf(htx, &hc->req.buf);
-
-error:
-
-	return ret;
-}
-
 
 /*
  * Start the HTTP client
@@ -392,15 +333,15 @@ struct appctx *httpclient_start(struct httpclient *hc)
 
 	/* parse URI and fill sockaddr_storage */
 	/* FIXME: use a resolver */
-	len = url2sa(istptr(hc->req.url), istlen(hc->req.url), &hc->dst, &out);
+	len = url2sa(ist0(hc->req.url), istlen(hc->req.url), &hc->dst, &out);
 	if (len == -1) {
-		ha_alert("httpclient: cannot parse uri '%s'.\n", istptr(hc->req.url));
+		ha_alert("httpclient: cannot parse uri '%s'.\n", ist0(hc->req.url));
 		goto out;
 	}
 
 	/* The HTTP client will be created in the same thread as the caller,
 	 * avoiding threading issues */
-	appctx = appctx_new(applet);
+	appctx = appctx_new(applet, tid_bit);
 	if (!appctx)
 		goto out;
 
@@ -414,7 +355,7 @@ struct appctx *httpclient_start(struct httpclient *hc)
 		goto out_free_appctx;
 	}
 
-	if (!sockaddr_alloc(&s->si[1].dst, &hc->dst, sizeof(hc->dst))) {
+	if (!sockaddr_alloc(&s->target_addr, &hc->dst, sizeof(hc->dst))) {
 		ha_alert("httpclient: Failed to initialize stream in %s:%d.\n", __FUNCTION__, __LINE__);
 		goto out_free_stream;
 	}
@@ -444,7 +385,6 @@ struct appctx *httpclient_start(struct httpclient *hc)
 
 	task_wakeup(s->task, TASK_WOKEN_INIT);
 	hc->appctx = appctx;
-	hc->flags |= HTTPCLIENT_FS_STARTED;
 	appctx->ctx.httpclient.ptr = hc;
 	appctx->st0 = HTTPCLIENT_S_REQ;
 
@@ -462,55 +402,13 @@ out:
 	return NULL;
 }
 
-/*
- * This function tries to destroy the httpclient if it wasn't running.
- * If it was running, stop the client and ask it to autodestroy itself.
- *
- * Once this function is used, all pointer sto the client must be removed
- *
- */
-void httpclient_stop_and_destroy(struct httpclient *hc)
-{
-
-	/* The httpclient was already stopped or never started, we can safely destroy it */
-	if (hc->flags & HTTPCLIENT_FS_ENDED || !(hc->flags & HTTPCLIENT_FS_STARTED)) {
-		httpclient_destroy(hc);
-	} else {
-	/* if the client wasn't stopped, ask for a stop and destroy */
-		hc->flags |= (HTTPCLIENT_FA_AUTOKILL | HTTPCLIENT_FA_STOP);
-		if (hc->appctx)
-			appctx_wakeup(hc->appctx);
-	}
-}
-
 /* Free the httpclient */
 void httpclient_destroy(struct httpclient *hc)
 {
-	struct http_hdr *hdrs;
-
-
 	if (!hc)
 		return;
-
-	/* we should never destroy a client which was started but not stopped  */
-	BUG_ON(httpclient_started(hc) && !httpclient_ended(hc));
-
-	/* request */
-	istfree(&hc->req.url);
 	b_free(&hc->req.buf);
-	/* response */
-	istfree(&hc->res.vsn);
-	istfree(&hc->res.reason);
-	hdrs = hc->res.hdrs;
-	while (hdrs && isttest(hdrs->n)) {
-		istfree(&hdrs->n);
-		istfree(&hdrs->v);
-		hdrs++;
-	}
-	ha_free(&hc->res.hdrs);
 	b_free(&hc->res.buf);
-
-
 	free(hc);
 
 	return;
@@ -535,7 +433,7 @@ struct httpclient *httpclient_new(void *caller, enum http_meth_t meth, struct is
 		goto err;
 
 	hc->caller = caller;
-	hc->req.url = istdup(url);
+	hc->req.url = url;
 	hc->req.meth = meth;
 
 	return hc;
@@ -557,75 +455,20 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 	struct htx_sl *sl = NULL;
 	int32_t pos;
 	uint32_t hdr_num;
-	int ret;
 
 
 	while (1) {
-
-		/* required to stop */
-		if (hc->flags & HTTPCLIENT_FA_STOP)
-			goto end;
-
 		switch(appctx->st0) {
 
 			case HTTPCLIENT_S_REQ:
-				/* we know that the buffer is empty here, since
-				 * it's the first call, we can freely copy the
-				 * request from the httpclient buffer */
-				ret = b_xfer(&req->buf, &hc->req.buf, b_data(&hc->req.buf));
-				if (!ret)
-					goto more;
-
+				/* copy the request from the hc->req.buf buffer */
 				htx = htx_from_buf(&req->buf);
-				if (!htx)
-					goto more;
-
-				channel_add_input(req, htx->data);
-
-				if (htx->flags & HTX_FL_EOM) /* check if a body need to be added */
-					appctx->st0 = HTTPCLIENT_S_RES_STLINE;
-				else
-					appctx->st0 = HTTPCLIENT_S_REQ_BODY;
-
+				/* We now that it fits the content of a buffer so can
+				 * just push this entirely */
+				b_xfer(&req->buf, &hc->req.buf, b_data(&hc->req.buf));
+				channel_add_input(req, b_data(&req->buf));
+				appctx->st0 = HTTPCLIENT_S_RES_STLINE;
 				goto more; /* we need to leave the IO handler once we wrote the request */
-			break;
-			case HTTPCLIENT_S_REQ_BODY:
-				/* call the payload callback */
-				{
-					if (hc->ops.req_payload) {
-
-						/* call the request callback */
-						hc->ops.req_payload(hc);
-						/* check if the request buffer is empty */
-
-						htx = htx_from_buf(&req->buf);
-						if (!htx_is_empty(htx))
-							goto more;
-						/* Here htx_to_buf() will set buffer data to 0 because
-						 * the HTX is empty, and allow us to do an xfer.
-						 */
-						htx_to_buf(htx, &req->buf);
-
-						ret = b_xfer(&req->buf, &hc->req.buf, b_data(&hc->req.buf));
-						if (!ret)
-							goto more;
-						htx = htx_from_buf(&req->buf);
-						if (!htx)
-							goto more;
-
-						channel_add_input(req, htx->data);
-					}
-
-					htx = htx_from_buf(&req->buf);
-					if (!htx)
-						goto more;
-
-					/* if the request contains the HTX_FL_EOM, we finished the request part. */
-					if (htx->flags & HTX_FL_EOM)
-						appctx->st0 = HTTPCLIENT_S_RES_STLINE;
-
-					goto more; /* we need to leave the IO handler once we wrote the request */
-				}
 			break;
 
 			case HTTPCLIENT_S_RES_STLINE:
@@ -711,11 +554,10 @@ static void httpclient_applet_io_handler(struct appctx *appctx)
 
 					/* if there is no HTX data anymore and the EOM flag is
 					 * set, leave (no body) */
-					if (htx_is_empty(htx) && htx->flags & HTX_FL_EOM) {
+					if (htx_is_empty(htx) && htx->flags & HTX_FL_EOM)
 						appctx->st0 = HTTPCLIENT_S_RES_END;
-					} else {
+					else
 						appctx->st0 = HTTPCLIENT_S_RES_BODY;
-					}
 				}
 			break;
 
@@ -801,17 +643,9 @@ static void httpclient_applet_release(struct appctx *appctx)
 {
 	struct httpclient *hc = appctx->ctx.httpclient.ptr;
 
-	/* mark the httpclient as ended */
-	hc->flags |= HTTPCLIENT_FS_ENDED;
 	/* the applet is leaving, remove the ptr so we don't try to call it
 	 * again from the caller */
 	hc->appctx = NULL;
-
-
-	/* destroy the httpclient when set to autotokill */
-	if (hc->flags & HTTPCLIENT_FA_AUTOKILL) {
-		httpclient_destroy(hc);
-	}
 
 	return;
 }
@@ -885,7 +719,7 @@ static int httpclient_init()
 	httpclient_srv_ssl->ssl_ctx.verify = SSL_SOCK_VERIFY_NONE;
 #endif
 
-	/* add the proxy in the proxy list only if everything is successful */
+	/* add the proxy in the proxy list only if everything successed */
 	httpclient_proxy->next = proxies_list;
 	proxies_list = httpclient_proxy;
 

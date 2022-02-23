@@ -622,7 +622,8 @@ cache_store_http_payload(struct stream *s, struct filter *filter, struct http_ms
 			case HTX_BLK_DATA:
 				v = htx_get_blk_value(htx, blk);
 				v = istadv(v, offset);
-				v = isttrim(v, len);
+				if (v.len > len)
+					v.len = len;
 
 				info = (type << 28) + v.len;
 				chunk_memcat(&trash, (char *)&info, sizeof(info));
@@ -779,11 +780,11 @@ int http_calc_maxage(struct stream *s, struct cache *cache, int *true_maxage)
 		if (value) {
 			struct buffer *chk = get_trash_chunk();
 
-			chunk_memcat(chk, value, ctx.value.len - 8 + 1);
-			chunk_memcat(chk, "", 1);
+			chunk_strncat(chk, value, ctx.value.len - 8 + 1);
+			chunk_strncat(chk, "", 1);
 			offset = (*chk->area == '"') ? 1 : 0;
 			smaxage = strtol(chk->area + offset, &endptr, 10);
-			if (unlikely(smaxage < 0 || endptr == chk->area + offset))
+			if (unlikely(smaxage < 0 || endptr == chk->area))
 				return -1;
 		}
 
@@ -791,11 +792,11 @@ int http_calc_maxage(struct stream *s, struct cache *cache, int *true_maxage)
 		if (value) {
 			struct buffer *chk = get_trash_chunk();
 
-			chunk_memcat(chk, value, ctx.value.len - 7 + 1);
-			chunk_memcat(chk, "", 1);
+			chunk_strncat(chk, value, ctx.value.len - 7 + 1);
+			chunk_strncat(chk, "", 1);
 			offset = (*chk->area == '"') ? 1 : 0;
 			maxage = strtol(chk->area + offset, &endptr, 10);
-			if (unlikely(maxage < 0 || endptr == chk->area + offset))
+			if (unlikely(maxage < 0 || endptr == chk->area))
 				return -1;
 		}
 	}
@@ -1644,7 +1645,7 @@ int sha1_hosturi(struct stream *s)
 		chunk_istcat(trash, ctx.value);
 	}
 
-	chunk_istcat(trash, uri);
+	chunk_memcat(trash, uri.ptr, uri.len);
 
 	/* hash everything */
 	blk_SHA1_Init(&sha1_ctx);
@@ -2179,49 +2180,49 @@ static int parse_encoding_value(struct ist encoding, unsigned int *encoding_valu
 
 	switch (*encoding.ptr) {
 	case 'a':
-		encoding = istnext(encoding);
+		encoding = istadv(encoding, 1);
 		*encoding_value = CHECK_ENCODING(encoding, "aes128gcm", VARY_ENCODING_AES128GCM);
 		break;
 	case 'b':
-		encoding = istnext(encoding);
+		encoding = istadv(encoding, 1);
 		*encoding_value = CHECK_ENCODING(encoding, "br", VARY_ENCODING_BR);
 		break;
 	case 'c':
-		encoding = istnext(encoding);
+		encoding = istadv(encoding, 1);
 		*encoding_value = CHECK_ENCODING(encoding, "compress", VARY_ENCODING_COMPRESS);
 		break;
 	case 'd':
-		encoding = istnext(encoding);
+		encoding = istadv(encoding, 1);
 		*encoding_value = CHECK_ENCODING(encoding, "deflate", VARY_ENCODING_DEFLATE);
 		break;
 	case 'e':
-		encoding = istnext(encoding);
+		encoding = istadv(encoding, 1);
 		*encoding_value = CHECK_ENCODING(encoding, "exi", VARY_ENCODING_EXI);
 		break;
 	case 'g':
-		encoding = istnext(encoding);
+		encoding = istadv(encoding, 1);
 		*encoding_value = CHECK_ENCODING(encoding, "gzip", VARY_ENCODING_GZIP);
 		break;
 	case 'i':
-		encoding = istnext(encoding);
+		encoding = istadv(encoding, 1);
 		*encoding_value = CHECK_ENCODING(encoding, "identity", VARY_ENCODING_IDENTITY);
 		break;
 	case 'p':
-		encoding = istnext(encoding);
+		encoding = istadv(encoding, 1);
 		*encoding_value = CHECK_ENCODING(encoding, "pack200-gzip", VARY_ENCODING_PACK200_GZIP);
 		break;
 	case 'x':
-		encoding = istnext(encoding);
+		encoding = istadv(encoding, 1);
 		*encoding_value = CHECK_ENCODING(encoding, "x-gzip", VARY_ENCODING_GZIP);
 		if (!*encoding_value)
 			*encoding_value = CHECK_ENCODING(encoding, "x-compress", VARY_ENCODING_COMPRESS);
 		break;
 	case 'z':
-		encoding = istnext(encoding);
+		encoding = istadv(encoding, 1);
 		*encoding_value = CHECK_ENCODING(encoding, "zstd", VARY_ENCODING_ZSTD);
 		break;
 	case '*':
-		encoding = istnext(encoding);
+		encoding = istadv(encoding, 1);
 		*encoding_value = VARY_ENCODING_STAR;
 		break;
 	default:
@@ -2237,7 +2238,7 @@ static int parse_encoding_value(struct ist encoding, unsigned int *encoding_valu
 				return -1;
 
 			if (has_null_weight) {
-				encoding = istnext(encoding);
+				encoding = istadv(encoding, 1);
 
 				encoding = http_trim_leading_spht(encoding);
 
@@ -2589,7 +2590,7 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 		while (1) {
 
 			shctx_lock(shctx_ptr(cache));
-			if (!node)
+			if (!node || (node = eb32_next_dup(node)) == NULL)
 				node = eb32_lookup_ge(&cache->entries, next_key);
 			if (!node) {
 				shctx_unlock(shctx_ptr(cache));

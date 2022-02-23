@@ -25,7 +25,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include <import/ebtree-t.h>
+#include <import/eb32tree.h>
+#include <import/ebmbtree.h>
 
 #include <haproxy/api-t.h>
 #include <haproxy/check-t.h>
@@ -34,8 +35,10 @@
 #include <haproxy/freq_ctr-t.h>
 #include <haproxy/listener-t.h>
 #include <haproxy/obj_type-t.h>
+#include <haproxy/openssl-compat.h>
 #include <haproxy/queue-t.h>
 #include <haproxy/resolvers-t.h>
+#include <haproxy/ssl_sock-t.h>
 #include <haproxy/stats-t.h>
 #include <haproxy/task-t.h>
 #include <haproxy/thread-t.h>
@@ -211,13 +214,6 @@ struct srv_per_thread {
 	struct eb_root avail_conns;             /* Connections in use, but with still new streams available */
 };
 
-/* Configure the protocol selection for websocket */
-enum __attribute__((__packed__)) srv_ws_mode {
-	SRV_WS_AUTO = 0,
-	SRV_WS_H1,
-	SRV_WS_H2,
-};
-
 struct proxy;
 struct server {
 	/* mostly config or admin stuff, doesn't change often */
@@ -263,9 +259,6 @@ struct server {
 	unsigned rweight;			/* remainder of weight in the current LB tree */
 	unsigned cumulative_weight;		/* weight of servers prior to this one in the same group, for chash balancing */
 	int maxqueue;				/* maximum number of pending connections allowed */
-
-	enum srv_ws_mode ws;                    /* configure the protocol selection for websocket */
-	/* 3 bytes hole here */
 
 	uint refcount;                          /* refcount used to remove a server at runtime */
 
@@ -335,21 +328,23 @@ struct server {
 	unsigned int init_addr_methods;		/* initial address setting, 3-bit per method, ends at 0, enough to store 10 entries */
 	enum srv_log_proto log_proto;		/* used proto to emit messages on server lines from ring section */
 
+#ifdef USE_OPENSSL
 	char *sni_expr;             /* Temporary variable to store a sample expression for SNI */
 	struct {
-		void *ctx;
+		SSL_CTX *ctx;
 		struct {
 			unsigned char *ptr;
 			int size;
 			int allocated_size;
-			char *sni; /* SNI used for the session */
 		} * reused_sess;
 
 		struct ckch_inst *inst; /* Instance of the ckch_store in which the certificate was loaded (might be null if server has no certificate) */
 		__decl_thread(HA_RWLOCK_T lock); /* lock the cache and SSL_CTX during commit operations */
 
 		char *ciphers;			/* cipher suite to use if non-null */
+#ifdef HAVE_SSL_CTX_SET_CIPHERSUITES
 		char *ciphersuites;			/* TLS 1.3 cipher suite to use if non-null */
+#endif
 		int options;			/* ssl options */
 		int verify;			/* verify method (set of SSL_VERIFY_* flags) */
 		struct tls_version_filter methods;	/* ssl methods */
@@ -357,14 +352,19 @@ struct server {
 		char *ca_file;			/* CAfile to use on verify */
 		char *crl_file;			/* CRLfile to use on verify */
 		struct sample_expr *sni;        /* sample expression for SNI */
+#ifdef OPENSSL_NPN_NEGOTIATED
 		char *npn_str;                  /* NPN protocol string */
 		int npn_len;                    /* NPN protocol string length */
+#endif
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
 		char *alpn_str;                 /* ALPN protocol string */
 		int alpn_len;                   /* ALPN protocol string length */
+#endif
 	} ssl_ctx;
 #ifdef USE_QUIC
 	struct quic_transport_params quic_params; /* QUIC transport parameters */
 	struct eb_root cids;        /* QUIC connections IDs. */
+#endif
 #endif
 	struct resolv_srvrq *srvrq;		/* Pointer representing the DNS SRV requeest, if any */
 	struct list srv_rec_item;		/* to attach server to a srv record item */

@@ -3,10 +3,7 @@ name: Spec Compliance
 
 on:
   schedule:
-  - cron: "0 0 * * 3"
-
-permissions:
-  contents: read
+    - cron: "0 0 * * 3"
 
 jobs:
   h2spec:

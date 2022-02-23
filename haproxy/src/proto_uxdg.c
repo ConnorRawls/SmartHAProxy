@@ -57,7 +57,6 @@ struct protocol proto_uxdg = {
 	.fam            = &proto_fam_unix,
 
 	/* socket layer */
-	.proto_type     = PROTO_TYPE_DGRAM,
 	.sock_type      = SOCK_DGRAM,
 	.sock_prot      = 0,
 	.rx_enable      = sock_enable,
@@ -104,7 +103,7 @@ int uxdg_bind_listener(struct listener *listener, char *errmsg, int errlen)
  uxdg_return:
 	if (msg && errlen) {
 		const char *path = ((struct sockaddr_un *)&listener->rx.addr)->sun_path;
-                snprintf(errmsg, errlen, "%s for [%s]", msg, path);
+                snprintf(errmsg, errlen, "%s [%s]", msg, path);
 	}
 	return err;
 }

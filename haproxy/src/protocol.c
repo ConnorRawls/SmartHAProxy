@@ -24,7 +24,7 @@
 
 /* List head of all registered protocols */
 static struct list protocols = LIST_HEAD_INIT(protocols);
-struct protocol *__protocol_by_family[AF_CUST_MAX][PROTO_NUM_TYPES][2] __read_mostly = { };
+struct protocol *__protocol_by_family[AF_CUST_MAX][2][2] __read_mostly = { };
 
 /* This is the global spinlock we may need to register/unregister listeners or
  * protocols. Its main purpose is in fact to serialize the rare stop/deinit()
@@ -35,16 +35,12 @@ __decl_spinlock(proto_lock);
 /* Registers the protocol <proto> */
 void protocol_register(struct protocol *proto)
 {
-	int sock_domain = proto->fam->sock_domain;
-
-	BUG_ON(sock_domain < 0 || sock_domain >= AF_CUST_MAX);
-	BUG_ON(proto->proto_type >= PROTO_NUM_TYPES);
-
 	HA_SPIN_LOCK(PROTO_LOCK, &proto_lock);
 	LIST_APPEND(&protocols, &proto->list);
-	__protocol_by_family[sock_domain]
-	                    [proto->proto_type]
-	                    [proto->ctrl_type == SOCK_DGRAM] = proto;
+	if (proto->fam->sock_domain >= 0 && proto->fam->sock_domain < AF_CUST_MAX)
+		__protocol_by_family[proto->fam->sock_domain]
+			[proto->sock_type == SOCK_DGRAM]
+			[proto->ctrl_type == SOCK_DGRAM] = proto;
 	HA_SPIN_UNLOCK(PROTO_LOCK, &proto_lock);
 }
 
@@ -67,7 +63,7 @@ int protocol_bind_all(int verbose)
 	struct protocol *proto;
 	struct listener *listener;
 	struct receiver *receiver;
-	char msg[1000];
+	char msg[100];
 	char *errmsg;
 	int err, lerr;
 
@@ -85,12 +81,10 @@ int protocol_bind_all(int verbose)
 				struct proxy *px = listener->bind_conf->frontend;
 
 				if (lerr & ERR_ALERT)
-					ha_alert("Binding [%s:%d] for %s %s: %s\n",
-					         listener->bind_conf->file, listener->bind_conf->line,
+					ha_alert("Starting %s %s: %s\n",
 						 proxy_type_str(px), px->id, errmsg);
 				else if (lerr & ERR_WARN)
-					ha_warning("Binding [%s:%d] for %s %s: %s\n",
-					           listener->bind_conf->file, listener->bind_conf->line,
+					ha_warning("Starting %s %s: %s\n",
 						   proxy_type_str(px), px->id, errmsg);
 				ha_free(&errmsg);
 			}
@@ -109,12 +103,10 @@ int protocol_bind_all(int verbose)
 				struct proxy *px = listener->bind_conf->frontend;
 
 				if (lerr & ERR_ALERT)
-					ha_alert("Starting [%s:%d] for %s %s: %s\n",
-					         listener->bind_conf->file, listener->bind_conf->line,
+					ha_alert("Starting %s %s: %s\n",
 						 proxy_type_str(px), px->id, msg);
 				else if (lerr & ERR_WARN)
-					ha_warning("Starting [%s:%d] for %s %s: %s\n",
-					           listener->bind_conf->file, listener->bind_conf->line,
+					ha_warning("Starting %s %s: %s\n",
 						   proxy_type_str(px), px->id, msg);
 			}
 			if (lerr & ERR_ABORT)

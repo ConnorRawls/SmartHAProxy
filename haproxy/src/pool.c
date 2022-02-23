@@ -9,11 +9,9 @@
  * 2 of the License, or (at your option) any later version.
  *
  */
-
-#include <sys/mman.h>
 #include <errno.h>
 
-#include <haproxy/activity.h>
+#include <haproxy/activity-t.h>
 #include <haproxy/api.h>
 #include <haproxy/applet-t.h>
 #include <haproxy/cfgparse.h>
@@ -40,67 +38,6 @@ int mem_poison_byte = -1;
 
 #ifdef DEBUG_FAIL_ALLOC
 static int mem_fail_rate = 0;
-#endif
-
-#if defined(HA_HAVE_MALLOC_TRIM)
-static int using_libc_allocator = 0;
-
-/* ask the allocator to trim memory pools */
-static void trim_all_pools(void)
-{
-	if (using_libc_allocator)
-		malloc_trim(0);
-}
-
-/* check if we're using the same allocator as the one that provides
- * malloc_trim() and mallinfo(). The principle is that on glibc, both
- * malloc_trim() and mallinfo() are provided, and using mallinfo() we
- * can check if malloc() is performed through glibc or any other one
- * the executable was linked against (e.g. jemalloc).
- */
-static void detect_allocator(void)
-{
-#ifdef HA_HAVE_MALLINFO2
-	struct mallinfo2 mi1, mi2;
-#else
-	struct mallinfo mi1, mi2;
-#endif
-	void *ptr;
-
-#ifdef HA_HAVE_MALLINFO2
-	mi1 = mallinfo2();
-#else
-	mi1 = mallinfo();
-#endif
-	ptr = DISGUISE(malloc(1));
-#ifdef HA_HAVE_MALLINFO2
-	mi2 = mallinfo2();
-#else
-	mi2 = mallinfo();
-#endif
-	free(DISGUISE(ptr));
-
-	using_libc_allocator = !!memcmp(&mi1, &mi2, sizeof(mi1));
-}
-
-static int is_trim_enabled(void)
-{
-	return using_libc_allocator;
-}
-#else
-
-static void trim_all_pools(void)
-{
-}
-
-static void detect_allocator(void)
-{
-}
-
-static int is_trim_enabled(void)
-{
-	return 0;
-}
 #endif
 
 /* Try to find an existing shared pool with the same characteristics and
@@ -289,7 +226,7 @@ void pool_evict_from_local_caches()
 	struct pool_head *pool;
 
 	do {
-		item = LIST_PREV(&th_ctx->pool_lru_head, struct pool_cache_item *, by_lru);
+		item = LIST_PREV(&ti->pool_lru_head, struct pool_cache_item *, by_lru);
 		/* note: by definition we remove oldest objects so they also are the
 		 * oldest in their own pools, thus their next is the pool's head.
 		 */
@@ -315,7 +252,7 @@ void pool_put_to_cache(struct pool_head *pool, void *ptr)
 	struct pool_cache_head *ph = &pool->cache[tid];
 
 	LIST_INSERT(&ph->list, &item->by_pool);
-	LIST_INSERT(&th_ctx->pool_lru_head, &item->by_lru);
+	LIST_INSERT(&ti->pool_lru_head, &item->by_lru);
 	ph->count++;
 	pool_cache_count++;
 	pool_cache_bytes += pool->size;
@@ -338,7 +275,9 @@ void pool_flush(struct pool_head *pool)
 /* This function might ask the malloc library to trim its buffers. */
 void pool_gc(struct pool_head *pool_ctx)
 {
-	trim_all_pools();
+#if defined(HA_HAVE_MALLOC_TRIM)
+	malloc_trim(0);
+#endif
 }
 
 #else /* CONFIG_HAP_NO_GLOBAL_POOLS */
@@ -400,7 +339,9 @@ void pool_gc(struct pool_head *pool_ctx)
 		}
 	}
 
-	trim_all_pools();
+#if defined(HA_HAVE_MALLOC_TRIM)
+	malloc_trim(0);
+#endif
 
 	if (!isolated)
 		thread_release();
@@ -417,61 +358,12 @@ void pool_flush(struct pool_head *pool)
 /* This function might ask the malloc library to trim its buffers. */
 void pool_gc(struct pool_head *pool_ctx)
 {
-	trim_all_pools();
+#if defined(HA_HAVE_MALLOC_TRIM)
+	malloc_trim(0);
+#endif
 }
 
 #endif /* CONFIG_HAP_POOLS */
-
-
-#ifdef DEBUG_UAF
-
-/************* use-after-free allocator *************/
-
-/* allocates an area of size <size> and returns it. The semantics are similar
- * to those of malloc(). However the allocation is rounded up to 4kB so that a
- * full page is allocated. This ensures the object can be freed alone so that
- * future dereferences are easily detected. The returned object is always
- * 16-bytes aligned to avoid issues with unaligned structure objects. In case
- * some padding is added, the area's start address is copied at the end of the
- * padding to help detect underflows.
- */
-void *pool_alloc_area_uaf(size_t size)
-{
-	size_t pad = (4096 - size) & 0xFF0;
-	void *ret;
-
-	ret = mmap(NULL, (size + 4095) & -4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-	if (ret != MAP_FAILED) {
-		/* let's dereference the page before returning so that the real
-		 * allocation in the system is performed without holding the lock.
-		 */
-		*(int *)ret = 0;
-		if (pad >= sizeof(void *))
-			*(void **)(ret + pad - sizeof(void *)) = ret + pad;
-		ret += pad;
-	} else {
-		ret = NULL;
-	}
-	return ret;
-}
-
-/* frees an area <area> of size <size> allocated by pool_alloc_area(). The
- * semantics are identical to free() except that the size must absolutely match
- * the one passed to pool_alloc_area(). In case some padding is added, the
- * area's start address is compared to the one at the end of the padding, and
- * a segfault is triggered if they don't match, indicating an underflow.
- */
-void pool_free_area_uaf(void *area, size_t size)
-{
-	size_t pad = (4096 - size) & 0xFF0;
-
-	if (pad >= sizeof(void *) && *(void **)(area - sizeof(void *)) != area)
-		ABORT_NOW();
-
-	munmap(area - pad, (size + 4095) & -4096);
-}
-
-#endif /* DEBUG_UAF */
 
 /*
  * This function destroys a pool by freeing it completely, unless it's still
@@ -511,48 +403,23 @@ void dump_pools_to_trash()
 	struct pool_head *entry;
 	unsigned long allocated, used;
 	int nbpools;
-#ifdef CONFIG_HAP_POOLS
-	unsigned long cached_bytes = 0;
-	uint cached = 0;
-#endif
 
 	allocated = used = nbpools = 0;
 	chunk_printf(&trash, "Dumping pools usage. Use SIGQUIT to flush them.\n");
 	list_for_each_entry(entry, &pools, list) {
-#ifdef CONFIG_HAP_POOLS
-		int i;
-		for (cached = i = 0; i < global.nbthread; i++)
-			cached += entry->cache[i].count;
-		cached_bytes += cached * entry->size;
-#endif
-		chunk_appendf(&trash, "  - Pool %s (%u bytes) : %u allocated (%u bytes), %u used"
-#ifdef CONFIG_HAP_POOLS
-			      " (~%u by thread caches)"
-#endif
-			      ", needed_avg %u, %u failures, %u users, @%p%s\n",
-		              entry->name, entry->size, entry->allocated,
-		              entry->size * entry->allocated, entry->used,
-#ifdef CONFIG_HAP_POOLS
-		              cached,
-#endif
-		              swrate_avg(entry->needed_avg, POOL_AVG_SAMPLES), entry->failed,
-		              entry->users, entry,
-		              (entry->flags & MEM_F_SHARED) ? " [SHARED]" : "");
+		chunk_appendf(&trash, "  - Pool %s (%u bytes) : %u allocated (%u bytes), %u used, needed_avg %u, %u failures, %u users, @%p%s\n",
+			 entry->name, entry->size, entry->allocated,
+		         entry->size * entry->allocated, entry->used,
+		         swrate_avg(entry->needed_avg, POOL_AVG_SAMPLES), entry->failed,
+			 entry->users, entry,
+			 (entry->flags & MEM_F_SHARED) ? " [SHARED]" : "");
 
 		allocated += entry->allocated * entry->size;
 		used += entry->used * entry->size;
 		nbpools++;
 	}
-	chunk_appendf(&trash, "Total: %d pools, %lu bytes allocated, %lu used"
-#ifdef CONFIG_HAP_POOLS
-		      " (~%lu by thread caches)"
-#endif
-		      ".\n",
-	              nbpools, allocated, used
-#ifdef CONFIG_HAP_POOLS
-	              , cached_bytes
-#endif
-		      );
+	chunk_appendf(&trash, "Total: %d pools, %lu bytes allocated, %lu used.\n",
+		 nbpools, allocated, used);
 }
 
 /* Dump statistics on pools usage. */
@@ -632,24 +499,12 @@ static void init_pools()
 	int thr;
 
 	for (thr = 0; thr < MAX_THREADS; thr++) {
-		LIST_INIT(&ha_thread_ctx[thr].pool_lru_head);
+		LIST_INIT(&ha_thread_info[thr].pool_lru_head);
 	}
 #endif
-	detect_allocator();
 }
 
 INITCALL0(STG_PREPARE, init_pools);
-
-/* Report in build options if trim is supported */
-static void pools_register_build_options(void)
-{
-	if (is_trim_enabled()) {
-		char *ptr = NULL;
-		memprintf(&ptr, "Support for malloc_trim() is enabled.");
-		hap_register_build_opts(ptr, 1);
-	}
-}
-INITCALL0(STG_REGISTER, pools_register_build_options);
 
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{

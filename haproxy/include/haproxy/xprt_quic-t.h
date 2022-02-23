@@ -29,7 +29,6 @@
 #include <sys/socket.h>
 #include <openssl/ssl.h>
 
-#include <haproxy/cbuf-t.h>
 #include <haproxy/list.h>
 
 #include <haproxy/quic_cc-t.h>
@@ -38,19 +37,16 @@
 #include <haproxy/quic_loss-t.h>
 #include <haproxy/task.h>
 
-#include <import/ebtree-t.h>
-
-typedef unsigned long long ull;
+#include <import/eb64tree.h>
+#include <import/ebmbtree.h>
 
 #define QUIC_PROTOCOL_VERSION_DRAFT_28   0xff00001c /* draft-28 */
-#define QUIC_PROTOCOL_VERSION_DRAFT_29   0xff00001d /* draft-29 */
-#define QUIC_PROTOCOL_VERSION_1          0x00000001 /* V1 */
 
 #define QUIC_INITIAL_IPV4_MTU      1252 /* (bytes) */
 #define QUIC_INITIAL_IPV6_MTU      1232
 /* XXX TO DO XXX */
 /* Maximum packet length during handshake */
-#define QUIC_PACKET_MAXLEN     2048
+#define QUIC_PACKET_MAXLEN     QUIC_INITIAL_IPV4_MTU
 
 /* The minimum length of Initial packets. */
 #define QUIC_INITIAL_PACKET_MINLEN 1200
@@ -71,9 +67,9 @@ typedef unsigned long long ull;
 #define QUIC_LONG_PACKET_MINLEN            7
 /*
  * All QUIC packets with short headers are made of at least (in bytes):
- * flags(1), DCID(0..20)
+ * flags(1), DCID length(1), DCID(0..20)
  */
-#define QUIC_SHORT_PACKET_MINLEN           1
+#define QUIC_SHORT_PACKET_MINLEN           2
 /* Byte 0 of QUIC packets. */
 #define QUIC_PACKET_LONG_HEADER_BIT  0x80 /* Long header format if set, short if not. */
 #define QUIC_PACKET_FIXED_BIT        0x40 /* Must always be set for all the headers. */
@@ -152,25 +148,23 @@ enum quic_pkt_type {
 /*
  * Transport level error codes.
  */
-#define QC_ERR_NO_ERROR                     0x00
-#define QC_ERR_INTERNAL_ERROR               0x01
-#define QC_ERR_CONNECTION_REFUSED           0x02
-#define QC_ERR_FLOW_CONTROL_ERROR           0x03
-#define QC_ERR_STREAM_LIMIT_ERROR           0x04
-#define QC_ERR_STREAM_STATE_ERROR           0x05
-#define QC_ERR_FINAL_SIZE_ERROR             0x06
-#define QC_ERR_FRAME_ENCODING_ERROR         0x07
-#define QC_ERR_TRANSPORT_PARAMETER_ERROR    0x08
-#define QC_ERR_CONNECTION_ID_LIMIT_ERROR    0x09
-#define QC_ERR_PROTOCOL_VIOLATION           0x0a
-#define QC_ERR_INVALID_TOKEN                0x0b
-#define QC_ERR_APPLICATION_ERROR            0x0c
-#define QC_ERR_CRYPTO_BUFFER_EXCEEDED       0x0d
-#define QC_ERR_KEY_UPDATE_ERROR             0x0e
-#define QC_ERR_AEAD_LIMIT_REACHED           0x0f
-#define QC_ERR_NO_VIABLE_PATH               0x10
-/* 256 TLS reserved errors 0x100-0x1ff. */
-#define QC_ERR_CRYPTO_ERROR                0x100
+#define NO_ERROR                     0x00
+#define INTERNAL_ERROR               0x01
+#define CONNECTION_REFUSED_ERROR     0x02
+#define FLOW_CONTROL_ERROR           0x03
+#define STREAM_LIMIT_ERROR           0x04
+#define STREAM_STATE_ERROR           0x05
+#define FINAL_SIZE_ERROR             0x06
+#define FRAME_ENCODING_ERROR         0x07
+#define TRANSPORT_PARAMETER_ERROR    0x08
+#define CONNECTION_ID_LIMIT_ERROR    0x09
+#define PROTOCOL_VIOLATION           0x0a
+#define INVALID_TOKEN                0x0b
+#define APPLICATION_ERROR            0x0c
+#define CRYPTO_BUFFER_EXCEEDED       0x0d
+
+/* XXX TODO: check/complete this remaining part (256 crypto reserved errors). */
+#define CRYPTO_ERROR                0x100
 
 /* The maximum number of QUIC packets stored by the fd I/O handler by QUIC
  * connection. Must be a power of two.
@@ -216,8 +210,6 @@ enum quic_pkt_type {
 #define           QUIC_EV_CONN_PTIMER    (1ULL << 34)
 #define           QUIC_EV_CONN_SPTO      (1ULL << 35)
 #define           QUIC_EV_CONN_BCFRMS    (1ULL << 36)
-#define           QUIC_EV_CONN_XPRTSEND  (1ULL << 37)
-#define           QUIC_EV_CONN_XPRTRECV  (1ULL << 38)
 
 /* Similar to kernel min()/max() definitions. */
 #define QUIC_MIN(a, b) ({ \
@@ -232,19 +224,10 @@ enum quic_pkt_type {
     (void) (&_a == &_b);  \
     _a > _b ? _a : _b; })
 
-/* Size of the internal buffer of QUIC TX ring buffers (must be a power of 2) */
-#define QUIC_TX_RING_BUFSZ  (1UL << 12)
-/* Size of the internal buffer of QUIC RX buffer. */
-#define QUIC_RX_BUFSZ  (1UL << 18)
-/* Size of the QUIC RX buffer for the connections */
-#define QUIC_CONN_RX_BUFSZ (1UL << 13)
-
 extern struct trace_source trace_quic;
-extern struct pool_head *pool_head_quic_tx_ring;
-extern struct pool_head *pool_head_quic_rxbuf;
 extern struct pool_head *pool_head_quic_rx_packet;
 extern struct pool_head *pool_head_quic_tx_packet;
-extern struct pool_head *pool_head_quic_frame;
+extern struct pool_head *pool_head_quic_tx_frm;
 
 /*
  * This struct is used by ebmb_node structs as last member of flexible arrays.
@@ -273,17 +256,16 @@ struct preferred_address {
 	uint8_t stateless_reset_token[QUIC_STATELESS_RESET_TOKEN_LEN];
 };
 
-/* Default values for the absent transport parameters */
-#define QUIC_DFLT_MAX_UDP_PAYLOAD_SIZE   65527 /* bytes */
-#define QUIC_DFLT_ACK_DELAY_COMPONENT        3 /* milliseconds */
-#define QUIC_DFLT_MAX_ACK_DELAY             25 /* milliseconds */
-#define QUIC_ACTIVE_CONNECTION_ID_LIMIT      2 /* number of connections */
+/* Default values for some of transport parameters */
+#define QUIC_DFLT_MAX_PACKET_SIZE     65527
+#define QUIC_DFLT_ACK_DELAY_COMPONENT     3 /* milliseconds */
+#define QUIC_DFLT_MAX_ACK_DELAY          25 /* milliseconds */
 
 /* Types of QUIC transport parameters */
 #define QUIC_TP_ORIGINAL_DESTINATION_CONNECTION_ID   0
-#define QUIC_TP_MAX_IDLE_TIMEOUT                     1
+#define QUIC_TP_IDLE_TIMEOUT                         1
 #define QUIC_TP_STATELESS_RESET_TOKEN                2
-#define QUIC_TP_MAX_UDP_PAYLOAD_SIZE                 3
+#define QUIC_TP_MAX_PACKET_SIZE                      3
 #define QUIC_TP_INITIAL_MAX_DATA                     4
 #define QUIC_TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL   5
 #define QUIC_TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE  6
@@ -311,16 +293,16 @@ struct preferred_address {
  * Note that forbidden parameters sent by clients MUST generate TRANSPORT_PARAMETER_ERROR errors.
  */
 struct quic_transport_params {
-	uint64_t max_idle_timeout;
-	uint64_t max_udp_payload_size;                 /* Default: 65527 bytes (max of UDP payload for IPv6) */
+	uint64_t idle_timeout;
+	uint64_t max_packet_size;                                      /* Default: 65527 (max of UDP payload for IPv6) */
 	uint64_t initial_max_data;
 	uint64_t initial_max_stream_data_bidi_local;
 	uint64_t initial_max_stream_data_bidi_remote;
 	uint64_t initial_max_stream_data_uni;
 	uint64_t initial_max_streams_bidi;
 	uint64_t initial_max_streams_uni;
-	uint64_t ack_delay_exponent;                   /* Default: 3, max: 20 */
-	uint64_t max_ack_delay;                        /* Default: 3ms, max: 2^14ms*/
+	uint64_t ack_delay_exponent;                                   /* Default: 3, max: 20 */
+	uint64_t max_ack_delay;                                        /* Default: 3ms, max: 2^14ms*/
 	uint64_t active_connection_id_limit;
 
 	/* Booleans */
@@ -365,9 +347,9 @@ struct quic_arngs {
 	size_t enc_sz;
 };
 
-/* Flag the packet number space as having received an ACK frame */
-#define QUIC_FL_PKTNS_ACK_RECEIVED_BIT 0
-#define QUIC_FL_PKTNS_ACK_RECEIVED  (1UL << QUIC_FL_PKTNS_ACK_RECEIVED_BIT)
+/* Flag the packet number space as requiring an ACK frame to be sent. */
+#define QUIC_FL_PKTNS_ACK_REQUIRED  (1UL << 0)
+#define QUIC_FL_PKTNS_ACK_RECEIVED  (1UL << 1)
 
 /* The maximum number of dgrams which may be sent upon PTO expirations. */
 #define QUIC_MAX_NB_PTO_DGRAMS         2
@@ -376,7 +358,7 @@ struct quic_arngs {
 struct quic_pktns {
 	struct {
 		/* List of frames to send. */
-		struct mt_list frms;
+		struct list frms;
 		/* Next packet number to use for transmissions. */
 		int64_t next_pn;
 		/* Largest acked sent packet. */
@@ -395,6 +377,8 @@ struct quic_pktns {
 	struct {
 		/* Largest packet number */
 		int64_t largest_pn;
+		/* Number of ack-eliciting packets. */
+		size_t nb_ack_eliciting;
 		struct quic_arngs arngs;
 	} rx;
 	unsigned int flags;
@@ -410,9 +394,8 @@ extern struct quic_transport_params quic_dflt_transport_params;
 #define QUIC_FL_RX_PACKET_ACK_ELICITING (1UL << 0)
 
 struct quic_rx_packet {
-	struct mt_list list;
-	struct mt_list rx_list;
-	struct list qc_rx_pkt_list;
+	struct list list;
+	struct list rx_list;
 	struct quic_conn *qc;
 	unsigned char type;
 	uint32_t version;
@@ -428,11 +411,9 @@ struct quic_rx_packet {
 	uint64_t token_len;
 	/* Packet length */
 	uint64_t len;
-	/* Packet length before decryption */
-	uint64_t raw_len;
 	/* Additional authenticated data length */
 	size_t aad_len;
-	unsigned char *data;
+	unsigned char data[QUIC_PACKET_MAXLEN];
 	struct eb64_node pn_node;
 	volatile unsigned int refcnt;
 	/* Source address of this packet. */
@@ -464,14 +445,6 @@ struct quic_rx_crypto_frm {
 	struct quic_rx_packet *pkt;
 };
 
-/* Structure to store information about RX STREAM frames. */
-struct quic_rx_strm_frm {
-	struct eb64_node offset_node;
-	uint64_t len;
-	const unsigned char *data;
-	struct quic_rx_packet *pkt;
-};
-
 /* Flag a sent packet as being an ack-eliciting packet. */
 #define QUIC_FL_TX_PACKET_ACK_ELICITING (1UL << 0)
 /* Flag a sent packet as containing a PADDING frame. */
@@ -483,8 +456,6 @@ struct quic_rx_strm_frm {
 struct quic_tx_packet {
 	/* List entry point. */
 	struct list list;
-	/* Packet length */
-	size_t len;
 	/* This is not the packet length but the length of outstanding data
 	 * for in flight TX packet.
 	 */
@@ -500,12 +471,18 @@ struct quic_tx_packet {
 	struct quic_pktns *pktns;
 	/* Flags. */
 	unsigned int flags;
-	/* Reference counter */
-	int refcnt;
-	/* Next packet in the same datagram */
-	struct quic_tx_packet *next;
-	unsigned char type;
 };
+
+/* Structure to stora enough information about the TX frames. */
+struct quic_tx_frm {
+	struct list list;
+	unsigned char type;
+	union {
+		struct quic_crypto crypto;
+		struct quic_new_connection_id new_connection_id;
+	};
+};
+
 
 #define QUIC_CRYPTO_BUF_SHIFT  10
 #define QUIC_CRYPTO_BUF_MASK   ((1UL << QUIC_CRYPTO_BUF_SHIFT) - 1)
@@ -545,14 +522,12 @@ struct quic_enc_level {
 		/* The packets received by the listener I/O handler
 		   with header protection removed. */
 		struct eb_root pkts;
-		/* <pkts> root must be protected from concurrent accesses */
-		__decl_thread(HA_RWLOCK_T pkts_rwlock);
 		/* Liste of QUIC packets with protected header. */
-		struct mt_list pqpkts;
+		struct list pqpkts;
 		/* Crypto frames */
 		struct {
 			uint64_t offset;
-			struct eb_root frms;
+			struct eb_root frms; /* XXX TO CHECK XXX */
 		} crypto;
 	} rx;
 	struct {
@@ -589,34 +564,15 @@ struct quic_path {
 	uint64_t ifae_pkts;
 };
 
-/* QUIC ring buffer */
-struct qring {
-	struct cbuf *cbuf;
-	struct mt_list mt_list;
-};
-
-/* QUIC RX buffer */
-struct rxbuf {
-	struct buffer buf;
-	struct mt_list mt_list;
-};
-
 /* The number of buffers for outgoing packets (must be a power of two). */
 #define QUIC_CONN_TX_BUFS_NB 8
 #define QUIC_CONN_TX_BUF_SZ  QUIC_PACKET_MAXLEN
 
-/* Flag the packet number space as requiring an ACK frame to be sent. */
-#define QUIC_FL_PKTNS_ACK_REQUIRED_BIT 0
-#define QUIC_FL_PKTNS_ACK_REQUIRED  (1UL << QUIC_FL_PKTNS_ACK_REQUIRED_BIT)
-
-#define QUIC_FL_CONN_ANTI_AMPLIFICATION_REACHED (1UL << 1)
 struct quic_conn {
 	uint32_t version;
-	/* QUIC transport parameters TLS extension */
-	int tps_tls_ext;
 
-	int state;
-	uint64_t err;
+	/* Transport parameters. */
+	struct quic_transport_params params;
 	unsigned char enc_params[QUIC_TP_MAX_ENCLEN]; /* encoded QUIC transport parameters */
 	size_t enc_params_len;
 
@@ -633,6 +589,9 @@ struct quic_conn {
 	struct eb_root cids;
 
 	struct quic_enc_level els[QUIC_TLS_ENC_LEVEL_MAX];
+
+	struct quic_transport_params rx_tps;
+
 	struct quic_pktns pktns[QUIC_TLS_PKTNS_MAX];
 
 	/* Used only to reach the tasklet for the I/O handler from this quic_conn object. */
@@ -647,6 +606,8 @@ struct quic_conn {
 		/* The remaining frames to send. */
 		struct list frms_to_send;
 
+		/* Array of buffers. */
+		struct q_buf **bufs;
 		/* The size of the previous array. */
 		size_t nb_buf;
 		/* Writer index. */
@@ -655,40 +616,21 @@ struct quic_conn {
 		int rbuf;
 		/* Number of sent bytes. */
 		uint64_t bytes;
-		/* Number of bytes for prepared packets */
-		uint64_t prep_bytes;
 		/* The number of datagrams which may be sent
 		 * when sending probe packets.
 		 */
 		int nb_pto_dgrams;
-		/* Transport parameters sent by the peer */
-		struct quic_transport_params params;
-		/* A pointer to a list of TX ring buffers */
-		struct mt_list *qring_list;
 	} tx;
 	struct {
 		/* Number of received bytes. */
 		uint64_t bytes;
-		/* Number of ack-eliciting received packets. */
-		size_t nb_ack_eliciting;
-		/* Transport parameters the peer will receive */
-		struct quic_transport_params params;
-		/* RX buffer */
-		struct buffer buf;
-		/* RX buffer read/write lock */
-		__decl_thread(HA_RWLOCK_T buf_rwlock);
-		struct list pkt_list;
 	} rx;
 	unsigned int max_ack_delay;
 	struct quic_path paths[1];
 	struct quic_path *path;
 
-	struct listener *li; /* only valid for frontend connections */
-	/* MUX */
-	struct qcc *qcc;
 	struct task *timer_task;
 	unsigned int timer;
-	unsigned int flags;
 };
 
 #endif /* USE_QUIC */

@@ -18,6 +18,7 @@
 
 #include <import/mjson.h>
 #include <import/sha1.h>
+#include <import/xxhash.h>
 
 #include <haproxy/api.h>
 #include <haproxy/arg.h>
@@ -25,7 +26,6 @@
 #include <haproxy/base64.h>
 #include <haproxy/buf.h>
 #include <haproxy/chunk.h>
-#include <haproxy/clock.h>
 #include <haproxy/errors.h>
 #include <haproxy/fix.h>
 #include <haproxy/global.h>
@@ -43,8 +43,6 @@
 #include <haproxy/tools.h>
 #include <haproxy/uri_auth-t.h>
 #include <haproxy/vars.h>
-#include <haproxy/xxhash.h>
-#include <haproxy/jwt.h>
 
 /* sample type names */
 const char *smp_to_type[SMP_TYPES] = {
@@ -863,9 +861,7 @@ sample_cast_fct sample_casts[SMP_TYPES][SMP_TYPES] = {
  * Parse a sample expression configuration:
  *        fetch keyword followed by format conversion keywords.
  * Returns a pointer on allocated sample expression structure.
- * <al> is an arg_list serving as a list head to report missing dependencies.
- * It may be NULL if such dependencies are not allowed. Otherwise, the caller
- * must have set al->ctx if al is set.
+ * The caller must have set al->ctx.
  * If <endptr> is non-nul, it will be set to the first unparsed character
  * (which may be the final '\0') on success. If it is nul, the expression
  * must be properly terminated by a '\0' otherwise an error is reported.
@@ -924,10 +920,8 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 	 * this allows it to automatically create entries for mandatory
 	 * implicit arguments (eg: local proxy name).
 	 */
-	if (al) {
-		al->kw = expr->fetch->kw;
-		al->conv = NULL;
-	}
+	al->kw = expr->fetch->kw;
+	al->conv = NULL;
 	if (make_arg_list(endw, -1, fetch->arg_mask, &expr->arg_p, err_msg, &endt, &err_arg, al) < 0) {
 		memprintf(err_msg, "fetch method '%s' : %s", fkw, *err_msg);
 		goto out_error;
@@ -1027,10 +1021,8 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		LIST_APPEND(&(expr->conv_exprs), &(conv_expr->list));
 		conv_expr->conv = conv;
 
-		if (al) {
-			al->kw = expr->fetch->kw;
-			al->conv = conv_expr->conv->kw;
-		}
+		al->kw = expr->fetch->kw;
+		al->conv = conv_expr->conv->kw;
 		argcnt = make_arg_list(endw, -1, conv->arg_mask, &conv_expr->arg_p, err_msg, &endt, &err_arg, al);
 		if (argcnt < 0) {
 			memprintf(err_msg, "invalid arg %d in converter '%s' : %s", err_arg+1, ckw, *err_msg);
@@ -1217,16 +1209,8 @@ int smp_resolve_args(struct proxy *p, char **err)
 					break;
 				}
 			}
-			else {
-				if (px->cap & PR_CAP_DEF) {
-					memprintf(err, "%sparsing [%s:%d]: backend name must be set in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-						  *err ? *err : "", cur->file, cur->line,
-						  cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
-					cfgerr++;
-					break;
-				}
+			else
 				sname = arg->data.str.area;
-			}
 
 			srv = findserver(px, sname);
 			if (!srv) {
@@ -1301,16 +1285,8 @@ int smp_resolve_args(struct proxy *p, char **err)
 		case ARGT_TAB:
 			if (arg->data.str.data)
 				stktname = arg->data.str.area;
-			else {
-				if (px->cap & PR_CAP_DEF) {
-					memprintf(err, "%sparsing [%s:%d]: table name must be set in arg %d of %s%s%s%s '%s' %s proxy '%s'.\n",
-						  *err ? *err : "", cur->file, cur->line,
-						  cur->arg_pos + 1, conv_pre, conv_ctx, conv_pos, ctx, cur->kw, where, p->id);
-					cfgerr++;
-					break;
-				}
+			else
 				stktname = px->id;
-			}
 
 			t = stktable_find_by_name(stktname);
 			if (!t) {
@@ -1648,24 +1624,6 @@ static int sample_conv_bin2base64url(const struct arg *arg_p, struct sample *smp
 	return 1;
 }
 
-/* This function returns a sample struct filled with the conversion of variable
- * <var> to sample type <type> (SMP_T_*), via a cast to the target type. If the
- * variable cannot be retrieved or casted, 0 is returned, otherwise 1.
- *
- * Keep in mind that the sample content may be written to a pre-allocated
- * trash chunk as returned by get_trash_chunk().
- */
-int sample_conv_var2smp(const struct var_desc *var, struct sample *smp, int type)
-{
-	if (!vars_get_by_desc(var, smp, NULL))
-		return 0;
-	if (!sample_casts[smp->data.type][type])
-		return 0;
-	if (!sample_casts[smp->data.type][type](smp))
-		return 0;
-	return 1;
-}
-
 static int sample_conv_sha1(const struct arg *arg_p, struct sample *smp, void *private)
 {
 	blk_SHA_CTX ctx;
@@ -1684,6 +1642,92 @@ static int sample_conv_sha1(const struct arg *arg_p, struct sample *smp, void *p
 	return 1;
 }
 
+#ifdef USE_OPENSSL
+static int smp_check_sha2(struct arg *args, struct sample_conv *conv,
+                          const char *file, int line, char **err)
+{
+	if (args[0].type == ARGT_STOP)
+		return 1;
+	if (args[0].type != ARGT_SINT) {
+		memprintf(err, "Invalid type '%s'", arg_type_names[args[0].type]);
+		return 0;
+	}
+
+	switch (args[0].data.sint) {
+		case 224:
+		case 256:
+		case 384:
+		case 512:
+			/* this is okay */
+			return 1;
+		default:
+			memprintf(err, "Unsupported number of bits: '%lld'", args[0].data.sint);
+			return 0;
+	}
+}
+
+static int sample_conv_sha2(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct buffer *trash = get_trash_chunk();
+	int bits = 256;
+	if (arg_p->data.sint)
+		bits = arg_p->data.sint;
+
+	switch (bits) {
+	case 224: {
+		SHA256_CTX ctx;
+
+		memset(&ctx, 0, sizeof(ctx));
+
+		SHA224_Init(&ctx);
+		SHA224_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
+		SHA224_Final((unsigned char *) trash->area, &ctx);
+		trash->data = SHA224_DIGEST_LENGTH;
+		break;
+	}
+	case 256: {
+		SHA256_CTX ctx;
+
+		memset(&ctx, 0, sizeof(ctx));
+
+		SHA256_Init(&ctx);
+		SHA256_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
+		SHA256_Final((unsigned char *) trash->area, &ctx);
+		trash->data = SHA256_DIGEST_LENGTH;
+		break;
+	}
+	case 384: {
+		SHA512_CTX ctx;
+
+		memset(&ctx, 0, sizeof(ctx));
+
+		SHA384_Init(&ctx);
+		SHA384_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
+		SHA384_Final((unsigned char *) trash->area, &ctx);
+		trash->data = SHA384_DIGEST_LENGTH;
+		break;
+	}
+	case 512: {
+		SHA512_CTX ctx;
+
+		memset(&ctx, 0, sizeof(ctx));
+
+		SHA512_Init(&ctx);
+		SHA512_Update(&ctx, smp->data.u.str.area, smp->data.u.str.data);
+		SHA512_Final((unsigned char *) trash->area, &ctx);
+		trash->data = SHA512_DIGEST_LENGTH;
+		break;
+	}
+	default:
+		return 0;
+	}
+
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_BIN;
+	smp->flags &= ~SMP_F_CONST;
+	return 1;
+}
+
 /* This function returns a sample struct filled with an <arg> content.
  * If the <arg> contains a string, it is returned in the sample flagged as
  * SMP_F_CONST. If the <arg> contains a variable descriptor, the sample is
@@ -1694,7 +1738,7 @@ static int sample_conv_sha1(const struct arg *arg_p, struct sample *smp, void *p
  *
  * This function returns 0 if an error occurs, otherwise it returns 1.
  */
-int sample_conv_var2smp_str(const struct arg *arg, struct sample *smp)
+static inline int sample_conv_var2smp_str(const struct arg *arg, struct sample *smp)
 {
 	switch (arg->type) {
 	case ARGT_STR:
@@ -1703,17 +1747,330 @@ int sample_conv_var2smp_str(const struct arg *arg, struct sample *smp)
 		smp->flags = SMP_F_CONST;
 		return 1;
 	case ARGT_VAR:
-		return sample_conv_var2smp(&arg->data.var, smp, SMP_T_STR);
+		if (!vars_get_by_desc(&arg->data.var, smp, NULL))
+				return 0;
+		if (!sample_casts[smp->data.type][SMP_T_STR])
+				return 0;
+		if (!sample_casts[smp->data.type][SMP_T_STR](smp))
+				return 0;
+		return 1;
 	default:
 		return 0;
 	}
 }
 
+/* This function checks an <arg> and fills it with a variable type if the
+ * <arg> string contains a valid variable name. If failed, the function
+ * tries to perform a base64 decode operation on the same string, and
+ * fills the <arg> with the decoded content.
+ *
+ * Validation is skipped if the <arg> string is empty.
+ *
+ * This function returns 0 if the variable lookup fails and the specified
+ * <arg> string is not a valid base64 encoded string, as well if
+ * unexpected argument type is specified or memory allocation error
+ * occurs. Otherwise it returns 1.
+ */
+static inline int sample_check_arg_base64(struct arg *arg, char **err)
+{
+	char *dec = NULL;
+	int dec_size;
+
+	if (arg->type != ARGT_STR) {
+		memprintf(err, "unexpected argument type");
+		return 0;
+	}
+
+	if (arg->data.str.data == 0) /* empty */
+		return 1;
+
+	if (vars_check_arg(arg, NULL))
+		return 1;
+
+	if (arg->data.str.data % 4) {
+		memprintf(err, "argument needs to be base64 encoded, and "
+		               "can either be a string or a variable");
+		return 0;
+	}
+
+	dec_size = (arg->data.str.data / 4 * 3)
+	           - (arg->data.str.area[arg->data.str.data-1] == '=' ? 1 : 0)
+	           - (arg->data.str.area[arg->data.str.data-2] == '=' ? 1 : 0);
+
+	if ((dec = malloc(dec_size)) == NULL) {
+		memprintf(err, "memory allocation error");
+		return 0;
+	}
+
+	dec_size = base64dec(arg->data.str.area, arg->data.str.data, dec, dec_size);
+	if (dec_size < 0) {
+		memprintf(err, "argument needs to be base64 encoded, and "
+		               "can either be a string or a variable");
+		free(dec);
+		return 0;
+	}
+
+	/* base64 decoded */
+	chunk_destroy(&arg->data.str);
+	arg->data.str.area = dec;
+	arg->data.str.data = dec_size;
+	return 1;
+}
+
+#ifdef EVP_CIPH_GCM_MODE
+static int check_aes_gcm(struct arg *args, struct sample_conv *conv,
+						  const char *file, int line, char **err)
+{
+	switch(args[0].data.sint) {
+	case 128:
+	case 192:
+	case 256:
+		break;
+	default:
+		memprintf(err, "key size must be 128, 192 or 256 (bits).");
+		return 0;
+	}
+
+	/* Try to decode variables. */
+	if (!sample_check_arg_base64(&args[1], err)) {
+		memprintf(err, "failed to parse nonce : %s", *err);
+		return 0;
+	}
+	if (!sample_check_arg_base64(&args[2], err)) {
+		memprintf(err, "failed to parse key : %s", *err);
+		return 0;
+	}
+	if (!sample_check_arg_base64(&args[3], err)) {
+		memprintf(err, "failed to parse aead_tag : %s", *err);
+		return 0;
+	}
+
+	return 1;
+}
+
+/* Arguments: AES size in bits, nonce, key, tag. The last three arguments are base64 encoded */
+static int sample_conv_aes_gcm_dec(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct sample nonce, key, aead_tag;
+	struct buffer *smp_trash = NULL, *smp_trash_alloc = NULL;
+	EVP_CIPHER_CTX *ctx;
+	int dec_size, ret;
+
+	smp_trash_alloc = alloc_trash_chunk();
+	if (!smp_trash_alloc)
+		return 0;
+
+	/* smp copy */
+	smp_trash_alloc->data = smp->data.u.str.data;
+	if (unlikely(smp_trash_alloc->data > smp_trash_alloc->size))
+		smp_trash_alloc->data = smp_trash_alloc->size;
+	memcpy(smp_trash_alloc->area, smp->data.u.str.area, smp_trash_alloc->data);
+
+	ctx = EVP_CIPHER_CTX_new();
+
+	if (!ctx)
+		goto err;
+
+	smp_trash = alloc_trash_chunk();
+	if (!smp_trash)
+		goto err;
+
+	smp_set_owner(&nonce, smp->px, smp->sess, smp->strm, smp->opt);
+	if (!sample_conv_var2smp_str(&arg_p[1], &nonce))
+		goto err;
+
+	if (arg_p[1].type == ARGT_VAR) {
+		dec_size = base64dec(nonce.data.u.str.area, nonce.data.u.str.data, smp_trash->area, smp_trash->size);
+		if (dec_size < 0)
+			goto err;
+		smp_trash->data = dec_size;
+		nonce.data.u.str = *smp_trash;
+	}
+
+	/* Set cipher type and mode */
+	switch(arg_p[0].data.sint) {
+	case 128:
+		EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL);
+		break;
+	case 192:
+		EVP_DecryptInit_ex(ctx, EVP_aes_192_gcm(), NULL, NULL, NULL);
+		break;
+	case 256:
+		EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
+		break;
+	}
+
+	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, nonce.data.u.str.data, NULL);
+
+	/* Initialise IV */
+	if(!EVP_DecryptInit_ex(ctx, NULL, NULL, NULL, (unsigned char *) nonce.data.u.str.area))
+		goto err;
+
+	smp_set_owner(&key, smp->px, smp->sess, smp->strm, smp->opt);
+	if (!sample_conv_var2smp_str(&arg_p[2], &key))
+		goto err;
+
+	if (arg_p[2].type == ARGT_VAR) {
+		dec_size = base64dec(key.data.u.str.area, key.data.u.str.data, smp_trash->area, smp_trash->size);
+		if (dec_size < 0)
+			goto err;
+		smp_trash->data = dec_size;
+		key.data.u.str = *smp_trash;
+	}
+
+	/* Initialise key */
+	if (!EVP_DecryptInit_ex(ctx, NULL, NULL, (unsigned char *) key.data.u.str.area, NULL))
+		goto err;
+
+	if (!EVP_DecryptUpdate(ctx, (unsigned char *) smp_trash->area, (int *) &smp_trash->data,
+	                       (unsigned char *) smp_trash_alloc->area, (int) smp_trash_alloc->data))
+		goto err;
+
+	smp_set_owner(&aead_tag, smp->px, smp->sess, smp->strm, smp->opt);
+	if (!sample_conv_var2smp_str(&arg_p[3], &aead_tag))
+		goto err;
+
+	if (arg_p[3].type == ARGT_VAR) {
+		dec_size = base64dec(aead_tag.data.u.str.area, aead_tag.data.u.str.data, smp_trash_alloc->area, smp_trash_alloc->size);
+		if (dec_size < 0)
+			goto err;
+		smp_trash_alloc->data = dec_size;
+		aead_tag.data.u.str = *smp_trash_alloc;
+	}
+
+	dec_size = smp_trash->data;
+
+	EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, aead_tag.data.u.str.data, (void *) aead_tag.data.u.str.area);
+	ret = EVP_DecryptFinal_ex(ctx, (unsigned char *) smp_trash->area + smp_trash->data, (int *) &smp_trash->data);
+
+	if (ret <= 0)
+		goto err;
+
+	smp->data.u.str.data = dec_size + smp_trash->data;
+	smp->data.u.str.area = smp_trash->area;
+	smp->data.type = SMP_T_BIN;
+	smp_dup(smp);
+	free_trash_chunk(smp_trash_alloc);
+	free_trash_chunk(smp_trash);
+	return 1;
+
+err:
+	free_trash_chunk(smp_trash_alloc);
+	free_trash_chunk(smp_trash);
+	return 0;
+}
+#endif
+
+static int check_crypto_digest(struct arg *args, struct sample_conv *conv,
+						  const char *file, int line, char **err)
+{
+	const EVP_MD *evp = EVP_get_digestbyname(args[0].data.str.area);
+
+	if (evp)
+		return 1;
+
+	memprintf(err, "algorithm must be a valid OpenSSL message digest name.");
+	return 0;
+}
+
+static int sample_conv_crypto_digest(const struct arg *args, struct sample *smp, void *private)
+{
+	struct buffer *trash = get_trash_chunk();
+	unsigned char *md = (unsigned char*) trash->area;
+	unsigned int md_len = trash->size;
+	EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+	const EVP_MD *evp = EVP_get_digestbyname(args[0].data.str.area);
+
+	if (!ctx)
+		return 0;
+
+	if (!EVP_DigestInit_ex(ctx, evp, NULL) ||
+	    !EVP_DigestUpdate(ctx, smp->data.u.str.area, smp->data.u.str.data) ||
+	    !EVP_DigestFinal_ex(ctx, md, &md_len)) {
+		EVP_MD_CTX_free(ctx);
+		return 0;
+	}
+
+	EVP_MD_CTX_free(ctx);
+
+	trash->data = md_len;
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_BIN;
+	smp->flags &= ~SMP_F_CONST;
+	return 1;
+}
+
+static int check_crypto_hmac(struct arg *args, struct sample_conv *conv,
+						  const char *file, int line, char **err)
+{
+	if (!check_crypto_digest(args, conv, file, line, err))
+		return 0;
+
+	if (!sample_check_arg_base64(&args[1], err)) {
+		memprintf(err, "failed to parse key : %s", *err);
+		return 0;
+	}
+
+	return 1;
+}
+
+static int sample_conv_crypto_hmac(const struct arg *args, struct sample *smp, void *private)
+{
+	struct sample key;
+	struct buffer *trash = NULL, *key_trash = NULL;
+	unsigned char *md;
+	unsigned int md_len;
+	const EVP_MD *evp = EVP_get_digestbyname(args[0].data.str.area);
+	int dec_size;
+
+	smp_set_owner(&key, smp->px, smp->sess, smp->strm, smp->opt);
+	if (!sample_conv_var2smp_str(&args[1], &key))
+		return 0;
+
+	if (args[1].type == ARGT_VAR) {
+		key_trash = alloc_trash_chunk();
+		if (!key_trash)
+			goto err;
+
+		dec_size = base64dec(key.data.u.str.area, key.data.u.str.data, key_trash->area, key_trash->size);
+		if (dec_size < 0)
+			goto err;
+		key_trash->data = dec_size;
+		key.data.u.str = *key_trash;
+	}
+
+	trash = alloc_trash_chunk();
+	if (!trash)
+		goto err;
+
+	md = (unsigned char*) trash->area;
+	md_len = trash->size;
+	if (!HMAC(evp, key.data.u.str.area, key.data.u.str.data, (const unsigned char*) smp->data.u.str.area,
+	          smp->data.u.str.data, md, &md_len))
+		goto err;
+
+	free_trash_chunk(key_trash);
+
+	trash->data = md_len;
+	smp->data.u.str = *trash;
+	smp->data.type = SMP_T_BIN;
+	smp_dup(smp);
+	free_trash_chunk(trash);
+	return 1;
+
+err:
+	free_trash_chunk(key_trash);
+	free_trash_chunk(trash);
+	return 0;
+}
+
+#endif /* USE_OPENSSL */
+
 static int sample_conv_be2dec_check(struct arg *args, struct sample_conv *conv,
                                     const char *file, int line, char **err)
 {
 	if (args[1].data.sint <= 0 || args[1].data.sint > sizeof(unsigned long long)) {
-		memprintf(err, "chunk_size out of [1..%u] range (%lld)", (uint)sizeof(unsigned long long), args[1].data.sint);
+		memprintf(err, "chunk_size out of [1..%ld] range (%lld)", sizeof(unsigned long long), args[1].data.sint);
 		return 0;
 	}
 
@@ -2625,7 +2982,7 @@ static int check_operator(struct arg *args, struct sample_conv *conv,
  *
  * This function returns 0 if an error occurs, otherwise it returns 1.
  */
-int sample_conv_var2smp_sint(const struct arg *arg, struct sample *smp)
+static inline int sample_conv_var2smp(const struct arg *arg, struct sample *smp)
 {
 	switch (arg->type) {
 	case ARGT_SINT:
@@ -2633,7 +2990,13 @@ int sample_conv_var2smp_sint(const struct arg *arg, struct sample *smp)
 		smp->data.u.sint = arg->data.sint;
 		return 1;
 	case ARGT_VAR:
-		return sample_conv_var2smp(&arg->data.var, smp, SMP_T_SINT);
+		if (!vars_get_by_desc(&arg->data.var, smp, NULL))
+			return 0;
+		if (!sample_casts[smp->data.type][SMP_T_SINT])
+			return 0;
+		if (!sample_casts[smp->data.type][SMP_T_SINT](smp))
+			return 0;
+		return 1;
 	default:
 		return 0;
 	}
@@ -2656,7 +3019,7 @@ static int sample_conv_binary_and(const struct arg *arg_p, struct sample *smp, v
 	struct sample tmp;
 
 	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
-	if (!sample_conv_var2smp_sint(arg_p, &tmp))
+	if (!sample_conv_var2smp(arg_p, &tmp))
 		return 0;
 	smp->data.u.sint &= tmp.data.u.sint;
 	return 1;
@@ -2670,7 +3033,7 @@ static int sample_conv_binary_or(const struct arg *arg_p, struct sample *smp, vo
 	struct sample tmp;
 
 	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
-	if (!sample_conv_var2smp_sint(arg_p, &tmp))
+	if (!sample_conv_var2smp(arg_p, &tmp))
 		return 0;
 	smp->data.u.sint |= tmp.data.u.sint;
 	return 1;
@@ -2684,7 +3047,7 @@ static int sample_conv_binary_xor(const struct arg *arg_p, struct sample *smp, v
 	struct sample tmp;
 
 	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
-	if (!sample_conv_var2smp_sint(arg_p, &tmp))
+	if (!sample_conv_var2smp(arg_p, &tmp))
 		return 0;
 	smp->data.u.sint ^= tmp.data.u.sint;
 	return 1;
@@ -2724,7 +3087,7 @@ static int sample_conv_arith_add(const struct arg *arg_p, struct sample *smp, vo
 	struct sample tmp;
 
 	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
-	if (!sample_conv_var2smp_sint(arg_p, &tmp))
+	if (!sample_conv_var2smp(arg_p, &tmp))
 		return 0;
 	smp->data.u.sint = arith_add(smp->data.u.sint, tmp.data.u.sint);
 	return 1;
@@ -2739,7 +3102,7 @@ static int sample_conv_arith_sub(const struct arg *arg_p,
 	struct sample tmp;
 
 	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
-	if (!sample_conv_var2smp_sint(arg_p, &tmp))
+	if (!sample_conv_var2smp(arg_p, &tmp))
 		return 0;
 
 	/* We cannot represent -LLONG_MIN because abs(LLONG_MIN) is greater
@@ -2772,7 +3135,7 @@ static int sample_conv_arith_mul(const struct arg *arg_p,
 	long long int c;
 
 	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
-	if (!sample_conv_var2smp_sint(arg_p, &tmp))
+	if (!sample_conv_var2smp(arg_p, &tmp))
 		return 0;
 
 	/* prevent divide by 0 during the check */
@@ -2816,7 +3179,7 @@ static int sample_conv_arith_div(const struct arg *arg_p,
 	struct sample tmp;
 
 	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
-	if (!sample_conv_var2smp_sint(arg_p, &tmp))
+	if (!sample_conv_var2smp(arg_p, &tmp))
 		return 0;
 
 	if (tmp.data.u.sint) {
@@ -2844,7 +3207,7 @@ static int sample_conv_arith_mod(const struct arg *arg_p,
 	struct sample tmp;
 
 	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
-	if (!sample_conv_var2smp_sint(arg_p, &tmp))
+	if (!sample_conv_var2smp(arg_p, &tmp))
 		return 0;
 
 	if (tmp.data.u.sint) {
@@ -3014,8 +3377,9 @@ static int sample_conv_strcmp(const struct arg *arg_p, struct sample *smp, void 
 	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
 	if (arg_p[0].type != ARGT_VAR)
 		return 0;
-
-	if (!sample_conv_var2smp(&arg_p[0].data.var, &tmp, SMP_T_STR))
+	if (!vars_get_by_desc(&arg_p[0].data.var, &tmp, NULL))
+		return 0;
+	if (!sample_casts[tmp.data.type][SMP_T_STR](&tmp))
 		return 0;
 
 	max = MIN(smp->data.u.str.data, tmp.data.u.str.data);
@@ -3035,6 +3399,41 @@ static int sample_conv_strcmp(const struct arg *arg_p, struct sample *smp, void 
 	smp->data.type = SMP_T_SINT;
 	return 1;
 }
+
+#if defined(HAVE_CRYPTO_memcmp)
+/* Compares bytestring with a variable containing a bytestring. Return value
+ * is `true` if both bytestrings are bytewise identical and `false` otherwise.
+ *
+ * Comparison will be performed in constant time if both bytestrings are of
+ * the same length. If the lengths differ execution time will not be constant.
+ */
+static int sample_conv_secure_memcmp(const struct arg *arg_p, struct sample *smp, void *private)
+{
+	struct sample tmp;
+	int result;
+
+	smp_set_owner(&tmp, smp->px, smp->sess, smp->strm, smp->opt);
+	if (arg_p[0].type != ARGT_VAR)
+		return 0;
+	if (!vars_get_by_desc(&arg_p[0].data.var, &tmp, NULL))
+		return 0;
+	if (!sample_casts[tmp.data.type][SMP_T_BIN](&tmp))
+		return 0;
+
+	if (smp->data.u.str.data != tmp.data.u.str.data) {
+		smp->data.u.sint = 0;
+		smp->data.type = SMP_T_BOOL;
+		return 1;
+	}
+
+	/* The following comparison is performed in constant time. */
+	result = CRYPTO_memcmp(smp->data.u.str.area, tmp.data.u.str.area, smp->data.u.str.data);
+
+	smp->data.u.sint = result == 0;
+	smp->data.type = SMP_T_BOOL;
+	return 1;
+}
+#endif
 
 /* Takes a boolean as input. Returns the first argument if that boolean is true and
  * the second argument otherwise.
@@ -3142,7 +3541,7 @@ static int sample_conv_fix_tag_value(const struct arg *arg_p, struct sample *smp
 	value = fix_tag_value(ist2(smp->data.u.str.area, smp->data.u.str.data),
 			      arg_p[0].data.sint);
 	if (!istlen(value)) {
-		if (isttest(value)) {
+		if (!isttest(value)) {
 			/* value != IST_NULL, need more data */
 			smp->flags |= SMP_F_MAY_CHANGE;
 		}
@@ -3328,6 +3727,28 @@ static int smp_check_strcmp(struct arg *args, struct sample_conv *conv,
 	return 0;
 }
 
+#if defined(HAVE_CRYPTO_memcmp)
+/* This function checks the "secure_memcmp" converter's arguments and extracts the
+ * variable name and its scope.
+ */
+static int smp_check_secure_memcmp(struct arg *args, struct sample_conv *conv,
+                           const char *file, int line, char **err)
+{
+	if (!args[0].data.str.data) {
+		memprintf(err, "missing variable name");
+		return 0;
+	}
+
+	/* Try to decode a variable. */
+	if (vars_check_arg(&args[0], NULL))
+		return 1;
+
+	memprintf(err, "failed to register variable name '%s'",
+		  args[0].data.str.area);
+	return 0;
+}
+#endif
+
 /**/
 static int sample_conv_htonl(const struct arg *arg_p, struct sample *smp, void *private)
 {
@@ -3510,146 +3931,6 @@ static int sample_conv_json_query(const struct arg *args, struct sample *smp, vo
 	return 0;
 }
 
-#ifdef USE_OPENSSL
-static int sample_conv_jwt_verify_check(struct arg *args, struct sample_conv *conv,
-					const char *file, int line, char **err)
-{
-	vars_check_arg(&args[0], NULL);
-	vars_check_arg(&args[1], NULL);
-
-	if (args[0].type == ARGT_STR) {
-		enum jwt_alg alg = jwt_parse_alg(args[0].data.str.area, args[0].data.str.data);
-
-		switch(alg) {
-		case JWT_ALG_DEFAULT:
-			memprintf(err, "unknown JWT algorithm: %s", args[0].data.str.area);
-			return 0;
-
-		case JWS_ALG_PS256:
-		case JWS_ALG_PS384:
-		case JWS_ALG_PS512:
-			memprintf(err, "RSASSA-PSS JWS signing not managed yet");
-			return 0;
-
-		default:
-			break;
-		}
-	}
-
-	if (args[1].type == ARGT_STR) {
-		jwt_tree_load_cert(args[1].data.str.area, args[1].data.str.data, err);
-	}
-
-	return 1;
-}
-
-/* Check that a JWT's signature is correct */
-static int sample_conv_jwt_verify(const struct arg *args, struct sample *smp, void *private)
-{
-	struct sample alg_smp, key_smp;
-
-	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = 0;
-
-	smp_set_owner(&alg_smp, smp->px, smp->sess, smp->strm, smp->opt);
-	smp_set_owner(&key_smp, smp->px, smp->sess, smp->strm, smp->opt);
-	if (!sample_conv_var2smp_str(&args[0], &alg_smp))
-		return 0;
-	if (!sample_conv_var2smp_str(&args[1], &key_smp))
-		return 0;
-
-	smp->data.u.sint = jwt_verify(&smp->data.u.str,  &alg_smp.data.u.str,
-				      &key_smp.data.u.str);
-
-	return 1;
-}
-
-
-/*
- * Returns the decoded header or payload of a JWT if no parameter is given, or
- * the value of the specified field of the corresponding JWT subpart if a
- * parameter is given.
- */
-static int sample_conv_jwt_member_query(const struct arg *args, struct sample *smp,
-					void *private, enum jwt_elt member)
-{
-	struct jwt_item items[JWT_ELT_MAX] = { { 0 } };
-	unsigned int item_num = member + 1; /* We don't need to tokenize the full token */
-	struct buffer *decoded_header = get_trash_chunk();
-	int retval = 0;
-	int ret;
-
-	jwt_tokenize(&smp->data.u.str, items, &item_num);
-
-	if (item_num < member + 1)
-		goto end;
-
-	decoded_header = alloc_trash_chunk();
-	if (!decoded_header)
-		goto end;
-
-	ret = base64urldec(items[member].start, items[member].length,
-	                   decoded_header->area, decoded_header->size);
-	if (ret == -1)
-		goto end;
-
-	decoded_header->data = ret;
-	if (args[0].type != ARGT_STR) {
-		smp->data.u.str = *decoded_header;
-		smp->data.type = SMP_T_STR;
-		goto end;
-	}
-
-	/* We look for a specific field of the header or payload part of the JWT */
-	smp->data.u.str = *decoded_header;
-
-	retval = sample_conv_json_query(args, smp, private);
-
-end:
-	return retval;
-}
-
-/* This function checks the "jwt_header_query" and "jwt_payload_query" converters' arguments.
- * It is based on the "json_query" converter's check with the only difference
- * being that the jwt converters can take 0 parameters as well.
- */
-static int sample_conv_jwt_query_check(struct arg *arg, struct sample_conv *conv,
-				       const char *file, int line, char **err)
-{
-	if (arg[1].data.str.data != 0) {
-		if (strcmp(arg[1].data.str.area, "int") != 0) {
-			memprintf(err, "output_type only supports \"int\" as argument");
-			return 0;
-		} else {
-			arg[1].type = ARGT_SINT;
-			arg[1].data.sint = 0;
-		}
-	}
-	return 1;
-}
-
-/*
- * If no parameter is given, return the decoded header part of a JWT (the first
- * base64 encoded part, corresponding to the JOSE header).
- * If a parameter is given, this converter acts as a "json_query" on this
- * decoded JSON.
- */
-static int sample_conv_jwt_header_query(const struct arg *args, struct sample *smp, void *private)
-{
-	return sample_conv_jwt_member_query(args, smp, private, JWT_ELT_JOSE);
-}
-
-/*
- * If no parameter is given, return the decoded payload part of a JWT (the
- * second base64 encoded part, which contains all the claims).  If a parameter
- * is given, this converter acts as a "json_query" on this decoded JSON.
- */
-static int sample_conv_jwt_payload_query(const struct arg *args, struct sample *smp, void *private)
-{
-	return sample_conv_jwt_member_query(args, smp, private, JWT_ELT_CLAIMS);
-}
-
-#endif /* USE_OPENSSL */
 
 /************************************************************************/
 /*       All supported sample fetch functions must be declared here     */
@@ -4120,8 +4401,19 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "word",    sample_conv_word,         ARG3(2,SINT,STR,SINT), sample_conv_field_check,  SMP_T_STR,  SMP_T_STR  },
 	{ "regsub",  sample_conv_regsub,       ARG3(2,REG,STR,STR),   sample_conv_regsub_check, SMP_T_STR,  SMP_T_STR  },
 	{ "sha1",    sample_conv_sha1,         0,                     NULL,                     SMP_T_BIN,  SMP_T_BIN  },
-	{ "concat",  sample_conv_concat,       ARG3(1,STR,STR,STR),   smp_check_concat,         SMP_T_STR,  SMP_T_STR  },
-	{ "strcmp",  sample_conv_strcmp,       ARG1(1,STR),           smp_check_strcmp,         SMP_T_STR,  SMP_T_SINT },
+#ifdef USE_OPENSSL
+	{ "sha2",   sample_conv_sha2,      ARG1(0, SINT), smp_check_sha2, SMP_T_BIN,  SMP_T_BIN  },
+#ifdef EVP_CIPH_GCM_MODE
+	{ "aes_gcm_dec", sample_conv_aes_gcm_dec,   ARG4(4,SINT,STR,STR,STR), check_aes_gcm,       SMP_T_BIN, SMP_T_BIN },
+#endif
+	{ "digest",      sample_conv_crypto_digest, ARG1(1,STR),              check_crypto_digest, SMP_T_BIN, SMP_T_BIN },
+	{ "hmac",        sample_conv_crypto_hmac,   ARG2(2,STR,STR),          check_crypto_hmac,   SMP_T_BIN, SMP_T_BIN },
+#endif
+	{ "concat", sample_conv_concat,    ARG3(1,STR,STR,STR), smp_check_concat, SMP_T_STR,  SMP_T_STR },
+	{ "strcmp", sample_conv_strcmp,    ARG1(1,STR), smp_check_strcmp, SMP_T_STR,  SMP_T_SINT },
+#if defined(HAVE_CRYPTO_memcmp)
+	{ "secure_memcmp", sample_conv_secure_memcmp,    ARG1(1,STR), smp_check_secure_memcmp, SMP_T_BIN,  SMP_T_BOOL },
+#endif
 
 	/* gRPC converters. */
 	{ "ungrpc", sample_conv_ungrpc,    ARG2(1,PBUF_FNUM,STR), sample_conv_protobuf_check, SMP_T_BIN, SMP_T_BIN  },
@@ -4157,13 +4449,6 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "ltrim",    sample_conv_ltrim,    ARG1(1,STR), NULL, SMP_T_STR,  SMP_T_STR  },
 	{ "rtrim",    sample_conv_rtrim,    ARG1(1,STR), NULL, SMP_T_STR,  SMP_T_STR  },
 	{ "json_query", sample_conv_json_query, ARG2(1,STR,STR),  sample_check_json_query , SMP_T_STR, SMP_T_ANY },
-
-#ifdef USE_OPENSSL
-	/* JSON Web Token converters */
-	{ "jwt_header_query",  sample_conv_jwt_header_query,  ARG2(0,STR,STR), sample_conv_jwt_query_check,   SMP_T_BIN, SMP_T_ANY },
-	{ "jwt_payload_query", sample_conv_jwt_payload_query, ARG2(0,STR,STR), sample_conv_jwt_query_check,   SMP_T_BIN, SMP_T_ANY },
-	{ "jwt_verify",        sample_conv_jwt_verify,        ARG2(2,STR,STR), sample_conv_jwt_verify_check,  SMP_T_BIN, SMP_T_SINT },
-#endif
 	{ NULL, NULL, 0, 0, 0 },
 }};
 

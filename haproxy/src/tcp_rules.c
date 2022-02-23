@@ -27,6 +27,7 @@
 #include <haproxy/stream_interface.h>
 #include <haproxy/tcp_rules.h>
 #include <haproxy/ticks.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 #include <haproxy/trace.h>
 
@@ -94,16 +95,12 @@ struct action_kw *tcp_res_cont_action(const char *kw)
  */
 int tcp_inspect_request(struct stream *s, struct channel *req, int an_bit)
 {
-	struct list *def_rules, *rules;
 	struct session *sess = s->sess;
 	struct act_rule *rule;
 	int partial;
 	int act_opts = 0;
 
 	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_TCP_ANA, s);
-
-	def_rules = ((s->be->defpx && (an_bit == AN_REQ_INSPECT_FE || s->be->defpx != sess->fe->defpx)) ? &s->be->defpx->tcp_req.inspect_rules : NULL);
-	rules = &s->be->tcp_req.inspect_rules;
 
 	/* We don't know whether we have enough data, so must proceed
 	 * this way :
@@ -115,8 +112,7 @@ int tcp_inspect_request(struct stream *s, struct channel *req, int an_bit)
 	 * - if one rule returns KO, then return KO
 	 */
 
-	if ((req->flags & (CF_EOI|CF_SHUTR|CF_READ_ERROR)) || channel_full(req, global.tune.maxrewrite) ||
-	    si_rx_blocked_room(chn_prod(req)) ||
+	if ((req->flags & CF_SHUTR) || channel_full(req, global.tune.maxrewrite) ||
 	    !s->be->tcp_req.inspect_delay || tick_is_expired(s->rules_exp, now_ms))
 		partial = SMP_OPT_FINAL;
 	else
@@ -130,13 +126,12 @@ int tcp_inspect_request(struct stream *s, struct channel *req, int an_bit)
 	if (s->current_rule) {
 		rule = s->current_rule;
 		s->current_rule = NULL;
-		if ((def_rules && s->current_rule_list == def_rules) || s->current_rule_list == rules)
+		if (s->current_rule_list == &s->be->tcp_req.inspect_rules)
 			goto resume_execution;
 	}
-	s->current_rule_list = ((!def_rules || s->current_rule_list == def_rules) ? rules : def_rules);
+	s->current_rule_list = &s->be->tcp_req.inspect_rules;
 
-  restart:
-	list_for_each_entry(rule, s->current_rule_list, list) {
+	list_for_each_entry(rule, &s->be->tcp_req.inspect_rules, list) {
 		enum acl_test_res ret = ACL_TEST_PASS;
 
 		if (rule->cond) {
@@ -195,17 +190,11 @@ resume_execution:
 		}
 	}
 
-	if (def_rules && s->current_rule_list == def_rules) {
-		s->current_rule_list = rules;
-		goto restart;
-	}
-
  end:
 	/* if we get there, it means we have no rule which matches, or
 	 * we have an explicit accept, so we apply the default accept.
 	 */
 	req->analysers &= ~an_bit;
-	s->current_rule = s->current_rule_list = NULL;
 	req->analyse_exp = s->rules_exp = TICK_ETERNITY;
 	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_TCP_ANA, s);
 	return 1;
@@ -245,8 +234,6 @@ resume_execution:
 
  abort:
 	req->analysers &= AN_REQ_FLT_END;
-	s->current_rule = s->current_rule_list = NULL;
-	req->analyse_exp = s->rules_exp = TICK_ETERNITY;
 
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_PRXCOND;
@@ -264,16 +251,12 @@ resume_execution:
  */
 int tcp_inspect_response(struct stream *s, struct channel *rep, int an_bit)
 {
-	struct list *def_rules, *rules;
 	struct session *sess = s->sess;
 	struct act_rule *rule;
 	int partial;
 	int act_opts = 0;
 
 	DBG_TRACE_ENTER(STRM_EV_STRM_ANA|STRM_EV_TCP_ANA, s);
-
-	def_rules = (s->be->defpx ? &s->be->defpx->tcp_rep.inspect_rules : NULL);
-	rules = &s->be->tcp_rep.inspect_rules;
 
 	/* We don't know whether we have enough data, so must proceed
 	 * this way :
@@ -284,8 +267,7 @@ int tcp_inspect_response(struct stream *s, struct channel *rep, int an_bit)
 	 * - if one rule returns OK, then return OK
 	 * - if one rule returns KO, then return KO
 	 */
-	if ((rep->flags & (CF_EOI|CF_SHUTR|CF_READ_ERROR)) || channel_full(rep, global.tune.maxrewrite) ||
-	    si_rx_blocked_room(chn_prod(rep)) ||
+	if ((rep->flags & CF_SHUTR) || channel_full(rep, global.tune.maxrewrite) ||
 	    !s->be->tcp_rep.inspect_delay || tick_is_expired(s->rules_exp, now_ms))
 		partial = SMP_OPT_FINAL;
 	else
@@ -299,13 +281,13 @@ int tcp_inspect_response(struct stream *s, struct channel *rep, int an_bit)
 	if (s->current_rule) {
 		rule = s->current_rule;
 		s->current_rule = NULL;
-		if ((def_rules && s->current_rule_list == def_rules) || s->current_rule_list == rules)
+		if (s->current_rule_list == &s->be->tcp_rep.inspect_rules)
 			goto resume_execution;
 	}
-	s->current_rule_list = ((!def_rules || s->current_rule_list == def_rules) ? rules : def_rules);
+	s->current_rule_list = &s->be->tcp_rep.inspect_rules;
+	s->rules_exp = TICK_ETERNITY;
 
-  restart:
-	list_for_each_entry(rule, s->current_rule_list, list) {
+	list_for_each_entry(rule, &s->be->tcp_rep.inspect_rules, list) {
 		enum acl_test_res ret = ACL_TEST_PASS;
 
 		if (rule->cond) {
@@ -371,17 +353,11 @@ resume_execution:
 		}
 	}
 
-	if (def_rules && s->current_rule_list == def_rules) {
-		s->current_rule_list = rules;
-		goto restart;
-	}
-
  end:
 	/* if we get there, it means we have no rule which matches, or
 	 * we have an explicit accept, so we apply the default accept.
 	 */
 	rep->analysers &= ~an_bit;
-	s->current_rule = s->current_rule_list = NULL;
 	rep->analyse_exp = s->rules_exp = TICK_ETERNITY;
 	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_TCP_ANA, s);
 	return 1;
@@ -426,8 +402,6 @@ resume_execution:
 
   abort:
 	rep->analysers &= AN_RES_FLT_END;
-	s->current_rule = s->current_rule_list = NULL;
-	rep->analyse_exp = s->rules_exp = TICK_ETERNITY;
 
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_PRXCOND;
@@ -445,7 +419,6 @@ resume_execution:
  */
 int tcp_exec_l4_rules(struct session *sess)
 {
-	struct proxy *px = sess->fe;
 	struct act_rule *rule;
 	struct connection *conn = objt_conn(sess->origin);
 	int result = 1;
@@ -454,11 +427,7 @@ int tcp_exec_l4_rules(struct session *sess)
 	if (!conn)
 		return result;
 
-	if  (sess->fe->defpx)
-		px = sess->fe->defpx;
-
-  restart:
-	list_for_each_entry(rule, &px->tcp_req.l4_rules, list) {
+	list_for_each_entry(rule, &sess->fe->tcp_req.l4_rules, list) {
 		ret = ACL_TEST_PASS;
 
 		if (rule->cond) {
@@ -526,11 +495,6 @@ int tcp_exec_l4_rules(struct session *sess)
 			}
 		}
 	}
-
-	if (px != sess->fe) {
-		px = sess->fe;
-		goto restart;
-	}
  end:
 	return result;
 }
@@ -544,16 +508,11 @@ int tcp_exec_l4_rules(struct session *sess)
  */
 int tcp_exec_l5_rules(struct session *sess)
 {
-	struct proxy *px = sess->fe;
 	struct act_rule *rule;
 	int result = 1;
 	enum acl_test_res ret;
 
-	if  (sess->fe->defpx)
-		px = sess->fe->defpx;
-
-  restart:
-	list_for_each_entry(rule, &px->tcp_req.l5_rules, list) {
+	list_for_each_entry(rule, &sess->fe->tcp_req.l5_rules, list) {
 		ret = ACL_TEST_PASS;
 
 		if (rule->cond) {
@@ -603,11 +562,6 @@ int tcp_exec_l5_rules(struct session *sess)
 			}
 		}
 	}
-
-	if (px != sess->fe) {
-		px = sess->fe;
-		goto restart;
-	}
   end:
 	return result;
 }
@@ -619,8 +573,8 @@ static int tcp_parse_response_rule(char **args, int arg, int section_type,
                                    unsigned int where,
                                    const char *file, int line)
 {
-	if ((curpx == defpx && strlen(defpx->id) == 0) || !(curpx->cap & PR_CAP_BE)) {
-		memprintf(err, "%s %s is only allowed in 'backend' sections or 'defaults' section with a name",
+	if (curpx == defpx || !(curpx->cap & PR_CAP_BE)) {
+		memprintf(err, "%s %s is only allowed in 'backend' sections",
 		          args[0], args[1]);
 		return -1;
 	}
@@ -787,9 +741,9 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
                                   struct act_rule *rule, char **err,
                                   unsigned int where, const char *file, int line)
 {
-	if (curpx == defpx && strlen(defpx->id) == 0) {
-		memprintf(err, "%s %s is not allowed in anonymous 'defaults' sections",
-			  args[0], args[1]);
+	if (curpx == defpx) {
+		memprintf(err, "%s %s is not allowed in 'defaults' sections",
+		          args[0], args[1]);
 		return -1;
 	}
 
@@ -1076,8 +1030,8 @@ static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
 	}
 
 	if (strcmp(args[1], "inspect-delay") == 0) {
-		if ((curpx == defpx && strlen(defpx->id) == 0) || !(curpx->cap & PR_CAP_BE)) {
-			memprintf(err, "%s %s is only allowed in 'backend' sections or 'defaults' section with a name",
+		if (curpx == defpx || !(curpx->cap & PR_CAP_BE)) {
+			memprintf(err, "%s %s is only allowed in 'backend' sections",
 			          args[0], args[1]);
 			return -1;
 		}
@@ -1105,7 +1059,7 @@ static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
 		return 0;
 	}
 
-	rule = new_act_rule(ACT_F_TCP_RES_CNT, file, line);
+	rule = calloc(1, sizeof(*rule));
 	if (!rule) {
 		memprintf(err, "parsing [%s:%d] : out of memory", file, line);
 		return -1;
@@ -1121,6 +1075,7 @@ static int tcp_parse_tcp_rep(char **args, int section_type, struct proxy *curpx,
 			where |= SMP_VAL_FE_RES_CNT;
 		if (curpx->cap & PR_CAP_BE)
 			where |= SMP_VAL_BE_RES_CNT;
+		rule->from = ACT_F_TCP_RES_CNT;
 		if (tcp_parse_response_rule(args, arg, section_type, curpx, defpx, rule, err, where, file, line) < 0)
 			goto error;
 
@@ -1193,9 +1148,9 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 	}
 
 	if (strcmp(args[1], "inspect-delay") == 0) {
-		if (curpx == defpx && strlen(defpx->id) == 0) {
-			memprintf(err, "%s %s is not allowed in anonymous 'defaults' sections",
-				  args[0], args[1]);
+		if (curpx == defpx) {
+			memprintf(err, "%s %s is not allowed in 'defaults' sections",
+			          args[0], args[1]);
 			return -1;
 		}
 
@@ -1222,7 +1177,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 		return 0;
 	}
 
-	rule = new_act_rule(0, file, line);
+	rule = calloc(1, sizeof(*rule));
 	if (!rule) {
 		memprintf(err, "parsing [%s:%d] : out of memory", file, line);
 		return -1;

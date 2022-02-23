@@ -19,11 +19,8 @@
 #include <ctype.h>
 #include <sys/types.h>
 
-#include <import/ebmbtree.h>
-
-#include <haproxy/api.h>
 #include <haproxy/acl.h>
-#include <haproxy/activity.h>
+#include <haproxy/api.h>
 #include <haproxy/arg.h>
 #include <haproxy/backend.h>
 #include <haproxy/channel.h>
@@ -61,6 +58,17 @@
 
 #define TRACE_SOURCE &trace_strm
 
+///////////////// Begin edits /////////////////
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <netdb.h>
+
+#include <haproxy/blacklist.h>
+#include <haproxy/request.h>
+
+struct Blacklist blacklist;
+////////////////// End edits //////////////////
 int be_lastsession(const struct proxy *be)
 {
 	if (be->be_counters.last_sess)
@@ -526,6 +534,37 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 /* random value  */
 static struct server *get_server_rnd(struct stream *s, const struct server *avoid)
 {
+	///////////////// Begin edits /////////////////
+
+	//keep communicating with server
+	for (int i = 0; i < 5; i++)
+	{		
+		char *message = "Hello";
+		char *server_reply[2000];
+
+		//Send some data
+		if (send(blacklist.sdsock, message, strlen(message), 0) < 0)
+		{
+			puts("Send failed");
+			return 1;
+		}
+		
+		//Receive a reply from the server
+		if (recv(blacklist.sdsock, server_reply, 2000, 0) < 0)
+		{
+			puts("recv failed");
+			break;
+		}
+		
+		puts("Server reply: ");
+		puts(server_reply);
+
+	}
+
+	close(blacklist.sdsock);
+
+	////////////////// End edits //////////////////
+
 	unsigned int hash = 0;
 	struct proxy  *px = s->be;
 	struct server *prev, *curr;
@@ -544,18 +583,18 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 			break;
 
 		/* compare the new server to the previous best choice and pick
-		 * the one with the least currently served requests.
-		 */
+			* the one with the least currently served requests.
+			*/
 		if (prev && prev != curr &&
-		    curr->served * prev->cur_eweight > prev->served * curr->cur_eweight)
+			curr->served * prev->cur_eweight > prev->served * curr->cur_eweight)
 			curr = prev;
 	} while (--draws > 0);
 
 	/* if the selected server is full, pretend we have none so that we reach
-	 * the backend's queue instead.
-	 */
+		* the backend's queue instead.
+		*/
 	if (curr &&
-	    (curr->queue.length || (curr->maxconn && curr->served >= srv_dynamic_maxconn(curr))))
+		(curr->queue.length || (curr->maxconn && curr->served >= srv_dynamic_maxconn(curr))))
 		curr = NULL;
 
 	return curr;
@@ -572,7 +611,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
  * The function tries to keep the original connection slot if it reconnects to
  * the same server, otherwise it releases it and tries to offer it.
  *
- * It is illegal to call this function with a stream in a queue.
+ * It is illegal to call this function with a stream in a// *** Begin changes ***
  *
  * It may return :
  *   SRV_STATUS_OK       if everything is OK. ->srv and ->target are assigned.
@@ -696,18 +735,16 @@ int assign_server(struct stream *s)
 			}
 
 			switch (s->be->lbprm.algo & BE_LB_PARM) {
-				const struct sockaddr_storage *src;
-
 			case BE_LB_HASH_SRC:
-				src = si_src(&s->si[0]);
-				if (src && src->ss_family == AF_INET) {
+				conn = objt_conn(strm_orig(s));
+				if (conn && conn_get_src(conn) && conn->src->ss_family == AF_INET) {
 					srv = get_server_sh(s->be,
-							    (void *)&((struct sockaddr_in *)src)->sin_addr,
+							    (void *)&((struct sockaddr_in *)conn->src)->sin_addr,
 							    4, prev_srv);
 				}
-				else if (src && src->ss_family == AF_INET6) {
+				else if (conn && conn_get_src(conn) && conn->src->ss_family == AF_INET6) {
 					srv = get_server_sh(s->be,
-							    (void *)&((struct sockaddr_in6 *)src)->sin6_addr,
+							    (void *)&((struct sockaddr_in6 *)conn->src)->sin6_addr,
 							    16, prev_srv);
 				}
 				else {
@@ -833,9 +870,10 @@ out_ok:
 static int alloc_dst_address(struct sockaddr_storage **ss,
                              struct server *srv, struct stream *s)
 {
-	const struct sockaddr_storage *dst;
+	struct connection *cli_conn = objt_conn(strm_orig(s));
 
 	*ss = NULL;
+
 	if ((s->flags & SF_DIRECT) || (s->be->lbprm.algo & BE_LB_KIND)) {
 		/* A server is necessarily known for this stream */
 		if (!(s->flags & SF_ASSIGNED))
@@ -846,33 +884,34 @@ static int alloc_dst_address(struct sockaddr_storage **ss,
 
 		**ss = srv->addr;
 		set_host_port(*ss, srv->svc_port);
-		if (!is_addr(*ss)) {
+
+		if (!is_addr(*ss) && cli_conn) {
 			/* if the server has no address, we use the same address
 			 * the client asked, which is handy for remapping ports
 			 * locally on multiple addresses at once. Nothing is done
 			 * for AF_UNIX addresses.
 			 */
-			dst = si_dst(&s->si[0]);
-			if (dst && dst->ss_family == AF_INET) {
+			if (!conn_get_dst(cli_conn)) {
+				/* do nothing if we can't retrieve the address */
+			} else if (cli_conn->dst->ss_family == AF_INET) {
 				((struct sockaddr_in *)*ss)->sin_family = AF_INET;
 				((struct sockaddr_in *)*ss)->sin_addr =
-				  ((struct sockaddr_in *)dst)->sin_addr;
-			} else if (dst && dst->ss_family == AF_INET6) {
+				  ((struct sockaddr_in *)cli_conn->dst)->sin_addr;
+			} else if (cli_conn->dst->ss_family == AF_INET6) {
 				((struct sockaddr_in6 *)*ss)->sin6_family = AF_INET6;
 				((struct sockaddr_in6 *)*ss)->sin6_addr =
-				  ((struct sockaddr_in6 *)dst)->sin6_addr;
+				  ((struct sockaddr_in6 *)cli_conn->dst)->sin6_addr;
 			}
 		}
 
 		/* if this server remaps proxied ports, we'll use
 		 * the port the client connected to with an offset. */
-		if ((srv->flags & SRV_F_MAPPORTS)) {
+		if ((srv->flags & SRV_F_MAPPORTS) && cli_conn) {
 			int base_port;
 
-			dst = si_dst(&s->si[0]);
-			if (dst) {
+			if (conn_get_dst(cli_conn)) {
 				/* First, retrieve the port from the incoming connection */
-				base_port = get_host_port(dst);
+				base_port = get_host_port(cli_conn->dst);
 
 				/* Second, assign the outgoing connection's port */
 				base_port += get_host_port(*ss);
@@ -887,14 +926,14 @@ static int alloc_dst_address(struct sockaddr_storage **ss,
 		/* connect to the defined dispatch addr */
 		**ss = s->be->dispatch_addr;
 	}
-	else if ((s->be->options & PR_O_TRANSP)) {
+	else if ((s->be->options & PR_O_TRANSP) && cli_conn) {
 		if (!sockaddr_alloc(ss, NULL, 0))
 			return SRV_STATUS_INTERNAL;
 
 		/* in transparent mode, use the original dest addr if no dispatch specified */
-		dst = si_dst(&s->si[0]);
-		if (dst && (dst->ss_family == AF_INET || dst->ss_family == AF_INET6))
-			**ss = *dst;
+		if (conn_get_dst(cli_conn) &&
+		    (cli_conn->dst->ss_family == AF_INET || cli_conn->dst->ss_family == AF_INET6))
+			**ss = *cli_conn->dst;
 	}
 	else {
 		/* no server and no LB algorithm ! */
@@ -1037,8 +1076,8 @@ static int alloc_bind_address(struct sockaddr_storage **ss,
                               struct server *srv, struct stream *s)
 {
 #if defined(CONFIG_HAP_TRANSPARENT)
-	const struct sockaddr_storage *addr;
 	struct conn_src *src = NULL;
+	struct connection *cli_conn;
 	struct sockaddr_in *sin;
 	char *vptr;
 	size_t vlen;
@@ -1067,14 +1106,14 @@ static int alloc_bind_address(struct sockaddr_storage **ss,
 	case CO_SRC_TPROXY_CLI:
 	case CO_SRC_TPROXY_CIP:
 		/* FIXME: what can we do if the client connects in IPv6 or unix socket ? */
-		addr = si_src(&s->si[0]);
-		if (!addr)
+		cli_conn = objt_conn(strm_orig(s));
+		if (!cli_conn || !conn_get_src(cli_conn))
 			return SRV_STATUS_INTERNAL;
 
 		if (!sockaddr_alloc(ss, NULL, 0))
 			return SRV_STATUS_INTERNAL;
 
-		**ss = *addr;
+		**ss = *cli_conn->src;
 		break;
 
 	case CO_SRC_TPROXY_DYN:
@@ -1269,42 +1308,6 @@ int connect_server(struct stream *s)
 	 * it can be NULL for dispatch mode or transparent backend */
 	srv = objt_server(s->target);
 
-	if (!(s->flags & SF_ADDR_SET)) {
-		err = alloc_dst_address(&s->si[1].dst, srv, s);
-		if (err != SRV_STATUS_OK)
-			return SF_ERR_INTERNAL;
-
-		s->flags |= SF_ADDR_SET;
-	}
-
-	err = alloc_bind_address(&bind_addr, srv, s);
-	if (err != SRV_STATUS_OK)
-		return SF_ERR_INTERNAL;
-
-#ifdef USE_OPENSSL
-	if (srv && srv->ssl_ctx.sni) {
-		sni_smp = sample_fetch_as_type(s->be, s->sess, s,
-		                               SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
-		                               srv->ssl_ctx.sni, SMP_T_STR);
-	}
-#endif
-
-	/* do not reuse if mode is not http */
-	if (!IS_HTX_STRM(s)) {
-		DBG_TRACE_STATE("skip idle connections reuse: no htx", STRM_EV_STRM_PROC|STRM_EV_SI_ST, s);
-		goto skip_reuse;
-	}
-
-	/* disable reuse if websocket stream and the protocol to use is not the
-	 * same as the main protocol of the server.
-	 */
-	if (unlikely(s->flags & SF_WEBSOCKET) && srv) {
-		if (!srv_check_reuse_ws(srv)) {
-			DBG_TRACE_STATE("skip idle connections reuse: websocket stream", STRM_EV_STRM_PROC|STRM_EV_SI_ST, s);
-			goto skip_reuse;
-		}
-	}
-
 	/* first, set unique connection parameters and then calculate hash */
 	memset(&hash_params, 0, sizeof(hash_params));
 
@@ -1312,22 +1315,41 @@ int connect_server(struct stream *s)
 	hash_params.target = s->target;
 
 #ifdef USE_OPENSSL
-	/* 2. sni
-	 * only test if the sample is not null as smp_make_safe (called before
-	 * ssl_sock_set_servername) can only fails if this is not the case
-	 */
-	if (sni_smp) {
-		hash_params.sni_prehash =
-		  conn_hash_prehash(sni_smp->data.u.str.area,
-		                    sni_smp->data.u.str.data);
+	/* 2. sni */
+	if (srv && srv->ssl_ctx.sni) {
+		sni_smp = sample_fetch_as_type(s->be, s->sess, s,
+		                               SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
+		                               srv->ssl_ctx.sni, SMP_T_STR);
+
+		/* only test if the sample is not null as smp_make_safe (called
+		 * before ssl_sock_set_servername) can only fails if this is
+		 * not the case
+		 */
+		if (sni_smp) {
+			hash_params.sni_prehash =
+			  conn_hash_prehash(sni_smp->data.u.str.area,
+			                    sni_smp->data.u.str.data);
+		}
 	}
 #endif /* USE_OPENSSL */
 
 	/* 3. destination address */
+	if (!(s->flags & SF_ADDR_SET)) {
+		err = alloc_dst_address(&s->target_addr, srv, s);
+		if (err != SRV_STATUS_OK)
+			return SF_ERR_INTERNAL;
+
+		s->flags |= SF_ADDR_SET;
+	}
+
 	if (srv && (!is_addr(&srv->addr) || srv->flags & SRV_F_MAPPORTS))
-		hash_params.dst_addr = s->si[1].dst;
+		hash_params.dst_addr = s->target_addr;
 
 	/* 4. source address */
+	err = alloc_bind_address(&bind_addr, srv, s);
+	if (err != SRV_STATUS_OK)
+		return SF_ERR_INTERNAL;
+
 	hash_params.src_addr = bind_addr;
 
 	/* 5. proxy protocol */
@@ -1341,12 +1363,14 @@ int connect_server(struct stream *s)
 
 	hash = conn_calculate_hash(&hash_params);
 
+	/* do not reuse if mode is not http */
+	if (!IS_HTX_STRM(s))
+		goto skip_reuse;
+
 	/* first, search for a matching connection in the session's idle conns */
 	srv_conn = session_get_conn(s->sess, s->target, hash);
-	if (srv_conn) {
-		DBG_TRACE_STATE("reuse connection from session", STRM_EV_STRM_PROC|STRM_EV_SI_ST, s);
+	if (srv_conn)
 		reuse = 1;
-	}
 
 	if (srv && !reuse && reuse_mode != PR_O_REUSE_NEVR) {
 		/* Below we pick connections from the safe, idle  or
@@ -1369,10 +1393,8 @@ int connect_server(struct stream *s)
 		 */
 		if (!eb_is_empty(&srv->per_thr[tid].avail_conns)) {
 			srv_conn = srv_lookup_conn(&srv->per_thr[tid].avail_conns, hash);
-			if (srv_conn) {
-				DBG_TRACE_STATE("reuse connection from avail", STRM_EV_STRM_PROC|STRM_EV_SI_ST, s);
+			if (srv_conn)
 				reuse = 1;
-			}
 		}
 
 		/* if no available connections found, search for an idle/safe */
@@ -1403,10 +1425,8 @@ int connect_server(struct stream *s)
 				}
 			}
 
-			if (srv_conn) {
-				DBG_TRACE_STATE("reuse connection from idle/safe", STRM_EV_STRM_PROC|STRM_EV_SI_ST, s);
+			if (srv_conn)
 				reuse = 1;
-			}
 		}
 	}
 
@@ -1517,7 +1537,6 @@ skip_reuse:
 		srv_cs = NULL;
 
 		if (srv_conn) {
-			DBG_TRACE_STATE("alloc new be connection", STRM_EV_STRM_PROC|STRM_EV_SI_ST, s);
 			srv_conn->owner = s->sess;
 
 			/* connection will be attached to the session if
@@ -1534,8 +1553,6 @@ skip_reuse:
 				conn_free(srv_conn);
 				return SF_ERR_RESOURCE;
 			}
-
-			srv_conn->hash_node->hash = hash;
 		}
 	}
 
@@ -1547,7 +1564,7 @@ skip_reuse:
 		return SF_ERR_RESOURCE;
 
 	/* copy the target address into the connection */
-	*srv_conn->dst = *s->si[1].dst;
+	*srv_conn->dst = *s->target_addr;
 
 	/* Copy network namespace from client connection */
 	srv_conn->proxy_netns = cli_conn ? cli_conn->proxy_netns : NULL;
@@ -1555,7 +1572,7 @@ skip_reuse:
 	if (!srv_conn->xprt) {
 		/* set the correct protocol on the output stream interface */
 		if (srv) {
-			if (conn_prepare(srv_conn, protocol_lookup(srv_conn->dst->ss_family, PROTO_TYPE_STREAM, 0), srv->xprt)) {
+			if (conn_prepare(srv_conn, protocol_by_family(srv_conn->dst->ss_family), srv->xprt)) {
 				conn_free(srv_conn);
 				return SF_ERR_INTERNAL;
 			}
@@ -1563,7 +1580,7 @@ skip_reuse:
 			int ret;
 
 			/* proxies exclusively run on raw_sock right now */
-			ret = conn_prepare(srv_conn, protocol_lookup(srv_conn->dst->ss_family, PROTO_TYPE_STREAM, 0), xprt_get(XPRT_RAW));
+			ret = conn_prepare(srv_conn, protocol_by_family(srv_conn->dst->ss_family), xprt_get(XPRT_RAW));
 			if (ret < 0 || !(srv_conn->ctrl)) {
 				conn_free(srv_conn);
 				return SF_ERR_INTERNAL;
@@ -1593,39 +1610,14 @@ skip_reuse:
 		if (srv && srv->pp_opts) {
 			srv_conn->flags |= CO_FL_SEND_PROXY;
 			srv_conn->send_proxy_ofs = 1; /* must compute size */
+			if (cli_conn)
+				conn_get_dst(cli_conn);
 		}
 
 		if (srv && (srv->flags & SRV_F_SOCKS4_PROXY)) {
 			srv_conn->send_proxy_ofs = 1;
 			srv_conn->flags |= CO_FL_SOCKS4;
 		}
-
-#if defined(USE_OPENSSL) && defined(TLSEXT_TYPE_application_layer_protocol_negotiation)
-		/* if websocket stream, try to update connection ALPN. */
-		if (unlikely(s->flags & SF_WEBSOCKET) &&
-		    srv && srv->use_ssl && srv->ssl_ctx.alpn_str) {
-			char *alpn = "";
-			int force = 0;
-
-			switch (srv->ws) {
-			case SRV_WS_AUTO:
-				alpn = "\x08http/1.1";
-				force = 0;
-				break;
-			case SRV_WS_H1:
-				alpn = "\x08http/1.1";
-				force = 1;
-				break;
-			case SRV_WS_H2:
-				alpn = "\x02h2";
-				force = 1;
-				break;
-			}
-
-			if (!conn_update_alpn(srv_conn, ist(alpn), force))
-				DBG_TRACE_STATE("update alpn for websocket", STRM_EV_STRM_PROC|STRM_EV_SI_ST, s);
-		}
-#endif
 	}
 	else {
 		s->flags |= SF_SRV_REUSED;
@@ -1685,9 +1677,7 @@ skip_reuse:
 	 * fail, and flag the connection as CO_FL_ERROR.
 	 */
 	if (init_mux) {
-		const struct mux_ops *alt_mux =
-		  likely(!(s->flags & SF_WEBSOCKET)) ? NULL : srv_get_ws_proto(srv);
-		if (conn_install_mux_be(srv_conn, srv_cs, s->sess, alt_mux) < 0) {
+		if (conn_install_mux_be(srv_conn, srv_cs, s->sess) < 0) {
 			conn_full_close(srv_conn);
 			return SF_ERR_INTERNAL;
 		}
@@ -1786,6 +1776,8 @@ skip_reuse:
 		}
 	}
 
+	srv_conn->hash_node->hash = hash;
+
 	return SF_ERR_NONE;  /* connection is OK */
 }
 
@@ -1825,7 +1817,7 @@ int srv_redispatch_connect(struct stream *s)
 		if (((s->flags & (SF_DIRECT|SF_FORCE_PRST)) == SF_DIRECT) &&
 		    (s->be->options & PR_O_REDISP)) {
 			s->flags &= ~(SF_DIRECT | SF_ASSIGNED | SF_ADDR_SET);
-			sockaddr_free(&s->si[1].dst);
+			sockaddr_free(&s->target_addr);
 			goto redispatch;
 		}
 
@@ -2716,15 +2708,11 @@ int backend_parse_balance(const char **args, char **err, struct proxy *curproxy)
 static int
 smp_fetch_nbsrv(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct proxy *px = args->data.prx;
-
-	if (px == NULL)
-		return 0;
-	if (px->cap & PR_CAP_DEF)
-		px = smp->px;
+	struct proxy *px;
 
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
+	px = args->data.prx;
 
 	smp->data.u.sint = be_usable_srv(px);
 
@@ -2759,18 +2747,12 @@ static int
 smp_fetch_connslots(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	struct server *iterator;
-	struct proxy *px = args->data.prx;
-
-	if (px == NULL)
-		return 0;
-	if (px->cap & PR_CAP_DEF)
-		px = smp->px;
 
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
 	smp->data.u.sint = 0;
 
-	for (iterator = px->srv; iterator; iterator = iterator->next) {
+	for (iterator = args->data.prx->srv; iterator; iterator = iterator->next) {
 		if (iterator->cur_state == SRV_ST_STOPPED)
 			continue;
 
@@ -2879,16 +2861,9 @@ smp_fetch_srv_name(const struct arg *args, struct sample *smp, const char *kw, v
 static int
 smp_fetch_be_sess_rate(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct proxy *px = args->data.prx;
-
-	if (px == NULL)
-		return 0;
-	if (px->cap & PR_CAP_DEF)
-		px = smp->px;
-
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = read_freq_ctr(&px->be_sess_per_sec);
+	smp->data.u.sint = read_freq_ctr(&args->data.prx->be_sess_per_sec);
 	return 1;
 }
 
@@ -2899,16 +2874,9 @@ smp_fetch_be_sess_rate(const struct arg *args, struct sample *smp, const char *k
 static int
 smp_fetch_be_conn(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct proxy *px = args->data.prx;
-
-	if (px == NULL)
-		return 0;
-	if (px->cap & PR_CAP_DEF)
-		px = smp->px;
-
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = px->beconn;
+	smp->data.u.sint = args->data.prx->beconn;
 	return 1;
 }
 
@@ -2921,19 +2889,14 @@ static int
 smp_fetch_be_conn_free(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
 	struct server *iterator;
-	struct proxy *px = args->data.prx;
+	struct proxy *px;
 	unsigned int maxconn;
-
-	if (px == NULL)
-		return 0;
-	if (px->cap & PR_CAP_DEF)
-		px = smp->px;
 
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
 	smp->data.u.sint = 0;
 
-	for (iterator = px->srv; iterator; iterator = iterator->next) {
+	for (iterator = args->data.prx->srv; iterator; iterator = iterator->next) {
 		if (iterator->cur_state == SRV_ST_STOPPED)
 			continue;
 
@@ -2964,16 +2927,9 @@ smp_fetch_be_conn_free(const struct arg *args, struct sample *smp, const char *k
 static int
 smp_fetch_queue_size(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct proxy *px = args->data.prx;
-
-	if (px == NULL)
-		return 0;
-	if (px->cap & PR_CAP_DEF)
-		px = smp->px;
-
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
-	smp->data.u.sint = px->totpend;
+	smp->data.u.sint = args->data.prx->totpend;
 	return 1;
 }
 
@@ -2988,16 +2944,12 @@ smp_fetch_queue_size(const struct arg *args, struct sample *smp, const char *kw,
 static int
 smp_fetch_avg_queue_size(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct proxy *px = args->data.prx;
 	int nbsrv;
-
-	if (px == NULL)
-		return 0;
-	if (px->cap & PR_CAP_DEF)
-		px = smp->px;
+	struct proxy *px;
 
 	smp->flags = SMP_F_VOL_TEST;
 	smp->data.type = SMP_T_SINT;
+	px = args->data.prx;
 
 	nbsrv = be_usable_srv(px);
 

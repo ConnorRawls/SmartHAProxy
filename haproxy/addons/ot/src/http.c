@@ -134,17 +134,6 @@ struct otc_text_map *flt_ot_http_headers_get(struct channel *chn, const char *pr
 				v = htx_get_blk_value(htx, blk);
 
 				/*
-				 * In case the data of the HTTP header is not
-				 * specified, v.ptr will have some non-null
-				 * value and v.len will be equal to 0.  The
-				 * otc_text_map_add() function will not
-				 * interpret this well.  In this case v.ptr
-				 * is set to an empty string.
-				 */
-				if (v.len == 0)
-					v = ist("");
-
-				/*
 				 * Here, an HTTP header (which is actually part
 				 * of the span context is added to the text_map.
 				 *
@@ -220,10 +209,12 @@ int flt_ot_http_header_set(struct channel *chn, const char *prefix, const char *
 	}
 
 	if (!FLT_OT_STR_ISVALID(prefix)) {
-		ist_name = ist2((char *)name, strlen(name));
+		ist_name.ptr = (char *)name;
+		ist_name.len = strlen(name);
 	}
 	else if (!FLT_OT_STR_ISVALID(name)) {
-		ist_name = ist2((char *)prefix, strlen(prefix));
+		ist_name.ptr = (char *)prefix;
+		ist_name.len = strlen(prefix);
 	}
 	else {
 		buffer = flt_ot_trash_alloc(0, err);
@@ -232,7 +223,8 @@ int flt_ot_http_header_set(struct channel *chn, const char *prefix, const char *
 
 		(void)chunk_printf(buffer, "%s-%s", prefix, name);
 
-		ist_name = ist2(buffer->area, buffer->data);
+		ist_name.ptr = buffer->area;
+		ist_name.len = buffer->data;
 	}
 
 	/* Remove all occurrences of the header. */

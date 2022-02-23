@@ -13,6 +13,7 @@
 #include <errno.h>
 
 #include <import/eb64tree.h>
+#include <import/xxhash.h>
 #include <import/ebistree.h>
 
 #include <haproxy/api.h>
@@ -26,8 +27,8 @@
 #include <haproxy/proxy.h>
 #include <haproxy/resolvers.h>
 #include <haproxy/server.h>
+#include <haproxy/ssl_sock.h>
 #include <haproxy/tools.h>
-#include <haproxy/xxhash.h>
 
 
 /* Update a server state using the parameters available in the params list.
@@ -446,7 +447,7 @@ static void srv_state_srv_update(struct server *srv, int version, char **params)
 
 		/* configure ssl if connection has been initiated at startup */
 		if (srv->ssl_ctx.ctx != NULL)
-			srv_set_ssl(srv, use_ssl);
+			ssl_sock_set_srv(srv, use_ssl);
 #endif
 	}
 
@@ -830,7 +831,7 @@ void apply_server_state(void)
 		struct eb_root local_state_tree = EB_ROOT_UNIQUE;
 
 		/* Must be an enabled backend with at least a server */
-		if (!(curproxy->cap & PR_CAP_BE) || (curproxy->flags & (PR_FL_DISABLED|PR_FL_STOPPED)) || !curproxy->srv)
+		if (!(curproxy->cap & PR_CAP_BE) || curproxy->disabled || !curproxy->srv)
 			continue; /* next proxy */
 
 		/* Mode must be specified */

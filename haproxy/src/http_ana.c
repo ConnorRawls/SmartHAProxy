@@ -56,8 +56,8 @@ static size_t http_fmt_req_line(const struct htx_sl *sl, char *str, size_t len);
 static void http_debug_stline(const char *dir, struct stream *s, const struct htx_sl *sl);
 static void http_debug_hdr(const char *dir, struct stream *s, const struct ist n, const struct ist v);
 
-static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct list *def_rules, struct list *rules, struct stream *s);
-static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct list *def_rules, struct list *rules, struct stream *s);
+static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct list *rules, struct stream *s);
+static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct list *rules, struct stream *s);
 
 static void http_manage_client_side_cookies(struct stream *s, struct channel *req);
 static void http_manage_server_side_cookies(struct stream *s, struct channel *res);
@@ -336,6 +336,8 @@ int http_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	if (!(s->flags & SF_FINST_MASK))
 		s->flags |= SF_FINST_R;
 
+	req->analysers &= AN_REQ_FLT_END;
+	req->analyse_exp = TICK_ETERNITY;
 	DBG_TRACE_DEVEL("leaving on error",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
 	return 0;
@@ -351,7 +353,6 @@ int http_wait_for_request(struct stream *s, struct channel *req, int an_bit)
  */
 int http_process_req_common(struct stream *s, struct channel *req, int an_bit, struct proxy *px)
 {
-	struct list *def_rules, *rules;
 	struct session *sess = s->sess;
 	struct http_txn *txn = s->txn;
 	struct http_msg *msg = &txn->req;
@@ -366,15 +367,12 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 
 	/* just in case we have some per-backend tracking. Only called the first
 	 * execution of the analyser. */
-	if (!s->current_rule && !s->current_rule_list)
+	if (!s->current_rule || s->current_rule_list != &px->http_req_rules)
 		stream_inc_be_http_req_ctr(s);
 
-	def_rules = ((px->defpx && (an_bit == AN_REQ_HTTP_PROCESS_FE || px != sess->fe)) ? &px->defpx->http_req_rules : NULL);
-	rules = &px->http_req_rules;
-
 	/* evaluate http-request rules */
-	if ((def_rules && !LIST_ISEMPTY(def_rules)) || !LIST_ISEMPTY(rules)) {
-		verdict = http_req_get_intercept_rule(px, def_rules, rules, s);
+	if (!LIST_ISEMPTY(&px->http_req_rules)) {
+		verdict = http_req_get_intercept_rule(px, &px->http_req_rules, s);
 
 		switch (verdict) {
 		case HTTP_RULE_RES_YIELD: /* some data miss, call the function later. */
@@ -431,7 +429,7 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 
 		/* parse the whole stats request and extract the relevant information */
 		http_handle_stats(s, req);
-		verdict = http_req_get_intercept_rule(px, NULL, &px->uri_auth->http_req_rules, s);
+		verdict = http_req_get_intercept_rule(px, &px->uri_auth->http_req_rules, s);
 		/* not all actions implemented: deny, allow, auth */
 
 		if (verdict == HTTP_RULE_RES_DENY) /* stats http-request deny */
@@ -505,7 +503,6 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 	req->analyse_exp = TICK_ETERNITY;
  done_without_exp: /* done with this analyser, but don't reset the analyse_exp. */
 	req->analysers &= ~an_bit;
-	s->current_rule = s->current_rule_list = NULL;
 	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 	return 1;
 
@@ -586,7 +583,6 @@ int http_process_req_common(struct stream *s, struct channel *req, int an_bit, s
 
 	req->analysers &= AN_REQ_FLT_END;
 	req->analyse_exp = TICK_ETERNITY;
-	s->current_rule = s->current_rule_list = NULL;
 	DBG_TRACE_DEVEL("leaving on error",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
 	return 0;
@@ -654,7 +650,6 @@ int http_process_request(struct stream *s, struct channel *req, int an_bit)
 	 * asks for it.
 	 */
 	if ((sess->fe->options | s->be->options) & PR_O_FWDFOR) {
-		const struct sockaddr_storage *src = si_src(&s->si[0]);
 		struct http_hdr_ctx ctx = { .blk = NULL };
 		struct ist hdr = ist2(s->be->fwdfor_hdr_len ? s->be->fwdfor_hdr_name : sess->fe->fwdfor_hdr_name,
 				      s->be->fwdfor_hdr_len ? s->be->fwdfor_hdr_len : sess->fe->fwdfor_hdr_len);
@@ -665,13 +660,13 @@ int http_process_request(struct stream *s, struct channel *req, int an_bit)
 			 * and we found it, so don't do anything.
 			 */
 		}
-		else if (src && src->ss_family == AF_INET) {
+		else if (cli_conn && conn_get_src(cli_conn) && cli_conn->src->ss_family == AF_INET) {
 			/* Add an X-Forwarded-For header unless the source IP is
 			 * in the 'except' network range.
 			 */
-			if (ipcmp2net(src, &sess->fe->except_xff_net) &&
-			    ipcmp2net(src, &s->be->except_xff_net)) {
-				unsigned char *pn = (unsigned char *)&((struct sockaddr_in *)src)->sin_addr;
+			if (ipcmp2net(cli_conn->src, &sess->fe->except_xff_net) &&
+			    ipcmp2net(cli_conn->src, &s->be->except_xff_net)) {
+				unsigned char *pn = (unsigned char *)&((struct sockaddr_in *)cli_conn->src)->sin_addr;
 
 				/* Note: we rely on the backend to get the header name to be used for
 				 * x-forwarded-for, because the header is really meant for the backends.
@@ -683,16 +678,16 @@ int http_process_request(struct stream *s, struct channel *req, int an_bit)
 					goto return_int_err;
 			}
 		}
-		else if (src && src->ss_family == AF_INET6) {
+		else if (cli_conn && conn_get_src(cli_conn) && cli_conn->src->ss_family == AF_INET6) {
 			/* Add an X-Forwarded-For header unless the source IP is
 			 * in the 'except' network range.
 			 */
-			if (ipcmp2net(src, &sess->fe->except_xff_net) &&
-			    ipcmp2net(src, &s->be->except_xff_net)) {
+			if (ipcmp2net(cli_conn->src, &sess->fe->except_xff_net) &&
+			    ipcmp2net(cli_conn->src, &s->be->except_xff_net)) {
 				char pn[INET6_ADDRSTRLEN];
 
 				inet_ntop(AF_INET6,
-					  (const void *)&((struct sockaddr_in6 *)(src))->sin6_addr,
+					  (const void *)&((struct sockaddr_in6 *)(cli_conn->src))->sin6_addr,
 					  pn, sizeof(pn));
 
 				/* Note: we rely on the backend to get the header name to be used for
@@ -712,17 +707,16 @@ int http_process_request(struct stream *s, struct channel *req, int an_bit)
 	 * asks for it.
 	 */
 	if ((sess->fe->options | s->be->options) & PR_O_ORGTO) {
-		const struct sockaddr_storage *dst = si_dst(&s->si[0]);
 		struct ist hdr = ist2(s->be->orgto_hdr_len ? s->be->orgto_hdr_name : sess->fe->orgto_hdr_name,
 				      s->be->orgto_hdr_len ? s->be->orgto_hdr_len  : sess->fe->orgto_hdr_len);
 
-		if (dst && dst->ss_family == AF_INET) {
+		if (cli_conn && conn_get_dst(cli_conn) && cli_conn->dst->ss_family == AF_INET) {
 			/* Add an X-Original-To header unless the destination IP is
 			 * in the 'except' network range.
 			 */
-			if (ipcmp2net(dst, &sess->fe->except_xot_net) &&
-			    ipcmp2net(dst, &s->be->except_xot_net)) {
-				unsigned char *pn = (unsigned char *)&((struct sockaddr_in *)dst)->sin_addr;
+			if (ipcmp2net(cli_conn->dst, &sess->fe->except_xot_net) &&
+			    ipcmp2net(cli_conn->dst, &s->be->except_xot_net)) {
+				unsigned char *pn = (unsigned char *)&((struct sockaddr_in *)cli_conn->dst)->sin_addr;
 
 				/* Note: we rely on the backend to get the header name to be used for
 				 * x-original-to, because the header is really meant for the backends.
@@ -734,16 +728,16 @@ int http_process_request(struct stream *s, struct channel *req, int an_bit)
 					goto return_int_err;
 			}
 		}
-		else if (dst && dst->ss_family == AF_INET6) {
+		else if (cli_conn && conn_get_dst(cli_conn) && cli_conn->dst->ss_family == AF_INET6) {
 			/* Add an X-Original-To header unless the source IP is
 			 * in the 'except' network range.
 			 */
-			if (ipcmp2net(dst, &sess->fe->except_xot_net) &&
-			    ipcmp2net(dst, &s->be->except_xot_net)) {
+			if (ipcmp2net(cli_conn->dst, &sess->fe->except_xot_net) &&
+			    ipcmp2net(cli_conn->dst, &s->be->except_xot_net)) {
 				char pn[INET6_ADDRSTRLEN];
 
 				inet_ntop(AF_INET6,
-					  (const void *)&((struct sockaddr_in6 *)dst)->sin6_addr,
+					  (const void *)&((struct sockaddr_in6 *)(cli_conn->dst))->sin6_addr,
 					  pn, sizeof(pn));
 
 				/* Note: we rely on the backend to get the header name to be used for
@@ -815,6 +809,8 @@ int http_process_request(struct stream *s, struct channel *req, int an_bit)
 	if (!(s->flags & SF_FINST_MASK))
 		s->flags |= SF_FINST_R;
 
+	req->analysers &= AN_REQ_FLT_END;
+	req->analyse_exp = TICK_ETERNITY;
 	DBG_TRACE_DEVEL("leaving on error",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
 	return 0;
@@ -837,8 +833,6 @@ int http_process_tarpit(struct stream *s, struct channel *req, int an_bit)
 	channel_dont_connect(req);
 	if ((req->flags & (CF_SHUTR|CF_READ_ERROR)) == 0 &&
 	    !tick_is_expired(req->analyse_exp, now_ms)) {
-		/* Be sure to drain all data from the request channel */
-		channel_htx_erase(req, htxbuf(&req->buf));
 		DBG_TRACE_DEVEL("waiting for tarpit timeout expiry",
 				STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 		return 0;
@@ -854,6 +848,10 @@ int http_process_tarpit(struct stream *s, struct channel *req, int an_bit)
 	s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
 
 	http_reply_and_close(s, txn->status, (!(req->flags & CF_READ_ERROR) ? http_error_message(s) : NULL));
+
+  end:
+	req->analysers &= AN_REQ_FLT_END;
+	req->analyse_exp = TICK_ETERNITY;
 
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_PRXCOND;
@@ -1213,6 +1211,8 @@ int http_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 		txn->status = status;
 		http_reply_and_close(s, txn->status, http_error_message(s));
 	}
+	req->analysers   &= AN_REQ_FLT_END;
+	s->res.analysers &= AN_RES_FLT_END; /* we're in data phase, we want to abort both directions */
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_PRXCOND;
 	if (!(s->flags & SF_FINST_MASK))
@@ -1357,6 +1357,7 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				stream_inc_http_fail_ctr(s);
 			}
 
+			rep->analysers &= AN_RES_FLT_END;
 			s->si[1].flags |= SI_FL_NOLINGER;
 			http_reply_and_close(s, txn->status, http_error_message(s));
 
@@ -1385,6 +1386,7 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_READ_TIMEOUT);
 			}
 
+			rep->analysers &= AN_RES_FLT_END;
 			txn->status = 504;
 			stream_inc_http_fail_ctr(s);
 			s->si[1].flags |= SI_FL_NOLINGER;
@@ -1408,6 +1410,7 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 			if (objt_server(s->target))
 				_HA_ATOMIC_INC(&__objt_server(s->target)->counters.cli_aborts);
 
+			rep->analysers &= AN_RES_FLT_END;
 			txn->status = 400;
 			http_reply_and_close(s, txn->status, http_error_message(s));
 
@@ -1442,6 +1445,7 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_BROKEN_PIPE);
 			}
 
+			rep->analysers &= AN_RES_FLT_END;
 			txn->status = 502;
 			stream_inc_http_fail_ctr(s);
 			s->si[1].flags |= SI_FL_NOLINGER;
@@ -1740,6 +1744,9 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		s->flags |= SF_FINST_H;
 
 	s->si[1].flags |= SI_FL_NOLINGER;
+	rep->analysers &= AN_RES_FLT_END;
+	s->req.analysers &= AN_REQ_FLT_END;
+	rep->analyse_exp = TICK_ETERNITY;
 	DBG_TRACE_DEVEL("leaving on error",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
 	return 0;
@@ -1750,6 +1757,8 @@ int http_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	 * any other information so that the client retries.
 	 */
 	txn->status = 0;
+	rep->analysers   &= AN_RES_FLT_END;
+	s->req.analysers &= AN_REQ_FLT_END;
 	s->logs.logwait = 0;
 	s->logs.level = 0;
 	s->res.flags &= ~CF_EXPECT_MORE; /* speed up sending a previous response */
@@ -1807,21 +1816,14 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 	 * pointer and the ->fe rule list. If it doesn't match, I initialize
 	 * the loop with the ->be.
 	 */
-	if (s->current_rule_list == &sess->fe->http_res_rules ||
-	    (sess->fe->defpx && s->current_rule_list == &sess->fe->defpx->http_res_rules))
+	if (s->current_rule_list == &sess->fe->http_res_rules)
 		cur_proxy = sess->fe;
 	else
 		cur_proxy = s->be;
-
 	while (1) {
 		/* evaluate http-response rules */
-		if (ret == HTTP_RULE_RES_CONT || ret == HTTP_RULE_RES_STOP) {
-			struct list *def_rules, *rules;
-
-			def_rules = ((cur_proxy->defpx && (cur_proxy == s->be || cur_proxy->defpx != s->be->defpx)) ? &cur_proxy->defpx->http_res_rules : NULL);
-			rules = &cur_proxy->http_res_rules;
-
-			ret = http_res_get_intercept_rule(cur_proxy, def_rules, rules, s);
+		if (ret == HTTP_RULE_RES_CONT) {
+			ret = http_res_get_intercept_rule(cur_proxy, &cur_proxy->http_res_rules, s);
 
 			switch (ret) {
 			case HTTP_RULE_RES_YIELD: /* some data miss, call the function later. */
@@ -2009,7 +2011,6 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 	DBG_TRACE_LEAVE(STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA, s, txn);
 	rep->analysers &= ~an_bit;
 	rep->analyse_exp = TICK_ETERNITY;
-	s->current_rule = s->current_rule_list = NULL;
 	return 1;
 
  deny:
@@ -2027,8 +2028,8 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 		s->flags |= SF_ERR_INTERNAL;
 	_HA_ATOMIC_INC(&sess->fe->fe_counters.internal_errors);
 	_HA_ATOMIC_INC(&s->be->be_counters.internal_errors);
-	if (sess->listener && sess->listener->counters)
-		_HA_ATOMIC_INC(&sess->listener->counters->internal_errors);
+	if (objt_server(s->target))
+		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.internal_errors);
 	if (objt_server(s->target))
 		_HA_ATOMIC_INC(&__objt_server(s->target)->counters.internal_errors);
 	goto return_prx_err;
@@ -2059,7 +2060,6 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 	rep->analysers &= AN_RES_FLT_END;
 	s->req.analysers &= AN_REQ_FLT_END;
 	rep->analyse_exp = TICK_ETERNITY;
-	s->current_rule = s->current_rule_list = NULL;
 	DBG_TRACE_DEVEL("leaving on error",
 			STRM_EV_STRM_ANA|STRM_EV_HTTP_ANA|STRM_EV_HTTP_ERR, s, txn);
 	return 0;
@@ -2328,6 +2328,8 @@ int http_response_forward_body(struct stream *s, struct channel *res, int an_bit
    return_error:
 	/* don't send any error message as we're in the body */
 	http_reply_and_close(s, txn->status, NULL);
+	res->analysers   &= AN_RES_FLT_END;
+	s->req.analysers &= AN_REQ_FLT_END; /* we're in data phase, we want to abort both directions */
 	if (!(s->flags & SF_FINST_MASK))
 		s->flags |= SF_FINST_D;
 	DBG_TRACE_DEVEL("leaving on error",
@@ -2692,8 +2694,8 @@ int http_res_set_status(unsigned int status, struct ist reason, struct stream *s
  * and a deny/tarpit rule is matched, it will be filled with this rule's deny
  * status.
  */
-static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct list *def_rules,
-						    struct list *rules, struct stream *s)
+static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct list *rules,
+						    struct stream *s)
 {
 	struct session *sess = strm_sess(s);
 	struct http_txn *txn = s->txn;
@@ -2709,16 +2711,15 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 	if (s->current_rule) {
 		rule = s->current_rule;
 		s->current_rule = NULL;
-		if (s->current_rule_list == rules || (def_rules && s->current_rule_list == def_rules))
+		if (s->current_rule_list == rules)
 			goto resume_execution;
 	}
-	s->current_rule_list = ((!def_rules || s->current_rule_list == def_rules) ? rules : def_rules);
+	s->current_rule_list = rules;
 
-  restart:
 	/* start the ruleset evaluation in strict mode */
 	txn->req.flags &= ~HTTP_MSGF_SOFT_RW;
 
-	list_for_each_entry(rule, s->current_rule_list, list) {
+	list_for_each_entry(rule, rules, list) {
 		/* check optional condition */
 		if (rule->cond) {
 			int ret;
@@ -2811,11 +2812,6 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
 		}
 	}
 
-	if (def_rules && s->current_rule_list == def_rules) {
-		s->current_rule_list = rules;
-		goto restart;
-	}
-
   end:
 	/* if the ruleset evaluation is finished reset the strict mode */
 	if (rule_ret != HTTP_RULE_RES_YIELD)
@@ -2834,8 +2830,8 @@ static enum rule_result http_req_get_intercept_rule(struct proxy *px, struct lis
  * must be returned. If *YIELD is returned, the caller must call again the
  * function with the same context.
  */
-static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct list *def_rules,
-						    struct list *rules, struct stream *s)
+static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct list *rules,
+						    struct stream *s)
 {
 	struct session *sess = strm_sess(s);
 	struct http_txn *txn = s->txn;
@@ -2851,17 +2847,15 @@ static enum rule_result http_res_get_intercept_rule(struct proxy *px, struct lis
 	if (s->current_rule) {
 		rule = s->current_rule;
 		s->current_rule = NULL;
-		if (s->current_rule_list == rules || (def_rules && s->current_rule_list == def_rules))
+		if (s->current_rule_list == rules)
 			goto resume_execution;
 	}
-	s->current_rule_list = ((!def_rules || s->current_rule_list == def_rules) ? rules : def_rules);
-
-  restart:
+	s->current_rule_list = rules;
 
 	/* start the ruleset evaluation in strict mode */
 	txn->rsp.flags &= ~HTTP_MSGF_SOFT_RW;
 
-	list_for_each_entry(rule, s->current_rule_list, list) {
+	list_for_each_entry(rule, rules, list) {
 		/* check optional condition */
 		if (rule->cond) {
 			int ret;
@@ -2946,11 +2940,6 @@ resume_execution:
 		}
 	}
 
-	if (def_rules && s->current_rule_list == def_rules) {
-		s->current_rule_list = rules;
-		goto restart;
-	}
-
   end:
 	/* if the ruleset evaluation is finished reset the strict mode */
 	if (rule_ret != HTTP_RULE_RES_YIELD)
@@ -2967,7 +2956,6 @@ resume_execution:
  */
 int http_eval_after_res_rules(struct stream *s)
 {
-	struct list *def_rules, *rules;
 	struct session *sess = s->sess;
 	enum rule_result ret = HTTP_RULE_RES_CONT;
 
@@ -2982,15 +2970,9 @@ int http_eval_after_res_rules(struct stream *s)
 		vars_init_head(&s->vars_reqres, SCOPE_RES);
 	}
 
-	def_rules = (s->be->defpx ? &s->be->defpx->http_after_res_rules : NULL);
-	rules = &s->be->http_after_res_rules;
-
-	ret = http_res_get_intercept_rule(s->be, def_rules, rules, s);
-	if ((ret == HTTP_RULE_RES_CONT || ret == HTTP_RULE_RES_STOP) && sess->fe != s->be) {
-		def_rules = ((sess->fe->defpx && sess->fe->defpx != s->be->defpx) ? &sess->fe->defpx->http_after_res_rules : NULL);
-		rules = &sess->fe->http_after_res_rules;
-		ret = http_res_get_intercept_rule(sess->fe, def_rules, rules, s);
-	}
+	ret = http_res_get_intercept_rule(s->be, &s->be->http_after_res_rules, s);
+	if ((ret == HTTP_RULE_RES_CONT || ret == HTTP_RULE_RES_STOP) && sess->fe != s->be)
+		ret = http_res_get_intercept_rule(sess->fe, &sess->fe->http_after_res_rules, s);
 
   end:
 	/* All other codes than CONTINUE, STOP or DONE are forbidden */
@@ -4100,10 +4082,8 @@ enum rule_result http_wait_for_msg_body(struct stream *s, struct channel *chn,
 	/* Now we're in HTTP_MSG_DATA. We just need to know if all data have
 	 * been received or if the buffer is full.
 	 */
-	if ((htx->flags & HTX_FL_EOM) ||
-	    htx_get_tail_type(htx) > HTX_BLK_DATA ||
-	    channel_htx_full(chn, htx, global.tune.maxrewrite) ||
-	    si_rx_blocked_room(chn_prod(chn)))
+	if ((htx->flags & HTX_FL_EOM) || htx_get_tail_type(htx) > HTX_BLK_DATA ||
+	    channel_htx_full(chn, htx, global.tune.maxrewrite))
 		goto end;
 
 	if (bytes) {
@@ -4584,13 +4564,6 @@ void http_reply_and_close(struct stream *s, short status, struct http_reply *msg
 end:
 	s->res.wex = tick_add_ifset(now_ms, s->res.wto);
 
-	/* At this staged, HTTP analysis is finished */
-	s->req.analysers &= AN_REQ_FLT_END;
-	s->req.analyse_exp = TICK_ETERNITY;
-
-	s->res.analysers &= AN_RES_FLT_END;
-	s->res.analyse_exp = TICK_ETERNITY;
-
 	channel_auto_read(&s->req);
 	channel_abort(&s->req);
 	channel_auto_close(&s->req);
@@ -4911,7 +4884,8 @@ static void http_capture_headers(struct htx *htx, char **cap, struct cap_hdr *ca
 				}
 
 				v = htx_get_blk_value(htx, blk);
-				v = isttrim(v, h->len);
+				if (v.len > h->len)
+					v.len = h->len;
 
 				memcpy(cap[h->index], v.ptr, v.len);
 				cap[h->index][v.len]=0;

@@ -46,7 +46,6 @@
 #include <haproxy/channel.h>
 #include <haproxy/check.h>
 #include <haproxy/chunk.h>
-#include <haproxy/clock.h>
 #ifdef USE_CPU_AFFINITY
 #include <haproxy/cpuset.h>
 #endif
@@ -83,6 +82,7 @@
 #include <haproxy/tcp_rules.h>
 #include <haproxy/tcpcheck.h>
 #include <haproxy/thread.h>
+#include <haproxy/time.h>
 #include <haproxy/tools.h>
 #include <haproxy/uri_auth-t.h>
 #include <haproxy/xprt_quic.h>
@@ -161,7 +161,7 @@ int str2listener(char *str, struct proxy *curproxy, struct bind_conf *bind_conf,
 		 * is selected, regardless of bind_conf settings. We then need
 		 * to initialize QUIC params.
 		 */
-		if (proto->proto_type == PROTO_TYPE_DGRAM && proto->ctrl_type == SOCK_STREAM) {
+		if (proto->sock_type == SOCK_DGRAM && proto->ctrl_type == SOCK_STREAM) {
 			bind_conf->xprt = xprt_get(XPRT_QUIC);
 			quic_transport_params_init(&bind_conf->quic_params, 1);
 		}
@@ -918,7 +918,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		 */
 		if (peer || !local_peer) {
 			newpeer->addr = curpeers->peers_fe->srv->addr;
-			newpeer->proto = protocol_lookup(newpeer->addr.ss_family, PROTO_TYPE_STREAM, 0);
+			newpeer->proto = protocol_by_family(newpeer->addr.ss_family);
 		}
 
 		newpeer->xprt  = xprt_get(XPRT_RAW);
@@ -1019,7 +1019,7 @@ int cfg_parse_peers(const char *file, int linenum, char **args, int kwm)
 		stktables_list = t;
 	}
 	else if (strcmp(args[0], "disabled") == 0) {  /* disables this peers section */
-		curpeers->disabled |= PR_FL_DISABLED;
+		curpeers->disabled = PR_DISABLED;
 	}
 	else if (strcmp(args[0], "enabled") == 0) {  /* enables this peers section (used to revert a disabled default) */
 		curpeers->disabled = 0;
@@ -1536,7 +1536,7 @@ static void check_section_position(char *section_name,
                                    const char *file, int linenum,
                                    int *non_global_parsed)
 {
-	if (strcmp(section_name, "global") == 0) {
+	if (!strcmp(section_name, "global")) {
 		if (*non_global_parsed == 1)
 		        _ha_diag_warning("parsing [%s:%d] : global section detected after a non-global one, the prevalence of their statements is unspecified\n", file, linenum);
 	}
@@ -2403,7 +2403,7 @@ int check_config_validity()
 	 */
 
 	/* will be needed further to delay some tasks */
-	clock_update_date(0,1);
+	tv_update_date(0,1);
 
 	if (!global.tune.max_http_hdr)
 		global.tune.max_http_hdr = MAX_HTTP_HDR;
@@ -2434,14 +2434,6 @@ int check_config_validity()
 		}
 		all_threads_mask = nbits(global.nbthread);
 #endif
-	}
-
-	if (!global.nbtgroups)
-		global.nbtgroups = 1;
-
-	if (thread_map_to_groups() < 0) {
-		err_code |= ERR_ALERT | ERR_FATAL;
-		goto out;
 	}
 
 	pool_head_requri = create_pool("requri", global.tune.requri_len , MEM_F_SHARED);
@@ -2502,7 +2494,7 @@ int check_config_validity()
 		if (curproxy->uuid >= 0)
 			next_pxid++;
 
-		if (curproxy->flags & PR_FL_DISABLED) {
+		if (curproxy->disabled) {
 			/* ensure we don't keep listeners uselessly bound. We
 			 * can't disable their listeners yet (fdtab not
 			 * allocated yet) but let's skip them.
@@ -2514,41 +2506,9 @@ int check_config_validity()
 			continue;
 		}
 
-		/* The current proxy is referencing a default proxy. We must
-		 * finalize its config, but only once. If the default proxy is
-		 * ready (PR_FL_READY) it means it was already fully configured.
-		 */
-		if (curproxy->defpx) {
-			if (!(curproxy->defpx->flags & PR_FL_READY)) {
-				/* check validity for 'tcp-request' layer 4/5/6/7 rules */
-				cfgerr += check_action_rules(&curproxy->defpx->tcp_req.l4_rules, curproxy->defpx, &err_code);
-				cfgerr += check_action_rules(&curproxy->defpx->tcp_req.l5_rules, curproxy->defpx, &err_code);
-				cfgerr += check_action_rules(&curproxy->defpx->tcp_req.inspect_rules, curproxy->defpx, &err_code);
-				cfgerr += check_action_rules(&curproxy->defpx->tcp_rep.inspect_rules, curproxy->defpx, &err_code);
-				cfgerr += check_action_rules(&curproxy->defpx->http_req_rules, curproxy->defpx, &err_code);
-				cfgerr += check_action_rules(&curproxy->defpx->http_res_rules, curproxy->defpx, &err_code);
-				cfgerr += check_action_rules(&curproxy->defpx->http_after_res_rules, curproxy->defpx, &err_code);
-
-				err = NULL;
-				i = smp_resolve_args(curproxy->defpx, &err);
-				cfgerr += i;
-				if (i) {
-					indent_msg(&err, 8);
-					ha_alert("%s%s\n", i > 1 ? "multiple argument resolution errors:" : "", err);
-					ha_free(&err);
-				}
-				else
-					cfgerr += acl_find_targets(curproxy->defpx);
-
-				/* default proxy is now ready. Set the right FE/BE capabilities */
-				curproxy->defpx->flags |= PR_FL_READY;
-			}
-		}
-
 		/* check and reduce the bind-proc of each listener */
 		list_for_each_entry(bind_conf, &curproxy->conf.bind, by_fe) {
 			unsigned long mask;
-			struct listener *li;
 
 			/* HTTP frontends with "h2" as ALPN/NPN will work in
 			 * HTTP/2 and absolutely require buffers 16kB or larger.
@@ -2575,14 +2535,8 @@ int check_config_validity()
 #endif
 
 			/* detect and address thread affinity inconsistencies */
-			err = NULL;
-			if (thread_resolve_group_mask(bind_conf->bind_tgroup, bind_conf->bind_thread,
-			                              &bind_conf->bind_tgroup, &bind_conf->bind_thread, &err) < 0) {
-				ha_alert("Proxy '%s': %s in 'bind %s' at [%s:%d].\n",
-					   curproxy->id, err, bind_conf->arg, bind_conf->file, bind_conf->line);
-				free(err);
-				cfgerr++;
-			} else if (!((mask = bind_conf->bind_thread) & all_threads_mask)) {
+			mask = thread_mask(bind_conf->settings.bind_thread);
+			if (!(mask & all_threads_mask)) {
 				unsigned long new_mask = 0;
 
 				while (mask) {
@@ -2590,61 +2544,9 @@ int check_config_validity()
 					mask >>= global.nbthread;
 				}
 
-				bind_conf->bind_thread = new_mask;
-				ha_warning("Proxy '%s': the thread range specified on the 'thread' directive of 'bind %s' at [%s:%d] only refers to thread numbers out of the range defined by the global 'nbthread' directive. The thread numbers were remapped to existing threads instead (mask 0x%lx).\n",
+				bind_conf->settings.bind_thread = new_mask;
+				ha_warning("Proxy '%s': the thread range specified on the 'process' directive of 'bind %s' at [%s:%d] only refers to thread numbers out of the range defined by the global 'nbthread' directive. The thread numbers were remapped to existing threads instead (mask 0x%lx).\n",
 					   curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line, new_mask);
-			}
-
-			/* apply thread masks and groups to all receivers */
-			list_for_each_entry(li, &bind_conf->listeners, by_bind) {
-				if (bind_conf->settings.shards <= 1) {
-					li->rx.bind_thread = bind_conf->bind_thread;
-					li->rx.bind_tgroup = bind_conf->bind_tgroup;
-				} else {
-					struct listener *new_li;
-					int shard, shards, todo, done, bit;
-					ulong mask;
-
-					shards = bind_conf->settings.shards;
-					todo = my_popcountl(bind_conf->bind_thread);
-
-					/* no more shards than total threads */
-					if (shards > todo)
-						shards = todo;
-
-					shard = done = bit = 0;
-					new_li = li;
-
-					while (1) {
-						mask = 0;
-						while (done < todo) {
-							/* enlarge mask to cover next bit of bind_thread */
-							while (!(bind_conf->bind_thread & (1UL << bit)))
-								bit++;
-							mask |= (1UL << bit);
-							bit++;
-							done += shards;
-						}
-
-						new_li->rx.bind_thread = bind_conf->bind_thread & mask;
-						new_li->rx.bind_tgroup = bind_conf->bind_tgroup;
-						done -= todo;
-
-						shard++;
-						if (shard >= shards)
-							break;
-
-						/* create another listener for new shards */
-						new_li = clone_listener(li);
-						if (!new_li) {
-							ha_alert("Out of memory while trying to allocate extra listener for shard %d in %s %s\n",
-								 shard, proxy_type_str(curproxy), curproxy->id);
-							cfgerr++;
-							err_code |= ERR_FATAL | ERR_ALERT;
-							goto out;
-						}
-					}
-				}
 			}
 		}
 
@@ -3201,18 +3103,15 @@ out_uri_auth_compat:
 		}
 
 		if (curproxy->conf.uniqueid_format_string) {
-			int where = 0;
-
 			curproxy->conf.args.ctx = ARGC_UIF;
 			curproxy->conf.args.file = curproxy->conf.uif_file;
 			curproxy->conf.args.line = curproxy->conf.uif_line;
 			err = NULL;
-			if (curproxy->cap & PR_CAP_FE)
-				where |= SMP_VAL_FE_HRQ_HDR;
-			if (curproxy->cap & PR_CAP_BE)
-				where |= SMP_VAL_BE_HRQ_HDR;
 			if (!parse_logformat_string(curproxy->conf.uniqueid_format_string, curproxy, &curproxy->format_unique_id,
-			                            LOG_OPT_HTTP|LOG_OPT_MERGE_SPACES, where, &err)) {
+			                            LOG_OPT_HTTP|LOG_OPT_MERGE_SPACES,
+			                            (curproxy->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR
+			                                                        : SMP_VAL_BE_HRQ_HDR,
+			                            &err)) {
 				ha_alert("Parsing [%s:%d]: failed to parse unique-id : %s.\n",
 					 curproxy->conf.uif_file, curproxy->conf.uif_line, err);
 				free(err);
@@ -3624,8 +3523,8 @@ out_uri_auth_compat:
 			if (!curproxy->accept)
 				curproxy->accept = frontend_accept;
 
-			if (!LIST_ISEMPTY(&curproxy->tcp_req.inspect_rules) ||
-			    (curproxy->defpx && !LIST_ISEMPTY(&curproxy->defpx->tcp_req.inspect_rules)))
+			if (curproxy->tcp_req.inspect_delay ||
+			    !LIST_ISEMPTY(&curproxy->tcp_req.inspect_rules))
 				curproxy->fe_req_ana |= AN_REQ_INSPECT_FE;
 
 			if (curproxy->mode == PR_MODE_HTTP) {
@@ -3649,12 +3548,11 @@ out_uri_auth_compat:
 		}
 
 		if (curproxy->cap & PR_CAP_BE) {
-			if (!LIST_ISEMPTY(&curproxy->tcp_req.inspect_rules) ||
-			    (curproxy->defpx && !LIST_ISEMPTY(&curproxy->defpx->tcp_req.inspect_rules)))
+			if (curproxy->tcp_req.inspect_delay ||
+			    !LIST_ISEMPTY(&curproxy->tcp_req.inspect_rules))
 				curproxy->be_req_ana |= AN_REQ_INSPECT_BE;
 
-			if (!LIST_ISEMPTY(&curproxy->tcp_rep.inspect_rules) ||
-			    (curproxy->defpx && !LIST_ISEMPTY(&curproxy->defpx->tcp_rep.inspect_rules)))
+			if (!LIST_ISEMPTY(&curproxy->tcp_rep.inspect_rules))
                                 curproxy->be_rsp_ana |= AN_RES_INSPECT;
 
 			if (curproxy->mode == PR_MODE_HTTP) {
@@ -3782,7 +3680,7 @@ out_uri_auth_compat:
 		}
 	}
 
-	idle_conn_task = task_new_anywhere();
+	idle_conn_task = task_new(MAX_THREADS_MASK);
 	if (!idle_conn_task) {
 		ha_alert("parsing : failed to allocate global idle connection task.\n");
 		cfgerr++;
@@ -3792,7 +3690,7 @@ out_uri_auth_compat:
 		idle_conn_task->context = NULL;
 
 		for (i = 0; i < global.nbthread; i++) {
-			idle_conns[i].cleanup_task = task_new_on(i);
+			idle_conns[i].cleanup_task = task_new(1UL << i);
 			if (!idle_conns[i].cleanup_task) {
 				ha_alert("parsing : failed to allocate idle connection tasks for thread '%d'.\n", i);
 				cfgerr++;
@@ -3871,11 +3769,10 @@ out_uri_auth_compat:
 		}
 
 		/* create the task associated with the proxy */
-		curproxy->task = task_new_anywhere();
+		curproxy->task = task_new(MAX_THREADS_MASK);
 		if (curproxy->task) {
 			curproxy->task->context = curproxy;
 			curproxy->task->process = manage_proxy;
-			curproxy->flags |= PR_FL_READY;
 		} else {
 			ha_alert("Proxy '%s': no more memory when trying to allocate the management task\n",
 				 curproxy->id);
@@ -3931,7 +3828,6 @@ out_uri_auth_compat:
 				 * Note that ->srv is used by the local peer of a new process to connect to the local peer
 				 * of an old process.
 				 */
-				curpeers->peers_fe->flags |= PR_FL_READY;
 				p = curpeers->remote;
 				while (p) {
 					if (p->srv) {
@@ -3999,7 +3895,7 @@ out_uri_auth_compat:
 	 * other proxies.
 	 */
 	for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
-		if ((curproxy->flags & PR_FL_DISABLED) || !curproxy->table)
+		if (curproxy->disabled || !curproxy->table)
 			continue;
 
 		if (!stktable_init(curproxy->table)) {

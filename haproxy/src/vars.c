@@ -18,7 +18,6 @@
 #include <haproxy/tcpcheck.h>
 #include <haproxy/tools.h>
 #include <haproxy/vars.h>
-#include <haproxy/xxhash.h>
 
 
 /* This contains a pool of struct vars */
@@ -659,7 +658,6 @@ static enum act_return action_store(struct act_rule *rule, struct proxy *px,
 	int dir;
 
 	switch (rule->from) {
-	case ACT_F_TCP_REQ_CON: dir = SMP_OPT_DIR_REQ; break;
 	case ACT_F_TCP_REQ_SES: dir = SMP_OPT_DIR_REQ; break;
 	case ACT_F_TCP_REQ_CNT: dir = SMP_OPT_DIR_REQ; break;
 	case ACT_F_TCP_RES_CNT: dir = SMP_OPT_DIR_RES; break;
@@ -778,7 +776,7 @@ static enum act_parse_ret parse_store(const char **args, int *arg, struct proxy 
 	const char *var_name = args[*arg-1];
 	int var_len;
 	const char *kw_name;
-	int flags = 0, set_var = 0; /* 0=unset-var, 1=set-var, 2=set-var-fmt */
+	int flags, set_var = 0; /* 0=unset-var, 1=set-var, 2=set-var-fmt */
 	struct sample empty_smp = { };
 
 	if (strncmp(var_name, "set-var-fmt", 11) == 0) {
@@ -828,40 +826,24 @@ static enum act_parse_ret parse_store(const char **args, int *arg, struct proxy 
 	kw_name = args[*arg-1];
 
 	switch (rule->from) {
-	case ACT_F_TCP_REQ_CON:
-		flags = SMP_VAL_FE_CON_ACC;
-		px->conf.args.ctx = ARGC_TCO;
-		break;
 	case ACT_F_TCP_REQ_SES:
 		flags = SMP_VAL_FE_SES_ACC;
 		px->conf.args.ctx = ARGC_TSE;
 		break;
 	case ACT_F_TCP_REQ_CNT:
-		if (px->cap & PR_CAP_FE)
-			flags |= SMP_VAL_FE_REQ_CNT;
-		if (px->cap & PR_CAP_BE)
-			flags |= SMP_VAL_BE_REQ_CNT;
+		flags = (px->cap & PR_CAP_FE) ? SMP_VAL_FE_REQ_CNT : SMP_VAL_BE_REQ_CNT;
 		px->conf.args.ctx = ARGC_TRQ;
 		break;
 	case ACT_F_TCP_RES_CNT:
-		if (px->cap & PR_CAP_FE)
-			flags |= SMP_VAL_FE_RES_CNT;
-		if (px->cap & PR_CAP_BE)
-			flags |= SMP_VAL_BE_RES_CNT;
+		flags = (px->cap & PR_CAP_FE) ? SMP_VAL_FE_RES_CNT : SMP_VAL_BE_RES_CNT;
 		px->conf.args.ctx = ARGC_TRS;
 		break;
 	case ACT_F_HTTP_REQ:
-		if (px->cap & PR_CAP_FE)
-			flags |= SMP_VAL_FE_HRQ_HDR;
-		if (px->cap & PR_CAP_BE)
-			flags |= SMP_VAL_BE_HRQ_HDR;
+		flags = (px->cap & PR_CAP_FE) ? SMP_VAL_FE_HRQ_HDR : SMP_VAL_BE_HRQ_HDR;
 		px->conf.args.ctx = ARGC_HRQ;
 		break;
 	case ACT_F_HTTP_RES:
-		if (px->cap & PR_CAP_FE)
-			flags |= SMP_VAL_FE_HRS_HDR;
-		if (px->cap & PR_CAP_BE)
-			flags |= SMP_VAL_BE_HRS_HDR;
+		flags = (px->cap & PR_CAP_BE) ? SMP_VAL_BE_HRS_HDR : SMP_VAL_FE_HRS_HDR;
 		px->conf.args.ctx =  ARGC_HRS;
 		break;
 	case ACT_F_TCP_CHK:
@@ -936,8 +918,6 @@ static int vars_parse_global_set_var(char **args, int section_type, struct proxy
 	struct act_rule rule = {
 		.arg.vars.scope = SCOPE_PROC,
 		.from = ACT_F_CFG_PARSER,
-		.conf.file = (char *)file,
-		.conf.line = line,
 	};
 	enum obj_type objt = OBJ_TYPE_NONE;
 	struct session *sess = NULL;
@@ -1057,8 +1037,6 @@ static int vars_parse_cli_set_var(char **args, char *payload, struct appctx *app
 	struct act_rule rule = {
 		.arg.vars.scope = SCOPE_PROC,
 		.from = ACT_F_CLI_PARSER,
-		.conf.file = "CLI",
-		.conf.line = 0,
 	};
 	enum obj_type objt = OBJ_TYPE_NONE;
 	struct session *sess = NULL;
@@ -1204,7 +1182,7 @@ INITCALL0(STG_PREPARE, vars_init);
 
 static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 
-	{ "var", smp_fetch_var, ARG2(1,STR,STR), smp_check_var, SMP_T_ANY, SMP_USE_CONST },
+	{ "var", smp_fetch_var, ARG2(1,STR,STR), smp_check_var, SMP_T_STR, SMP_USE_CONST },
 	{ /* END */ },
 }};
 
@@ -1217,15 +1195,6 @@ static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 }};
 
 INITCALL1(STG_REGISTER, sample_register_convs, &sample_conv_kws);
-
-static struct action_kw_list tcp_req_conn_kws = { { }, {
-	{ "set-var-fmt", parse_store, KWF_MATCH_PREFIX },
-	{ "set-var",   parse_store, KWF_MATCH_PREFIX },
-	{ "unset-var", parse_store, KWF_MATCH_PREFIX },
-	{ /* END */ }
-}};
-
-INITCALL1(STG_REGISTER, tcp_req_conn_keywords_register, &tcp_req_conn_kws);
 
 static struct action_kw_list tcp_req_sess_kws = { { }, {
 	{ "set-var-fmt", parse_store, KWF_MATCH_PREFIX },

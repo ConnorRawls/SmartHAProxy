@@ -27,12 +27,10 @@
 #include <haproxy/api.h>
 #include <haproxy/applet-t.h>
 #include <haproxy/cfgparse.h>
-#include <haproxy/clock.h>
 #include <haproxy/fd.h>
 #include <haproxy/frontend.h>
 #include <haproxy/global.h>
 #include <haproxy/http.h>
-#include <haproxy/http_ana.h>
 #include <haproxy/listener.h>
 #include <haproxy/log.h>
 #include <haproxy/proxy.h>
@@ -195,7 +193,7 @@ static const struct logformat_type logformat_keywords[] = {
 };
 
 char default_http_log_format[] = "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r"; // default format
-char default_https_log_format[] = "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r %[fc_err]/%[ssl_fc_err,hex]/%[ssl_c_err]/%[ssl_c_ca_err]/%[ssl_fc_is_resumed] %[ssl_fc_sni]/%sslv/%sslc";
+char default_https_log_format[] = "%ci:%cp [%tr] %ft %b/%s %TR/%Tw/%Tc/%Tr/%Ta %ST %B %CC %CS %tsc %ac/%fc/%bc/%sc/%rc %sq/%bq %hr %hs %{+Q}r %[fc_conn_err]/%[ssl_fc_hsk_err,hex]/%[ssl_c_err]/%[ssl_c_ca_err] %sslv/%sslc";
 char clf_http_log_format[] = "%{+Q}o %{-Q}ci - - [%trg] %r %ST %B \"\" \"\" %cp %ms %ft %b %s %TR %Tw %Tc %Tr %Ta %tsc %ac %fc %bc %sc %rc %sq %bq %CC %CS %hrl %hsl";
 char default_tcp_log_format[] = "%ci:%cp [%t] %ft %b/%s %Tw/%Tc/%Tt %B %ts %ac/%fc/%bc/%sc/%rc %sq/%bq";
 char *log_format = NULL;
@@ -417,8 +415,7 @@ int add_sample_to_logformat_list(char *text, char *arg, int arg_len, struct prox
 	cmd[1] = "";
 	cmd_arg = 0;
 
-	expr = sample_parse_expr(cmd, &cmd_arg, curpx->conf.args.file, curpx->conf.args.line, err,
-				 &curpx->conf.args, endptr);
+	expr = sample_parse_expr(cmd, &cmd_arg, curpx->conf.args.file, curpx->conf.args.line, err, &curpx->conf.args, endptr);
 	if (!expr) {
 		memprintf(err, "failed to parse sample expression <%s> : %s", text, *err);
 		goto error_free;
@@ -1665,7 +1662,8 @@ static inline void __do_send_log(struct logsrv *logsrv, int nblogger, int level,
 		struct ist msg;
 
 		msg = ist2(message, size);
-		msg = isttrim(msg, logsrv->maxlen);
+		if (msg.len > logsrv->maxlen)
+			msg.len = logsrv->maxlen;
 
 		sent = sink_write(logsrv->sink, &msg, 1, level, logsrv->facility, metadata);
 	}
@@ -1673,7 +1671,8 @@ static inline void __do_send_log(struct logsrv *logsrv, int nblogger, int level,
 		struct ist msg;
 
 		msg = ist2(message, size);
-		msg = isttrim(msg, logsrv->maxlen);
+		if (msg.len > logsrv->maxlen)
+			msg.len = logsrv->maxlen;
 
 		sent = fd_write_frag_line(*plogfd, logsrv->maxlen, msg_header, nbelem, &msg, 1, 1);
 	}
@@ -2009,28 +2008,28 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 		logs = &tmp_strm_log;
 
 		if ((fe->mode == PR_MODE_HTTP) && fe_conn && fe_conn->mux && fe_conn->mux->ctl) {
-			enum mux_exit_status es = fe_conn->mux->ctl(fe_conn, MUX_EXIT_STATUS, &status);
+			enum mux_exit_status es = fe_conn->mux->ctl(fe_conn, MUX_EXIT_STATUS, NULL);
 
 			switch (es) {
 			case MUX_ES_SUCCESS:
 				break;
 			case MUX_ES_INVALID_ERR:
-				status = (status ? status : 400);
+				status = 400;
 				if ((fe_conn->flags & CO_FL_ERROR) || conn_xprt_read0_pending(fe_conn))
 					s_flags = SF_ERR_CLICL | SF_FINST_R;
 				else
 					s_flags = SF_ERR_PRXCOND | SF_FINST_R;
 				break;
 			case MUX_ES_TOUT_ERR:
-				status = (status ? status : 408);
+				status = 408;
 				s_flags = SF_ERR_CLITO | SF_FINST_R;
 				break;
 			case MUX_ES_NOTIMPL_ERR:
-				status = (status ? status : 501);
+				status = 501;
 				s_flags = SF_ERR_PRXCOND | SF_FINST_R;
 				break;
 			case MUX_ES_INTERNAL_ERR:
-				status = (status ? status : 500);
+				status = 500;
 				s_flags = SF_ERR_INTERNAL | SF_FINST_R;
 				break;
 			default:
@@ -2050,10 +2049,7 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 		return 0;
 
 	list_for_each_entry(tmp, list_format, list) {
-#ifdef USE_OPENSSL
 		struct connection *conn;
-#endif
-		const struct sockaddr_storage *addr;
 		const char *src = NULL;
 		struct sample *key;
 		const struct buffer empty = { };
@@ -2102,12 +2098,11 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				break;
 
 			case LOG_FMT_CLIENTIP:  // %ci
-				addr = (s ? si_src(&s->si[0]) : sess_src(sess));
-				if (addr)
-					ret = lf_ip(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, tmp);
+				conn = objt_conn(sess->origin);
+				if (conn && conn_get_src(conn))
+					ret = lf_ip(tmplog, (struct sockaddr *)conn->src, dst + maxsize - tmplog, tmp);
 				else
 					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
-
 				if (ret == NULL)
 					goto out;
 				tmplog = ret;
@@ -2115,13 +2110,14 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				break;
 
 			case LOG_FMT_CLIENTPORT:  // %cp
-				addr = (s ? si_src(&s->si[0]) : sess_src(sess));
-				if (addr) {
-					/* sess->listener is always defined when the session's owner is an inbound connections */
-					if (addr->ss_family == AF_UNIX)
+				conn = objt_conn(sess->origin);
+				if (conn && conn_get_src(conn)) {
+					if (conn->src->ss_family == AF_UNIX) {
 						ret = ltoa_o(sess->listener->luid, tmplog, dst + maxsize - tmplog);
-					else
-						ret = lf_port(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, tmp);
+					} else {
+						ret = lf_port(tmplog, (struct sockaddr *)conn->src,
+						              dst + maxsize - tmplog, tmp);
+					}
 				}
 				else
 					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
@@ -2133,9 +2129,10 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				break;
 
 			case LOG_FMT_FRONTENDIP: // %fi
-				addr = (s ? si_dst(&s->si[0]) : sess_dst(sess));
-				if (addr)
-					ret = lf_ip(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, tmp);
+				conn = objt_conn(sess->origin);
+				if (conn && conn_get_dst(conn)) {
+					ret = lf_ip(tmplog, (struct sockaddr *)conn->dst, dst + maxsize - tmplog, tmp);
+				}
 				else
 					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
 
@@ -2146,13 +2143,12 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				break;
 
 			case  LOG_FMT_FRONTENDPORT: // %fp
-				addr = (s ? si_dst(&s->si[0]) : sess_dst(sess));
-				if (addr) {
-					/* sess->listener is always defined when the session's owner is an inbound connections */
-					if (addr->ss_family == AF_UNIX)
+				conn = objt_conn(sess->origin);
+				if (conn && conn_get_dst(conn)) {
+					if (conn->dst->ss_family == AF_UNIX)
 						ret = ltoa_o(sess->listener->luid, tmplog, dst + maxsize - tmplog);
 					else
-						ret = lf_port(tmplog, (struct sockaddr *)addr, dst + maxsize - tmplog, tmp);
+						ret = lf_port(tmplog, (struct sockaddr *)conn->dst, dst + maxsize - tmplog, tmp);
 				}
 				else
 					ret = lf_text_len(tmplog, NULL, 0, dst + maxsize - tmplog, tmp);
@@ -2321,8 +2317,6 @@ int sess_build_logline(struct session *sess, struct stream *s, char *dst, size_t
 				if (iret == 0)
 					goto out;
 				tmplog += iret;
-
-				/* sess->listener may be undefined if the session's owner is a health-check */
 				if (sess->listener && sess->listener->bind_conf->xprt == xprt_get(XPRT_SSL))
 					LOGCHAR('~');
 				if (tmp->options & LOG_OPT_QUOTE)
@@ -3503,7 +3497,8 @@ void syslog_fd_handler(int fd)
 	struct listener *l = objt_listener(fdtab[fd].owner);
 	int max_accept;
 
-	BUG_ON(!l);
+	if(!l)
+		ABORT_NOW();
 
 	if (fdtab[fd].state & FD_POLL_IN) {
 
