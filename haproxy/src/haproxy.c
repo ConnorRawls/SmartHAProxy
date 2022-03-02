@@ -140,10 +140,14 @@
 #include <haproxy/version.h>
 
 ///////////////// Begin edits /////////////////
-#include <haproxy/blacklist.h>
-#include <haproxy/sdsock.h>
 
-struct Blacklist blacklist;
+// #include <haproxy/sdsock.h>
+#include <haproxy/whitelist.h>
+
+#define CAPACITY 50 // Number of possible requests
+
+// SDSock sdsock;
+
 ////////////////// End edits //////////////////
 
 /* array of init calls for older platforms */
@@ -2883,6 +2887,9 @@ int main(int argc, char **argv)
 	// Create sdsock
 	SDSock_Make();
 
+	// Construct whitelist
+	createWhitelist(CAPACITY);
+
 	////////////////// End edits //////////////////
 
 	/* Catch forced CFLAGS that miss 2-complement integer overflow */
@@ -3502,7 +3509,9 @@ int main(int argc, char **argv)
 
 	///////////////// Begin edits /////////////////
 	
-	// Destroy blacklist and sdsock
+	// Destroy whitelist and sdsock
+	freeWhitelist();
+	SDSock_Destroy();
 
 	////////////////// End edits //////////////////
 

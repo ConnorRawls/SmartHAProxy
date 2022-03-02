@@ -35,6 +35,8 @@ INVALID_SERVER_COUNT = Exception('Invalid server count detected.\nAre your serve
 SERVER_UNKNOWN_H = Exception('Unknown server name detected in HAProxy logs.\nMust be of the format "vm#"')
 SERVER_UNKNOWN_A = Exception('Unknown server name detected in Apache logs.\nMust be of the format "vm#"')
 
+whitelist = {}
+
 def main():
     # Initialize static matrix
     # Contains tuples of possible tasks (uri) and their respective execution times
@@ -55,7 +57,6 @@ def main():
     # that are to be avoided on each server respectively
     dynMatrix = Manager().list()
     blacklist = Manager().list()
-
     
     # Detect number of backend servers
     # SOCKET = 'TCP:haproxy:90'
@@ -193,9 +194,18 @@ def blackAlg(statMatrix, dynMatrix, blacklist, lock):
                     # Add the task to the server's blacklist
                     blacklist[whichVM].append(uri)
 
+                    if uri not in whitelist:
+                        whitelist[uri] = []
+                        whitelist[uri].append(whichVM)       
+                    else:
+                        whitelist[uri].append(whichVM)
+
                 # Else remove it from server's blacklist if it is there
                 elif uri in blacklist[whichVM] and time + sumTime < SLO:
                     blacklist[whichVM].remove(uri)
+
+                    if uri in whitelist:
+                        whitelist[uri].remove(whichVM)
                                 
             whichVM += 1
 
@@ -237,8 +247,16 @@ def comms(blacklist, lock, srvCount):
 
                         count += 1
 
+                    t = []
+                    for url in whitelist:
+                        t.append('|')
+                        t.append(url)
+                        t.append('|')
+                        t.append(whitelist[url])
+
                     # Conversion to transmittable format
-                    bl_bytes = json.dumps(blacklist._getvalue()).encode('utf-8')
+                    # bl_bytes = json.dumps(blacklist._getvalue()).encode('utf-8')
+                    bl_bytes = json.dumps(t).encode('utf-8')
 
                     # Send info
                     conn.sendall(bl_bytes)

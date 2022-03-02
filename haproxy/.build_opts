@@ -1,1 +1,0 @@
-'linux-glibc USE_LUA=1 -O2 -g -Wall -Wextra -Wundef -Wdeclaration-after-statement -fwrapv -Wno-unused-label -Wno-sign-compare -Wno-unused-parameter -Wno-clobbered -Wno-missing-field-initializers -Wtype-limits -Wshift-negative-value -Wshift-overflow=2 -Wduplicated-cond -Wnull-dereference '
