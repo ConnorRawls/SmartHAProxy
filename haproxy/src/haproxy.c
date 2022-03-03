@@ -141,7 +141,6 @@
 
 ///////////////// Begin edits /////////////////
 
-#include <haproxy/sdsock.h>
 #include <haproxy/whitelist.h>
 
 #define CAPACITY 50 // Number of possible requests
