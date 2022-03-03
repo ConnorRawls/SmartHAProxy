@@ -12,8 +12,6 @@
 
 #define CAPACITY 50 // Number of possible requests
 
-// SDSock sdsock;
-
 // Hashed item
 typedef struct Request_T
 {

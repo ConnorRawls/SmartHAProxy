@@ -62,8 +62,6 @@
 
 #include <haproxy/whitelist.h>
 
-Whitelist whitelist;
-
 ////////////////// End edits //////////////////
 
 int be_lastsession(const struct proxy *be)
@@ -533,9 +531,13 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 {
 	///////////////// Begin edits /////////////////
 
-	updateWhitelist();
+	// char servers[7];
 
-	printWhitelist();
+	// updateWhitelist();
+
+	// servers = searchWhitelist(url);
+
+	// printf("\nURL: \"%s\", Servers: %s\n", url, servers);
 
 	////////////////// End edits //////////////////
 
