@@ -194,10 +194,18 @@ def blackAlg(statMatrix, dynMatrix, blacklist, lock):
                     # Add the task to the server's blacklist
                     blacklist[whichVM].append(uri)
 
+<<<<<<< HEAD
                     if uri in whitelist:
                         whitelist[uri].append(whichVM)
                     else:
                         whitelist[uri] = whichVM
+=======
+                    if uri not in whitelist:
+                        whitelist[uri] = []
+                        whitelist[uri].append(whichVM)       
+                    else:
+                        whitelist[uri].append(whichVM)
+>>>>>>> 719a2e967d40ef49fbf22930beccda88a0c064b1
 
                 # Else remove it from server's blacklist if it is there
                 elif uri in blacklist[whichVM] and time + sumTime < SLO:
