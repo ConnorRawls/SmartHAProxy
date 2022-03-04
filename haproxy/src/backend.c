@@ -58,17 +58,6 @@
 
 #define TRACE_SOURCE &trace_strm
 
-///////////////// Begin edits /////////////////
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <netdb.h>
-
-#include <haproxy/blacklist.h>
-#include <haproxy/request.h>
-
-struct Blacklist blacklist;
-////////////////// End edits //////////////////
 int be_lastsession(const struct proxy *be)
 {
 	if (be->be_counters.last_sess)
@@ -534,37 +523,6 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 /* random value  */
 static struct server *get_server_rnd(struct stream *s, const struct server *avoid)
 {
-	///////////////// Begin edits /////////////////
-
-	//keep communicating with server
-	for (int i = 0; i < 5; i++)
-	{		
-		char *message = "Hello";
-		char *server_reply[2000];
-
-		//Send some data
-		if (send(blacklist.sdsock, message, strlen(message), 0) < 0)
-		{
-			puts("Send failed");
-			return 1;
-		}
-		
-		//Receive a reply from the server
-		if (recv(blacklist.sdsock, server_reply, 2000, 0) < 0)
-		{
-			puts("recv failed");
-			break;
-		}
-		
-		puts("Server reply: ");
-		puts(server_reply);
-
-	}
-
-	close(blacklist.sdsock);
-
-	////////////////// End edits //////////////////
-
 	unsigned int hash = 0;
 	struct proxy  *px = s->be;
 	struct server *prev, *curr;

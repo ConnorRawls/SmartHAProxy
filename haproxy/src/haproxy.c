@@ -139,13 +139,6 @@
 #include <haproxy/vars.h>
 #include <haproxy/version.h>
 
-///////////////// Begin edits /////////////////
-#include <haproxy/blacklist.h>
-#include <haproxy/sdsock.h>
-
-struct Blacklist blacklist;
-////////////////// End edits //////////////////
-
 /* array of init calls for older platforms */
 DECLARE_INIT_STAGES;
 
@@ -2878,13 +2871,6 @@ int main(int argc, char **argv)
 	int pidfd = -1;
 	int intovf = (unsigned char)argc + 1; /* let the compiler know it's strictly positive */
 
-	///////////////// Begin edits /////////////////
-
-	// Create sdsock
-	SDSock_Make();
-
-	////////////////// End edits //////////////////
-
 	/* Catch forced CFLAGS that miss 2-complement integer overflow */
 	if (intovf + 0x7FFFFFFF >= intovf) {
 		fprintf(stderr,
@@ -3499,12 +3485,6 @@ int main(int argc, char **argv)
 	haproxy_unblock_signals();
 	run_thread_poll_loop(0);
 #endif
-
-	///////////////// Begin edits /////////////////
-	
-	// Destroy blacklist and sdsock
-
-	////////////////// End edits //////////////////
 
 	deinit_and_exit(0);
 }
