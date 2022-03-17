@@ -58,6 +58,14 @@
 
 #define TRACE_SOURCE &trace_strm
 
+///////////////// Begin edits /////////////////
+
+#include <haproxy/whitelist.h>
+
+ReqCount reqCount;
+
+////////////////// End edits //////////////////
+
 int be_lastsession(const struct proxy *be)
 {
 	if (be->be_counters.last_sess)
@@ -523,10 +531,28 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 /* random value  */
 static struct server *get_server_rnd(struct stream *s, const struct server *avoid)
 {
-	unsigned int hash = 0;
-	struct proxy  *px = s->be;
+	///////////////// Begin edits /////////////////
+	unsigned int hash;
+	struct proxy  *px;
 	struct server *prev, *curr;
-	int draws = px->lbprm.arg_opt1; // number of draws
+	int draws; // number of draws
+
+	reqCount.count++;
+
+	if(reqCount.count == 250){
+
+		updateWhitelist();
+
+		printf("\nMic check.\n");
+
+		reqCount.count = 0;
+	}
+
+	////////////////// End edits //////////////////
+
+	hash = 0;
+	px = s->be;
+	draws = px->lbprm.arg_opt1; // number of draws
 
 	/* tot_weight appears to mean srv_count */
 	if (px->lbprm.tot_weight == 0)
