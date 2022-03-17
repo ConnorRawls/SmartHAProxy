@@ -1,10 +1,6 @@
-# TODO
-# Finish socket crap in comms
-    # list().insert() does not work with Manager().list(). Find another way to prepend
-    # our delimiter.
-# Consider multiprocessing.Queue for dynMatrix.
-# Clean way to stop the program
-# Elegant error handling
+# QUESTIONS
+# Does passing global Manager() objects to constructor without using Process()
+# cause issues? (Does it actually change the objects on a global level?)
 
 # Author: Connor Rawls
 # Email: connorrawls1996@gmail.com
@@ -16,12 +12,12 @@
 # Four processes run concurrently:
 #   -haproxyEvent
 #   -apacheEvent
-#   -blackAlg
+#   -whiteAlg
 #   -comms
 # Three objects are referenced globally:
 #   -statMatrix
 #   -dynMatrix
-#   -blacklist
+#   -whitelist
 
 import os
 import csv
@@ -29,52 +25,29 @@ import subprocess
 import re
 import socket
 import json
+import time
+from sys import getsizeof
 from multiprocessing import Process, Manager, Lock
 
-INVALID_SERVER_COUNT = Exception('Invalid server count detected.\nAre your servers running?')
-SERVER_UNKNOWN_H = Exception('Unknown server name detected in HAProxy logs.\nMust be of the format "vm#"')
-SERVER_UNKNOWN_A = Exception('Unknown server name detected in Apache logs.\nMust be of the format "vm#"')
+INVALID_SERVER_COUNT = Exception('Invalid server count detected.\nAre your \
+    servers running?')
+SERVER_UNKNOWN_H = Exception('Unknown server name detected in HAProxy logs.\
+    \nMust be of the format "vm#"')
+SERVER_UNKNOWN_A = Exception('Unknown server name detected in Apache logs.\
+    \nMust be of the format "vm#"')
 
-whitelist = {}
+MSGLEN = 1
 
 def main():
-    # Initialize static matrix
-    # Contains tuples of possible tasks (uri) and their respective execution times
-    # (offline profiled)
+    # Contains tuples of possible tasks (url) and their respective execution 
+    # times (offline profiled)
     statMatrix = Manager().dict()
+    # Contains lists of currently being executed tasks on each backend server
+    dynMatrix = Manager().dict()
+    # Contains URL (key) and servers (value) request should not be sent to
+    whitelist = Manager().dict()
 
-    with open('requests.csv', 'r') as file:
-        reader = csv.reader(file)
-
-        # Skip header
-        next(reader)
-
-        for uri, time, dev in reader:
-            statMatrix[uri] = time
-
-    # Initialize dynamic matrix and blacklist
-    # Contains lists of currently being executed tasks on each backend server and tasks
-    # that are to be avoided on each server respectively
-    dynMatrix = Manager().list()
-    blacklist = Manager().list()
-    
-    # Detect number of backend servers
-    # SOCKET = 'TCP:haproxy:90'
-    # detect = subprocess.run('echo "show servers state" | socat {} stdio'.format(SOCKET), \
-    #     shell = True, stdout = subprocess.PIPE).stdout.decode('utf-8')
-    # srvCount = detect.count('web_servers')
-
-    # if srvCount < 1: raise INVALID_SERVER_COUNT
-
-    srvCount = 7
-
-    for whichVM in range(srvCount):
-        whichVM += 1
-
-        name = 'vm' + str(whichVM)
-
-        dynMatrix.append([])
-        blacklist.append([])
+    constructGlobals(statMatrix, dynMatrix, whitelist)
 
     # Truncate logs
     os.system("truncate -s 0 /var/log/apache_access.log")
@@ -86,9 +59,11 @@ def main():
     # Multiprocessing mumbo jumbo
     proc1 = Process(target = haproxyEvent, args = (dynMatrix, lock))
     proc2 = Process(target = apacheEvent, args = (dynMatrix, lock))
-    proc3 = Process(target = blackAlg, args = (statMatrix, dynMatrix, blacklist, \
-        lock))
-    proc4 = Process(target = comms, args = (blacklist, lock, srvCount))
+    proc3 = Process(target = whiteAlg, args = (statMatrix, dynMatrix, \
+        whitelist, lock))
+    proc4 = Process(target = comms, args = (whitelist, lock))
+
+    print("Commencing Smartdrop.")
 
     proc3.start()       # Start blacklist algorithm
     proc4.start()       # Start listening to socket
@@ -103,9 +78,9 @@ def main():
     proc4.terminate()   # Stop listening to socket
     proc3.terminate()   # Stop blacklist algorithm
 
-# ---------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Add task to dynamic matrix
-# ---------------------------------------------------------
+# -----------------------------------------------------------------------------
 def haproxyEvent(dynMatrix, lock):
     while True:
         with open('/var/log/haproxy_access.log', 'r') as file:
@@ -117,158 +92,220 @@ def haproxyEvent(dynMatrix, lock):
 
                 else:
                     server = row[0]
-                    uri = row[1]
+                    url = row[1]
 
                     if not re.match('^vm[0-9]+$', server): raise SERVER_UNKNOWN_H
 
-                    whichVM = int(server[2]) - 1
+                    whichVM = int(server[2])
 
                     lock.acquire()
-                    dynMatrix[whichVM].append(uri)
+                    dynMatrix[whichVM].append(url)
                     lock.release()
 
         # Truncate log
         os.system("truncate -s 0 /var/log/haproxy_access.log")
 
-# ---------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Remove task from dynamic matrix
-# ---------------------------------------------------------
+# -----------------------------------------------------------------------------
 def apacheEvent(dynMatrix, lock):
     while True:
-        # Log contains tuples of backend VM, uri, execution time
+        # Log contains tuples of backend VM, url, execution time
         with open('/var/log/apache_access.log', 'r') as file:
             reader = csv.reader(file)
 
-            # for server, uri, actualTime in reader:
+            # for server, url, actualTime in reader:
             for row in reader:
                 if len(row) != 3: pass
 
                 else:
                     server = row[0]
-                    uri = row[1]
+                    url = row[1]
                     actualTime = row[2]
 
-                    if not re.match('^hpcclab[0-9]+$', server): raise SERVER_UNKNOWN_A
+                    # if not re.match('^hpcclab[0-9]+$', server): raise SERVER_UNKNOWN_A
+                    if not re.match('^hpcclab[0-9]+$', server):
+                        print(f"Passing on '{server}'")
+                        pass
 
                     # Determine the VM that the tuple belongs to
-                    whichVM = int(server[7]) - 1
+                    whichVM = int(server[-1])
 
-                    # If the uri matches a request in the VM's tasklist
-                    # if uri in dynMatrix[whichVM].tasks:
-                    if uri in dynMatrix[whichVM]:
+                    # If the url matches a request in the VM's tasklist
+                    # if url in dynMatrix[whichVM].tasks:
+                    if url in dynMatrix[whichVM]:
                         # Remove the first instance of that task found
                         lock.acquire()
-                        dynMatrix[whichVM].remove(uri)
+                        dynMatrix[whichVM].remove(url)
                         lock.release()
 
         os.system("truncate -s 0 /var/log/apache_access.log")
 
-# ---------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Calculate which tasks belong on blacklist and update
-# ---------------------------------------------------------
-def blackAlg(statMatrix, dynMatrix, blacklist, lock):
+# -----------------------------------------------------------------------------
+def whiteAlg(statMatrix, dynMatrix, whitelist, lock):
     # Service Level Objective = 1 second
     SLO = 1
 
     while True:
         # Iterate for all backend servers
-        whichVM = 0
-        for server in dynMatrix:
+        for server in dynMatrix.keys():
             # Total summated execution times of current tasks
             sumTime = 0
 
             lock.acquire()
-            # for uri in server.tasks:
-            for uri in server:
-                if uri in statMatrix:
+            # for tasks on server:
+            for url in dynMatrix[server]:
+                if url in statMatrix:
                     # Find task's estimated ex. time and add to total
-                    sumTime += int(statMatrix[uri])
+                    sumTime += int(statMatrix[url])
             lock.release()
 
-            for uri in statMatrix.keys():
+            for url in statMatrix.keys():
                 # Individual time of specific task
-                time = int(statMatrix[uri])
+                time = float(statMatrix[url])
 
                 # If task will cause server to exceed SLO
-                if uri not in blacklist[whichVM] and time + sumTime > SLO:
-                    # Add the task to the server's blacklist
-                    blacklist[whichVM].append(uri)
+                if str(server) not in whitelist[url] and time + sumTime > SLO:
+                    print(f"Adding server {server} to URL \"{url}\"'s whitelist.")
 
-<<<<<<< HEAD
-                    if uri in whitelist:
-                        whitelist[uri].append(whichVM)
-                    else:
-                        whitelist[uri] = whichVM
-=======
-                    if uri not in whitelist:
-                        whitelist[uri] = []
-                        whitelist[uri].append(whichVM)       
-                    else:
-                        whitelist[uri].append(whichVM)
->>>>>>> 719a2e967d40ef49fbf22930beccda88a0c064b1
+                    # Add the task to the server's blacklist
+                    whitelist[url] += server
 
                 # Else remove it from server's blacklist if it is there
-                elif uri in blacklist[whichVM] and time + sumTime < SLO:
-                    blacklist[whichVM].remove(uri)
+                elif str(server) in whitelist[url] and time + sumTime < SLO:
+                    print(f"Removing server {server} from URL \"{url}\"'s whitelist.")
 
-                    if uri in whitelist:
-                        whitelist[uri].remove(whichVM)
+                    whitelist[url].replace(server, "")
                                 
-            whichVM += 1
-
-# ---------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Send blacklist data to clients
-# ---------------------------------------------------------
-def comms(blacklist, lock, srvCount):
+# -----------------------------------------------------------------------------
+def comms(whitelist, lock):
     HOST = 'smartdrop'
     PORT = 8080
 
-    while True: # Is this loop necessary?
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind((HOST, PORT))
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((HOST, PORT))
 
-            s.listen()
+        s.listen()
 
-            conn, addr = s.accept()
+        conn, addr = s.accept()
 
         with conn:
             print('Connected by: ', addr)
 
+            # Main loop
             while True:
-                # If client requests blacklist
-                data = conn.recv(1024)
+                # Receive 1
+                # print("Waiting for HAProxy...")
+                message = receiveMessage(conn)
+                # print(f"Message 1 received from HAProxy: {message}")
 
-                if not data:
-                    break
-                
-                else: # Is this necessary?
-                    lock.acquire()
+                # Set lock
+                # print("HAProxy requests lock. Setting...")
+                lock.acquire()
 
-                    # Iterate through blacklist and # prepend list with VM + number
-                    # (our delimiter)
-                    count = 0
-                    for whichVM in range(srvCount):
-                        t = blacklist[count]            # Must copy list first (lame)
-                        t.insert(0, 'VM' + str(count))  # To make changes
-                        blacklist[count] = t            # Then copy back
+                # Offload whitelist data
+                fileWrite(whitelist)
 
-                        count += 1
+                # Send 1
+                # print("Sending message 1 to HAProxy...")
+                sendMessage(conn, b'1')
+                # print("Message 1 sent to HAProxy.")
 
-                    t = []
-                    for url in whitelist:
-                        t.append('|')
-                        t.append(url)
-                        t.append('|')
-                        t.append(whitelist[url])
+                # Receive 2
+                # print("Waiting for HAProxy...")
+                message = receiveMessage(conn)
+                # print(f"Message 2 received from HAProxy: {message}")
 
-                    # Conversion to transmittable format
-                    # bl_bytes = json.dumps(blacklist._getvalue()).encode('utf-8')
-                    bl_bytes = json.dumps(t).encode('utf-8')
+                # Send 2
+                # print("Sending message 2...")
+                sendMessage(conn, b'2')
+                # print("Message 2 sent to HAProxy.\nData transfer complete.")
 
-                    # Send info
-                    conn.sendall(bl_bytes)
+                # Release lock
+                lock.release()
 
-                    lock.release()
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+
+def detectServers():
+    SOCKET = 'TCP:haproxy:90'
+    detect = subprocess.run('echo "show servers state" | socat {} stdio'.format(SOCKET), \
+        shell = True, stdout = subprocess.PIPE).stdout.decode('utf-8')
+    return detect.count('web_servers')
+
+def constructGlobals(statMatrix, dynMatrix, whitelist):
+    # Detect number of backend servers
+    # srvCount = detectServers()
+    # if srvCount < 1: raise INVALID_SERVER_COUNT
+
+    srvCount = 7
+
+    with open('requests.csv', 'r') as file:
+        reader = csv.reader(file)
+
+        # Skip header
+        next(reader)
+
+        for url, time, _ in reader:
+            # Convert from microseconds to seconds
+            statMatrix[url] = str((int(time) / 1e6))
+            whitelist[url] = ""
+
+        for server in range(srvCount):
+            dynMatrix[server + 1] = []
+
+def fileWrite(whitelist):
+    t = '' # Simplify dict to list object
+    for url in whitelist.keys():
+        t += url
+        t += ','
+        if whitelist[url] == '': t += '0'
+        else: t += whitelist[url]
+        t += ','
+
+    t = t[:-1]
+    t += '\0'
+
+    # Offload data to file
+    # print("Writing to /Whitelist/whitelist.csv...")
+    with open("/Whitelist/whitelist.csv", "r+") as file:
+        file.truncate(0)
+        file.write(t)
+    # print("...done.")
+
+def sendMessage(conn, message):
+    total_sent = 0
+    while total_sent < MSGLEN:
+        sent = conn.send(message[total_sent:])
+
+        if sent == 0: raise RuntimeError("Socket connection broken.")
+
+        total_sent = total_sent + sent
+
+    return
+
+def receiveMessage(conn):
+    chunks = []
+    bytes_received = 0
+    while bytes_received < MSGLEN:
+        chunk = conn.recv(min(MSGLEN - bytes_received, 2048))
+
+        if chunk == b'': raise RuntimeError("Socket connection broken.")
+
+        # print(f"New chunk has arrived. Size: {len(chunk)}")
+
+        chunks.append(chunk)
+
+        bytes_received = bytes_received + len(chunk)
+
+        # print(f"bytes_received: {bytes_received}")
+
+    return b''.join(chunks)
 
 if __name__ == '__main__':
     main()
