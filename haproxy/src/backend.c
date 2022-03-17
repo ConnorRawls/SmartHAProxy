@@ -529,9 +529,14 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 }
 
 /* random value  */
-static struct server *get_server_rnd(struct stream *s, const struct server *avoid)
+static struct server *get_server_rnd(struct stream *s, const struct server *avoid, const char *uri, int uri_len)
 {
 	///////////////// Begin edits /////////////////
+	char *url_cpy = malloc(sizeof(char) * (uri_len + 1)); //url extracted from the uri
+	const char *url; //pointer to where the url ends
+	char *servers; //list of servers from the whitelist that the request url can use
+	int url_len = uri_len; //length of url string
+
 	unsigned int hash;
 	struct proxy  *px;
 	struct server *prev, *curr;
@@ -547,6 +552,13 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 		reqCount.count = 0;
 	}
+	
+	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
+		url_len = url-uri;
+	}
+	strncpy(url_cpy, uri, url_len);
+	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
+	printf("\nURL: %s\n", url_cpy);
 
 	////////////////// End edits //////////////////
 
@@ -572,7 +584,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		if (prev && prev != curr &&
 			curr->served * prev->cur_eweight > prev->served * curr->cur_eweight)
 			curr = prev;
-	} while (--draws > 0);
+	} while (--draws > 0 && (curr->id[2] == '4' || curr->id[2] == '2'));
 
 	/* if the selected server is full, pretend we have none so that we reach
 		* the backend's queue instead.
@@ -580,6 +592,12 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	if (curr &&
 		(curr->queue.length || (curr->maxconn && curr->served >= srv_dynamic_maxconn(curr))))
 		curr = NULL;
+
+	if(curr == NULL){
+		printf("chosen server was NULL\n");
+	}else{
+		printf("id: %s\n", curr->id);
+	}
 
 	return curr;
 }
@@ -707,7 +725,11 @@ int assign_server(struct stream *s)
 			if ((s->be->lbprm.algo & BE_LB_KIND) == BE_LB_KIND_RR) {
 				/* static-rr (map) or random (chash) */
 				if ((s->be->lbprm.algo & BE_LB_PARM) == BE_LB_RR_RANDOM)
-					srv = get_server_rnd(s, prev_srv);
+				{
+					struct ist uri;
+					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
+					srv = get_server_rnd(s, prev_srv, uri.ptr, uri.len);
+				}
 				else
 					srv = map_get_server_rr(s->be, prev_srv);
 				break;
