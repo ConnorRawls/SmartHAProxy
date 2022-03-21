@@ -532,19 +532,21 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 static struct server *get_server_rnd(struct stream *s, const struct server *avoid, const char *uri, int uri_len)
 {
 	///////////////// Begin edits /////////////////
-	char *url_cpy = malloc(sizeof(char) * (uri_len + 1)); //url extracted from the uri
-	const char *url; //pointer to where the url ends
-	char *servers; //list of servers from the whitelist that the request url can use
-	int url_len = uri_len; //length of url string
-
+	// Below are constructs created by HAProxy. Moved up here to get
+	// the compile warning to shut up.
 	unsigned int hash;
 	struct proxy  *px;
 	struct server *prev, *curr;
 	int draws; // number of draws
 
+	char *url_cpy; //url extracted from the uri
+	const char *url; //pointer to where the url ends
+	char *servers; //list of servers from the whitelist that the request url can use
+	int url_len; //length of url string
+
 	reqCount.count++;
 
-	if(reqCount.count == 250){
+	if(reqCount.count == 1){
 
 		updateWhitelist();
 
@@ -553,12 +555,24 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		reqCount.count = 0;
 	}
 	
+	url_len = uri_len;
 	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
 		url_len = url-uri;
 	}
+
+	url_cpy = malloc(sizeof(char) * (uri_len + 1));
 	strncpy(url_cpy, uri, url_len);
 	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
-	printf("\nURL: %s\n", url_cpy);
+
+	servers = NULL;
+	servers = allocateSrvSize(url_cpy, servers); // Hidden malloc, careful
+	servers = searchRequest(url_cpy);
+
+	printf("\nURL: %s\nServers: %s\n", url_cpy, servers);
+
+	// Be sure to move this right before the function return
+	free(servers);
+	free(url_cpy);
 
 	////////////////// End edits //////////////////
 

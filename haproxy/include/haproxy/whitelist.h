@@ -52,6 +52,9 @@ char *strBurn(char *srvrply_parted);
 // Find request's whitelist in table
 char *searchRequest(char *url);
 
+// Malloc variable containing request's servers
+char *allocateSrvSize(char *url, char *servers);
+
 // Display item statistics
 void printRequest(char *url);
 

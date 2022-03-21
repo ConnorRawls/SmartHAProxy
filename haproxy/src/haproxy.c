@@ -144,7 +144,7 @@
 #include <haproxy/whitelist.h>
 #include <haproxy/sdsock.h>
 
-#define CAPACITY 100 // Number of possible requests
+#define CAPACITY 100 // Number of possible preprofiled requests
 
 ReqCount reqCount;
 
@@ -3515,8 +3515,8 @@ int main(int argc, char **argv)
 	///////////////// Begin edits /////////////////
 	
 	// Destroy whitelist and sdsock
-	// freeWhitelist();
-	// SDSock_Destroy();
+	freeWhitelist();
+	SDSock_Destroy();
 
 	////////////////// End edits //////////////////
 

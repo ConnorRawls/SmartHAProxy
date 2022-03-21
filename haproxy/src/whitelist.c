@@ -166,6 +166,17 @@ char *searchRequest(char *url)
     return NULL;
 }
 
+char *allocateSrvSize(char *url, char *servers)
+{
+    int index = hashRequest(url);
+
+    Request *request = whitelist.requests[index];
+
+    servers = malloc(sizeof(request->servers));
+
+    return servers;
+}
+
 // Display item statistics
 void printRequest(char *url)
 {
