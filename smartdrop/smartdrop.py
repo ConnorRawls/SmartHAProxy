@@ -94,7 +94,9 @@ def haproxyEvent(dynMatrix, lock):
                     server = row[0]
                     url = row[1]
 
-                    if not re.match('^vm[0-9]+$', server): raise SERVER_UNKNOWN_H
+                    if not re.match('^vm[0-9]+$', server):
+                        print('Passing on server: ', server)
+                        pass
 
                     whichVM = int(server[2])
 
