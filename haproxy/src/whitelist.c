@@ -172,9 +172,13 @@ char *allocateSrvSize(char *url, char *servers)
 
     Request *request = whitelist.requests[index];
 
-    servers = malloc(sizeof(request->servers));
+    if(request != NULL) {
+        servers = malloc(sizeof(request->servers));
 
-    return servers;
+        return servers;
+    }
+
+    return NULL;
 }
 
 // Display item statistics
