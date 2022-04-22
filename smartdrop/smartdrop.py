@@ -31,35 +31,27 @@ from multiprocessing import Process, Manager, Lock
 
 INVALID_SERVER_COUNT = Exception('Invalid server count detected.\nAre your \
     servers running?')
-SERVER_UNKNOWN_H = Exception('Unknown server name detected in HAProxy logs.\
-    \nMust be of the format "vm#"')
-SERVER_UNKNOWN_A = Exception('Unknown server name detected in Apache logs.\
-    \nMust be of the format "vm#"')
 
 MSGLEN = 1
 
 def main():
-    # Contains tuples of possible tasks (url) and their respective execution 
-    # times (offline profiled)
-    statMatrix = Manager().dict()
-    # Contains lists of currently being executed tasks on each backend server
-    dynMatrix = Manager().dict()
-    # Contains URL (key) and servers (value) request should not be sent to
+    # Expected execution time per task type
+    time_matrix = Manager().dict()
+    # Expected std. dev. of execution time per task type
+    stdev_matrix = Manager.dict()
+    # Expected response time of backend servers - task's expected execution time
+    expected_response = Manager.dict()
+    # Contains URL (key) and servers (value) tasks are allowed to dispatch to
     whitelist = Manager().dict()
-
-    constructGlobals(statMatrix, dynMatrix, whitelist)
-
-    # Truncate logs
-    os.system("truncate -s 0 /var/log/apache_access.log")
-    os.system("truncate -s 0 /var/log/haproxy_access.log")
-
     # Master Lock TM
     lock = Lock()
 
+    initGlobals(time_matrix, stdev_matrix, expected_response, whitelist)
+
     # Multiprocessing mumbo jumbo
-    proc1 = Process(target = haproxyEvent, args = (dynMatrix, lock))
-    proc2 = Process(target = apacheEvent, args = (dynMatrix, lock))
-    proc3 = Process(target = whiteAlg, args = (statMatrix, dynMatrix, \
+    proc1 = Process(target = haproxyEvent, args = (time_matrix, stdev_matrix, \
+        expected_response, lock))
+    proc2 = Process(target = whiteAlg, args = (time_matrix, expected_response, \
         whitelist, lock))
     proc4 = Process(target = comms, args = (whitelist, lock))
 
@@ -81,67 +73,114 @@ def main():
 # -----------------------------------------------------------------------------
 # Add task to dynamic matrix
 # -----------------------------------------------------------------------------
-def haproxyEvent(dynMatrix, lock):
-    while True:
-        with open('/var/log/haproxy_access.log', 'r') as file:
-            reader = csv.reader(file)
+def haproxyEvent(time_matrix, stdev_matrix, expected_response, lock):
+    # Instance's actual response time
+    actual_response = ''
+    # Internal records for managing task instances
+    # URL, expected execution time, expected std. dev., expected response time,
+    # server, actual response
+    record = {}
+    # Error protocol variables
+    task_count = 0
+    total_response = 0
+    error_count = 0
 
-            # Parse log file and add requests to dynMatrix
-            for row in reader:
-                if len(row) != 2: pass
+    # Truncate log
+    os.system("truncate -s 0 /var/log/haproxy_access.log")
 
-                else:
-                    server = row[0]
-                    url = row[1]
+    with open('records.csv', 'a') as record_file:
+        record_file.writerow('task type,expected execution time,expected variance,' + \
+            + 'expected response time,actual response time')
 
-                    if not re.match('^vm[0-9]+$', server):
-                        print('Passing on server: ', server)
-                        pass
+        with open('/var/log/haproxy_access.log', 'r') as log_file:
+            lines = logRead(log_file)
 
-                    whichVM = int(server[2])
+            # MAIN LOOP: Parse log file
+            for line in lines:
+                line.replace(' ', '')
+                line = line.split(',')
 
-                    lock.acquire()
-                    dynMatrix[whichVM].append(url)
-                    lock.release()
+                # Task instance ID
+                try:
+                    task_id = line[0]
+                    if not isint(task_id):
+                        error_count += 1
+                        print('\nTask ID is not an integer. Line:\n', line)
+                        print('Error count: ', error_count)
+                        continue
+                    if not int(task_id) >= 0:
+                        error_count += 1
+                        print('\nTask ID is not positive. Line:\n', line)
+                        print('Error count: ', error_count)
+                        continue
+                except IndexError:
+                    error_count += 1
+                    print('\nIndexError at ID value. Line:\n', line)
+                    print('Error count: ', error_count)
+                    continue
 
-        # Truncate log
-        os.system("truncate -s 0 /var/log/haproxy_access.log")
+                # URL
+                try:
+                    url = line[1]
+                    if url not in time_matrix.keys():
+                        url = unknownURL(url, time_matrix, task_id, record)
+                        if url == 'UNKNOWN':
+                            error_count += 1
+                            print('\nUnknown URL. Line:\n', line)
+                            print('Error count: ', error_count)
+                            continue
+                except IndexError:
+                    error_count += 1
+                    print('\nIndexError at URL. Line:\n', line)
+                    print('Error count: ', error_count)
+                    url = unknownURL(url, time_matrix, task_id, record)
+                    if url == 'UNKNOWN':
+                        print('Could not recover :(')
+                        continue
 
-# -----------------------------------------------------------------------------
-# Remove task from dynamic matrix
-# -----------------------------------------------------------------------------
-def apacheEvent(dynMatrix, lock):
-    while True:
-        # Log contains tuples of backend VM, url, execution time
-        with open('/var/log/apache_access.log', 'r') as file:
-            reader = csv.reader(file)
+                # Server
+                try:
+                    server = line[2]
+                    if not re.match('^vm[1-7]$', server):
+                        server = unknownServer(task_id, record)
+                        if server == 'UNKNOWN':
+                            error_count += 1
+                            print('\nUnknown server. Line:\n', line)
+                            print('Error count: ', error_count)
+                            continue
+                except IndexError:
+                    error_count += 1
+                    print('\nIndexError at server name. Line:\n', line)
+                    print('Error count: ', error_count)
+                    server = unknownServer(task_id, record)
+                    if server == 'UNKNOWN':
+                        print('Could not recover :(')
+                        continue
 
-            # for server, url, actualTime in reader:
-            for row in reader:
-                if len(row) != 3: pass
+                # Response time
+                try:
+                    actual_response = line[3]
+                    if not isfloat(actual_response):
+                        if task_id in record.keys():
+                            actual_response = total_response / task_count
+                        else:
+                            error_count += 1
+                            print('\nUnknown response. Line:\n', line)
+                            print('Error count: ', error_count)
+                            continue
+                except IndexError:
+                    error_count += 1
+                    print('IndexError at response value. Line:\n ', line)
+                    print('Error count: ', error_count)
+                    if task_id in record.keys():
+                        actual_response = total_response / task_count
+                    else:
+                        print('Could not recover :(')
+                        continue
 
-                else:
-                    server = row[0]
-                    url = row[1]
-                    actualTime = row[2]
+                # Insert task
 
-                    # if not re.match('^hpcclab[0-9]+$', server): raise SERVER_UNKNOWN_A
-                    if not re.match('^hpcclab[0-9]+$', server):
-                        print(f"Passing on '{server}'")
-                        pass
-
-                    # Determine the VM that the tuple belongs to
-                    whichVM = int(server[-1])
-
-                    # If the url matches a request in the VM's tasklist
-                    # if url in dynMatrix[whichVM].tasks:
-                    if url in dynMatrix[whichVM]:
-                        # Remove the first instance of that task found
-                        lock.acquire()
-                        dynMatrix[whichVM].remove(url)
-                        lock.release()
-
-        os.system("truncate -s 0 /var/log/apache_access.log")
+                # Task completion
 
 # -----------------------------------------------------------------------------
 # Calculate which tasks belong on blacklist and update
@@ -169,17 +208,17 @@ def whiteAlg(statMatrix, dynMatrix, whitelist, lock):
                 time = float(statMatrix[url])
 
                 # If task will cause server to exceed SLO
-                if str(server) not in whitelist[url] and time + sumTime > SLO:
-                    print(f"Adding server {server} to URL \"{url}\"'s whitelist.")
-
-                    # Add the task to the server's blacklist
-                    whitelist[url] += server
-
-                # Else remove it from server's blacklist if it is there
-                elif str(server) in whitelist[url] and time + sumTime < SLO:
+                if str(server) in whitelist[url] and time + sumTime > SLO:
+                    # Remove it from server's whitelist if it is there
                     print(f"Removing server {server} from URL \"{url}\"'s whitelist.")
 
                     whitelist[url].replace(server, "")
+
+                elif str(server) not in whitelist[url] and time + sumTime < SLO:
+                    print(f"Adding server {server} to URL \"{url}\"'s whitelist.")
+
+                    # Add the task to the server's whitelist
+                    whitelist[url] += str(server)
                                 
 # -----------------------------------------------------------------------------
 # Send blacklist data to clients
@@ -240,12 +279,12 @@ def detectServers():
         shell = True, stdout = subprocess.PIPE).stdout.decode('utf-8')
     return detect.count('web_servers')
 
-def constructGlobals(statMatrix, dynMatrix, whitelist):
+def initGlobals(time_matrix, stdev_matrix, expected_response, whitelist):
     # Detect number of backend servers
     # srvCount = detectServers()
     # if srvCount < 1: raise INVALID_SERVER_COUNT
 
-    srvCount = 7
+    srv_count = 1
 
     with open('requests.csv', 'r') as file:
         reader = csv.reader(file)
@@ -253,13 +292,59 @@ def constructGlobals(statMatrix, dynMatrix, whitelist):
         # Skip header
         next(reader)
 
-        for url, time, _ in reader:
+        for url, time, stdev in reader:
             # Convert from microseconds to seconds
-            statMatrix[url] = str((int(time) / 1e6))
-            whitelist[url] = ""
+            time_matrix[url] = int(time) / 1e6
+            stdev_matrix[url] = int(stdev) / 1e6
+            whitelist[url] = []
 
-        for server in range(srvCount):
-            dynMatrix[server + 1] = []
+        for server in range(srv_count): expected_response[server + 1] = 0
+
+        for url in whitelist.keys():
+            for server in range(srv_count):
+                whitelist[url].append(str(server + 1))
+
+# Get latest update to logfile
+def logRead(file):
+    file.seek(0, 2)
+
+    while True:
+        line = file.readline()
+        if not line: continue
+        yield line
+
+# Unrecognized URL handler
+def unknownURL(url, time_matrix, task_id, record):
+    for key in time_matrix:
+        if key in url:
+            return key
+
+    if task_id in record.keys():
+        buffer = record[task_id].split(',')
+        return buffer[0]
+
+    return 'UNKNOWN'
+
+def unknownServer(task_id, record):
+    if task_id in record.keys():
+        buffer = record[task_id].split(',')
+        return buffer[4]
+
+    return 'UNKNOWN'
+
+def isint(string):
+    try:
+        int(string)
+        return True
+    except ValueError:
+        return False
+
+def isfloat(string):
+    try:
+        float(string)
+        return True
+    except ValueError:
+        return False
 
 def fileWrite(whitelist):
     t = '' # Simplify dict to list object
