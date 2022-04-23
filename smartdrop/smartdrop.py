@@ -1,23 +1,26 @@
-# QUESTIONS
-# Does passing global Manager() objects to constructor without using Process()
-# cause issues? (Does it actually change the objects on a global level?)
+'''
+TODO: Fix detectServers()
 
-# Author: Connor Rawls
-# Email: connorrawls1996@gmail.com
-# Organization: University of Louisiana
+-------------------------------------
+Author: Connor Rawls
+Email: connorrawls1996@gmail.com
+Organization: University of Louisiana
+-------------------------------------
 
-# Capture actual task (http request) list of each backend server and determine which
-# tasks each server will not be able to satisfy based upon SLO requirements (1 sec).
-# Communicate this information with client through UNIX sockets.
-# Four processes run concurrently:
-#   -haproxyEvent
-#   -apacheEvent
-#   -whiteAlg
-#   -comms
-# Three objects are referenced globally:
-#   -statMatrix
-#   -dynMatrix
-#   -whitelist
+Capture task-related events and determine which servers will be able to satisfy
+task types based upon SLO requirements (1 sec). Communicate this information with
+client through UNIX sockets.
+
+Three processes run concurrently:
+  -haproxyEvent
+  -whiteAlg
+  -comms
+Four objects are referenced globally:
+  -time_matrix
+  -stdev_matrix
+  -expected_response
+  -whitelist
+'''
 
 import os
 import csv
@@ -30,39 +33,41 @@ import sys
 from multiprocessing import Process, Manager, Lock
 
 MSGLEN = 1
+SRVCOUNT = 1
 
 def main():
-    # Expected execution time per task type
-    time_matrix = Manager().dict()
-    # Expected std. dev. of execution time per task type
-    stdev_matrix = Manager.dict()
-    # Expected response time of backend servers - task's expected execution time
-    expected_response = Manager.dict()
-    # Contains URL (key) and servers (value) tasks are allowed to dispatch to
-    whitelist = Manager().dict()
-    # Master Lock TM
-    lock = Lock()
+    with Manager() as m:
+        # Expected execution time per task type
+        time_matrix = m.dict()
+        # Expected std. dev. of execution time per task type
+        stdev_matrix = m.dict()
+        # Expected response time of backend servers - task's expected execution time
+        expected_response = m.dict()
+        # Contains URL (key) and servers (value) tasks are allowed to dispatch to
+        whitelist = m.dict()
+        # Master Lock TM
+        lock = Lock()
 
-    initGlobals(time_matrix, stdev_matrix, expected_response, whitelist)
+        initGlobals(time_matrix, stdev_matrix, expected_response, whitelist, m)
 
-    # Multiprocessing mumbo jumbo
-    proc1 = Process(target = haproxyEvent, args = (time_matrix, stdev_matrix, \
-        expected_response, lock))
-    proc2 = Process(target = whiteAlg, args = (time_matrix, expected_response, \
-        whitelist, lock))
-    proc3 = Process(target = comms, args = (whitelist, lock))
+        # Multiprocessing mumbo jumbo
+        proc1 = Process(target = haproxyEvent, args = (time_matrix, stdev_matrix, \
+            expected_response, lock))
+        proc2 = Process(target = whiteAlg, args = (time_matrix, expected_response, \
+            whitelist, lock))
+        proc3 = Process(target = comms, args = (whitelist, lock))
 
-    print("Commencing Smartdrop.")
+        print("Commencing Smartdrop.")
 
-    proc1.start()       # Start listening for task events
-    proc2.start()       # Start whitelist algorithm
-    proc3.start()       # Start listening for socket messages
-    proc1.join()
-    proc2.join()
-    proc3.join()
-    proc1.terminate()   # Stop listening for task events
-    proc2.terminate()   # Stop whitelist algorithm
-    proc3.terminate()   # Stop listening for socket messages
+        proc1.start()       # Start listening for task events
+        proc2.start()       # Start whitelist algorithm
+        proc3.start()       # Start listening for socket messages
+        proc1.join()
+        proc2.join()
+        proc3.join()
+        proc1.terminate()   # Stop listening for task events
+        proc2.terminate()   # Stop whitelist algorithm
+        proc3.terminate()   # Stop listening for socket messages
 
 # Monitor task-related events
 # -----------------------------------------------------------------------------
@@ -82,8 +87,8 @@ def haproxyEvent(time_matrix, stdev_matrix, expected_response, lock):
     os.system("truncate -s 0 /var/log/haproxy_access.log")
 
     with open('records.csv', 'a') as record_file:
-        record_file.writerow('task type,expected execution time,expected variance,' + \
-            + 'expected response time,actual response time')
+        record_file.write('task type,expected execution time,expected variance,' + \
+            'expected response time,actual response time')
 
         with open('/var/log/haproxy_access.log', 'r') as log_file:
             lines = logRead(log_file)
@@ -225,6 +230,8 @@ def whiteAlg(time_matrix, expected_response, whitelist, lock):
 
                 elif server not in whitelist[url] and execution + response < SLO:
                     print(f"Adding server {server} to URL \"{url}\"'s whitelist.")
+                    print('Whitelist: ', whitelist[url])
+                    print('Server: ', server)
                     # Add the task to the server's whitelist
                     whitelist[url].append(server)
 
@@ -288,13 +295,11 @@ def detectServers():
     return detect.count('web_servers')
 
 # Construct shared variables
-def initGlobals(time_matrix, stdev_matrix, expected_response, whitelist):
+def initGlobals(time_matrix, stdev_matrix, expected_response, whitelist, m):
     # Detect number of backend servers
     # srvCount = detectServers()
     # if srvCount < 1:
     #    sys.exit('\nInvalid server count. Are your servers running?')
-
-    srv_count = 1
 
     with open('requests.csv', 'r') as file:
         reader = csv.reader(file)
@@ -304,15 +309,15 @@ def initGlobals(time_matrix, stdev_matrix, expected_response, whitelist):
 
         for url, time, stdev in reader:
             # Convert from microseconds to seconds
-            time_matrix[url] = int(time) / 1e6
-            stdev_matrix[url] = int(stdev) / 1e6
-            whitelist[url] = []
+            time_matrix[url] = float(time) / 1e6
+            stdev_matrix[url] = float(stdev) / 1e6
+            whitelist[url] = m.list()
 
-        for server in range(srv_count): expected_response[server + 1] = 0
+        for server in range(SRVCOUNT): expected_response['vm' + str(server + 1)] = 0
 
         for url in whitelist.keys():
-            for server in range(srv_count):
-                whitelist[url].append(str('vm' + (server + 1)))
+            for server in range(SRVCOUNT):
+                whitelist[url].append('vm' + str(server + 1))
 
 # Get latest update to logfile
 def logRead(file):
