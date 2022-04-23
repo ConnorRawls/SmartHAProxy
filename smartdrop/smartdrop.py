@@ -26,11 +26,8 @@ import re
 import socket
 import json
 import time
-from sys import getsizeof
+import sys
 from multiprocessing import Process, Manager, Lock
-
-INVALID_SERVER_COUNT = Exception('Invalid server count detected.\nAre your \
-    servers running?')
 
 MSGLEN = 1
 
@@ -53,25 +50,21 @@ def main():
         expected_response, lock))
     proc2 = Process(target = whiteAlg, args = (time_matrix, expected_response, \
         whitelist, lock))
-    proc4 = Process(target = comms, args = (whitelist, lock))
+    proc3 = Process(target = comms, args = (whitelist, lock))
 
     print("Commencing Smartdrop.")
 
-    proc3.start()       # Start blacklist algorithm
-    proc4.start()       # Start listening to socket
-    proc1.start()       # Start reading HAProxy events
-    proc2.start()       # Start reading Apache events
+    proc1.start()       # Start listening for task events
+    proc2.start()       # Start whitelist algorithm
+    proc3.start()       # Start listening for socket messages
     proc1.join()
     proc2.join()
-    proc1.terminate()   # Stop reading HAProxy events
-    proc2.terminate()   # Stop reading Apache events
-    proc4.join()
     proc3.join()
-    proc4.terminate()   # Stop listening to socket
-    proc3.terminate()   # Stop blacklist algorithm
+    proc1.terminate()   # Stop listening for task events
+    proc2.terminate()   # Stop whitelist algorithm
+    proc3.terminate()   # Stop listening for socket messages
 
-# -----------------------------------------------------------------------------
-# Add task to dynamic matrix
+# Monitor task-related events
 # -----------------------------------------------------------------------------
 def haproxyEvent(time_matrix, stdev_matrix, expected_response, lock):
     # Instance's actual response time
@@ -85,7 +78,7 @@ def haproxyEvent(time_matrix, stdev_matrix, expected_response, lock):
     total_response = 0
     error_count = 0
 
-    # Truncate log
+    # Clear log
     os.system("truncate -s 0 /var/log/haproxy_access.log")
 
     with open('records.csv', 'a') as record_file:
@@ -179,49 +172,65 @@ def haproxyEvent(time_matrix, stdev_matrix, expected_response, lock):
                         continue
 
                 # Insert task
+                if '-' in str(actual_response):
+                    try:
+                        lock.acquire()
+                        expected_response[server] += time_matrix[url]
+                        lock.release()
+                        record[task_id] = url + ',' + str(time_matrix[url]) + ',' + \
+                            str(var_matrix[url]) + ',' + str(expected_response) + \
+                            ',' + str(server) + ','
+                    except KeyError:
+                        error_count += 1
+                        print('\nKeyError at inserting task. Line:\n', line)
+                        print('Error count: ', error_count)
 
                 # Task completion
+                else:
+                    try:
+                        if not task_id in record.keys(): continue
+                        lock.acquire()
+                        expected_response[server] -= time_matrix[url]
+                        lock.release()
+                        record[task_id] += str(float(actual_response) / 1e6)
+                        record_file.write(record[task_id] + '\n')
+                        del record[task_id]
+                        total_response += int(actual_response)
+                        task_count += 1
+                    except KeyError:
+                        error_count += 1
+                        print('\nKeyError at task completion. Line:\n', line)
+                        print('Error count: ', error_count)
 
+# Calculate task whitelists
 # -----------------------------------------------------------------------------
-# Calculate which tasks belong on blacklist and update
-# -----------------------------------------------------------------------------
-def whiteAlg(statMatrix, dynMatrix, whitelist, lock):
+def whiteAlg(time_matrix, expected_response, whitelist, lock):
     # Service Level Objective = 1 second
     SLO = 1
 
     while True:
         # Iterate for all backend servers
-        for server in dynMatrix.keys():
-            # Total summated execution times of current tasks
-            sumTime = 0
-
-            lock.acquire()
-            # for tasks on server:
-            for url in dynMatrix[server]:
-                if url in statMatrix:
-                    # Find task's estimated ex. time and add to total
-                    sumTime += int(statMatrix[url])
-            lock.release()
-
-            for url in statMatrix.keys():
-                # Individual time of specific task
-                time = float(statMatrix[url])
+        for server in expected_response.keys():
+            # Iterate for all task types
+            for url in whitelist.keys():
+                lock.acquire()
+                execution = float(time_matrix[url])
+                response = float(expected_response[server])
 
                 # If task will cause server to exceed SLO
-                if str(server) in whitelist[url] and time + sumTime > SLO:
+                if server in whitelist[url] and execution + response >= SLO:
                     # Remove it from server's whitelist if it is there
                     print(f"Removing server {server} from URL \"{url}\"'s whitelist.")
+                    whitelist[url].remove(server)
 
-                    whitelist[url].replace(server, "")
-
-                elif str(server) not in whitelist[url] and time + sumTime < SLO:
+                elif server not in whitelist[url] and execution + response < SLO:
                     print(f"Adding server {server} to URL \"{url}\"'s whitelist.")
-
                     # Add the task to the server's whitelist
-                    whitelist[url] += str(server)
+                    whitelist[url].append(server)
+
+                lock.release()
                                 
-# -----------------------------------------------------------------------------
-# Send blacklist data to clients
+# Send whitelist to load balancer
 # -----------------------------------------------------------------------------
 def comms(whitelist, lock):
     HOST = 'smartdrop'
@@ -269,20 +278,21 @@ def comms(whitelist, lock):
                 # Release lock
                 lock.release()
 
-# -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
-
+# How many backend servers are running
 def detectServers():
     SOCKET = 'TCP:haproxy:90'
     detect = subprocess.run('echo "show servers state" | socat {} stdio'.format(SOCKET), \
         shell = True, stdout = subprocess.PIPE).stdout.decode('utf-8')
     return detect.count('web_servers')
 
+# Construct shared variables
 def initGlobals(time_matrix, stdev_matrix, expected_response, whitelist):
     # Detect number of backend servers
     # srvCount = detectServers()
-    # if srvCount < 1: raise INVALID_SERVER_COUNT
+    # if srvCount < 1:
+    #    sys.exit('\nInvalid server count. Are your servers running?')
 
     srv_count = 1
 
@@ -302,7 +312,7 @@ def initGlobals(time_matrix, stdev_matrix, expected_response, whitelist):
 
         for url in whitelist.keys():
             for server in range(srv_count):
-                whitelist[url].append(str(server + 1))
+                whitelist[url].append(str('vm' + (server + 1)))
 
 # Get latest update to logfile
 def logRead(file):
@@ -325,6 +335,7 @@ def unknownURL(url, time_matrix, task_id, record):
 
     return 'UNKNOWN'
 
+# Unknown server handler
 def unknownServer(task_id, record):
     if task_id in record.keys():
         buffer = record[task_id].split(',')
@@ -332,6 +343,7 @@ def unknownServer(task_id, record):
 
     return 'UNKNOWN'
 
+# Is variable integer?
 def isint(string):
     try:
         int(string)
@@ -339,6 +351,7 @@ def isint(string):
     except ValueError:
         return False
 
+# Is variable float?
 def isfloat(string):
     try:
         float(string)
@@ -346,6 +359,7 @@ def isfloat(string):
     except ValueError:
         return False
 
+# Write data to file
 def fileWrite(whitelist):
     t = '' # Simplify dict to list object
     for url in whitelist.keys():
@@ -365,6 +379,7 @@ def fileWrite(whitelist):
         file.write(t)
     # print("...done.")
 
+# Socket send
 def sendMessage(conn, message):
     total_sent = 0
     while total_sent < MSGLEN:
@@ -376,6 +391,7 @@ def sendMessage(conn, message):
 
     return
 
+# Socket receive
 def receiveMessage(conn):
     chunks = []
     bytes_received = 0
