@@ -41,42 +41,53 @@ def main():
         time_matrix = m.dict()
         # Expected std. dev. of execution time per task type
         stdev_matrix = m.dict()
-        # Expected response time of backend servers - task's expected execution time
+        # Expected response time of backend servers - task's expected execution
+        # time
         expected_response = m.dict()
+        # CPU utilization stamp at time of instance dispatch
+        cpu_usage = m.dict()
         # Contains URL (key) and servers (value) tasks are allowed to dispatch to
         whitelist = m.dict()
         # Master Lock TM
-        lock = Lock()
+        er_lock = Lock()
+        cpu_lock = Lock()
 
-        initGlobals(time_matrix, stdev_matrix, expected_response, whitelist, m)
+        initGlobals(time_matrix, stdev_matrix, expected_response, cpu_usage, \
+            whitelist, m)
 
         # Multiprocessing mumbo jumbo
         proc1 = Process(target = haproxyEvent, args = (time_matrix, stdev_matrix, \
-            expected_response, lock))
-        proc2 = Process(target = whiteAlg, args = (time_matrix, expected_response, \
-            whitelist, lock))
-        proc3 = Process(target = comms, args = (whitelist, lock))
+            expected_response, cpu_usage, er_lock, cpu_lock))
+        proc2 = Process(target = cpuUsage, args = (cpu_usage, cpu_lock))
+        proc3 = Process(target = whiteAlg, args = (time_matrix, expected_response, \
+            cpu_usage, whitelist, er_lock, cpu_lock))
+        proc4 = Process(target = comms, args = (whitelist, er_lock, cpu_lock))
 
         print("Commencing Smartdrop.")
 
         proc1.start()       # Start listening for task events
-        proc2.start()       # Start whitelist algorithm
-        proc3.start()       # Start listening for socket messages
+        proc2.start()       # Start observing hardware metrics
+        proc3.start()       # Start whitelist algorithm
+        proc4.start()       # Start listening for socket messages
         proc1.join()
         proc2.join()
         proc3.join()
+        proc4.join()
         proc1.terminate()   # Stop listening for task events
-        proc2.terminate()   # Stop whitelist algorithm
-        proc3.terminate()   # Stop listening for socket messages
+        proc2.terminate()   # Stop observing hardware metrics
+        proc3.terminate()   # Stop whitelist algorithm
+        proc4.terminate()   # Stop listening for socket messages
 
-# Monitor task-related events
+# Process 1
 # -----------------------------------------------------------------------------
-def haproxyEvent(time_matrix, stdev_matrix, expected_response, lock):
+# Monitor task-related events
+def haproxyEvent(time_matrix, stdev_matrix, expected_response, cpu_usage, \
+    er_lock, cpu_lock):
     # Instance's actual response time
     actual_response = ''
     # Internal records for managing task instances
     # URL, expected execution time, expected std. dev., expected response time,
-    # server, actual response
+    # server, CPU usage, actual response
     record = {}
     # Error protocol variables
     task_count = 0
@@ -139,7 +150,7 @@ def haproxyEvent(time_matrix, stdev_matrix, expected_response, lock):
                 # Server
                 try:
                     server = line[2]
-                    if not re.match('^vm[1-7]$', server):
+                    if not re.match('^WP-Host[1-7]$', server):
                         server = unknownServer(task_id, record)
                         if server == 'UNKNOWN':
                             error_count += 1
@@ -179,12 +190,14 @@ def haproxyEvent(time_matrix, stdev_matrix, expected_response, lock):
                 # Insert task
                 if '-' in str(actual_response):
                     try:
-                        lock.acquire()
+                        er_lock.acquire()
                         expected_response[server] += time_matrix[url]
-                        lock.release()
+                        er_lock.release()
+                        cpu_lock.acquire()
                         record[task_id] = url + ',' + str(time_matrix[url]) + ',' + \
                             str(var_matrix[url]) + ',' + str(expected_response) + \
-                            ',' + str(server) + ','
+                            ',' + str(server) + ',' + str(cpu_usage[server].value) + ','
+                        cpu_lock.release()
                     except KeyError:
                         error_count += 1
                         print('\nKeyError at inserting task. Line:\n', line)
@@ -194,9 +207,9 @@ def haproxyEvent(time_matrix, stdev_matrix, expected_response, lock):
                 else:
                     try:
                         if not task_id in record.keys(): continue
-                        lock.acquire()
+                        er_lock.acquire()
                         expected_response[server] -= time_matrix[url]
-                        lock.release()
+                        er_lock.release()
                         record[task_id] += str(float(actual_response) / 1e6)
                         record_file.write(record[task_id] + '\n')
                         del record[task_id]
@@ -207,9 +220,38 @@ def haproxyEvent(time_matrix, stdev_matrix, expected_response, lock):
                         print('\nKeyError at task completion. Line:\n', line)
                         print('Error count: ', error_count)
 
-# Calculate task whitelists
+# Process 2
 # -----------------------------------------------------------------------------
-def whiteAlg(time_matrix, expected_response, whitelist, lock):
+# Monitor CPU utilization of backend server
+def cpuUsage(cpu_usage, cpu_lock): 
+    conn = libvirt.openReadOnly("qemu+ssh://root@hpcccloud1.cmix.louisiana.edu/system")
+    for server in cpu_usage.keys():
+        cpu_lock.acquire()
+        cpu_usage[server].value = 0
+        cpu_lock.release()
+
+    while True:
+        for server in cpu_usage.keys():
+            print('Domain name: ', server)
+            domain = conn.lookupByName(server)
+
+            time1 = time.time()
+            clock1 = int(domain.info()[4])
+            time.sleep(1.25)
+            time2 = time.time()
+            clock2 = int(domain.info()[4])
+            cores = int(domain.info()[3])
+
+            cpu_lock.acquire()
+            cpu_usage[server].value = round((clock2 - clock1) * 100 / ((time2 - time1) * cores * 1e9), 2)
+            if cpu_usage[server].value > 100: cpu_usage[server].value = 100
+            cpu_lock.release()
+
+# Process 3
+# -----------------------------------------------------------------------------
+# Calculate task whitelists
+def whiteAlg(time_matrix, expected_response, cpu_usage, whitelist, er_lock, \
+    cpu_lock):
     # Service Level Objective = 1 second
     SLO = 1
 
@@ -218,7 +260,7 @@ def whiteAlg(time_matrix, expected_response, whitelist, lock):
         for server in expected_response.keys():
             # Iterate for all task types
             for url in whitelist.keys():
-                lock.acquire()
+                er_lock.acquire()
                 execution = float(time_matrix[url])
                 response = float(expected_response[server])
 
@@ -235,11 +277,12 @@ def whiteAlg(time_matrix, expected_response, whitelist, lock):
                     # Add the task to the server's whitelist
                     whitelist[url].append(server)
 
-                lock.release()
+                er_lock.release()
                                 
-# Send whitelist to load balancer
+# Process 4
 # -----------------------------------------------------------------------------
-def comms(whitelist, lock):
+# Send whitelist to load balancer
+def comms(whitelist, er_lock, cpu_lock):
     HOST = 'smartdrop'
     PORT = 8080
 
@@ -260,9 +303,9 @@ def comms(whitelist, lock):
                 message = receiveMessage(conn)
                 # print(f"Message 1 received from HAProxy: {message}")
 
-                # Set lock
-                # print("HAProxy requests lock. Setting...")
-                lock.acquire()
+                # Set er_lock
+                # print("HAProxy requests er_lock. Setting...")
+                er_lock.acquire()
 
                 # Offload whitelist data
                 fileWrite(whitelist)
@@ -282,8 +325,8 @@ def comms(whitelist, lock):
                 sendMessage(conn, b'2')
                 # print("Message 2 sent to HAProxy.\nData transfer complete.")
 
-                # Release lock
-                lock.release()
+                # Release er_lock
+                er_lock.release()
 
 # Utilities
 # -----------------------------------------------------------------------------
@@ -295,7 +338,8 @@ def detectServers():
     return detect.count('web_servers')
 
 # Construct shared variables
-def initGlobals(time_matrix, stdev_matrix, expected_response, whitelist, m):
+def initGlobals(time_matrix, stdev_matrix, expected_response, cpu_usage, \
+    whitelist, m):
     # Detect number of backend servers
     # srvCount = detectServers()
     # if srvCount < 1:
@@ -313,11 +357,18 @@ def initGlobals(time_matrix, stdev_matrix, expected_response, whitelist, m):
             stdev_matrix[url] = float(stdev) / 1e6
             whitelist[url] = m.list()
 
-        for server in range(SRVCOUNT): expected_response['vm' + str(server + 1)] = 0
+        for server in range(SRVCOUNT):
+            if server == 0:
+                expected_response['WP-Host'] = 0
+                cpu_usage['WP-Host'] = m.Value('d', 0.0)
+            else:
+                expected_response['WP-Host' + str(server + 1)] = 0
+                cpu_usage['WP-Host' + str(server + 1)] = m.Value('d', 0.0)
 
         for url in whitelist.keys():
             for server in range(SRVCOUNT):
-                whitelist[url].append('vm' + str(server + 1))
+                if server == 0: whitelist[url].append('WP-Host')
+                else: whitelist[url].append('WP-Host' + str(server + 1))
 
 # Get latest update to logfile
 def logRead(file):
