@@ -2893,7 +2893,7 @@ int main(int argc, char **argv)
 
 	// Construct whitelist
 	createWhitelist(CAPACITY);
-	printf("\nWhitelist initialized.");
+	printf("\nWhitelist initialized.\n");
 
 	////////////////// End edits //////////////////
 

@@ -3,12 +3,15 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include <string.h>
+#include <err.h>
 
 #include <haproxy/sdsock.h>
 #include <haproxy/whitelist.h>
 #include <haproxy/fileRead.h>
 
 #define CAPACITY 50 // Number of possible requests
+#define MAXURL 100
+#define MAXSRV 10
 
 Whitelist whitelist;
 
@@ -92,43 +95,92 @@ void insertRequest(char *url, char *servers)
     }
 }
 
+// // Fill whitelist with new values
+// void updateWhitelist()
+// {
+//     char *file_name, *buffer, *data_parsed, *url, *servers;
+
+//     // printf("\nAcquiring access to shared volume...\n");
+
+//     SDSock_Set(); // Lock for reading from /Whitelist/whitelist.csv
+
+//     // printf("\nAccess granted. Reading file...\n");
+
+//     file_name = "/Whitelist/whitelist.csv";
+
+//     buffer = fileRead(file_name);
+
+//     // printf("\nFinished reading file. Releasing lock...\n");
+
+//     SDSock_Release();
+
+//     // printf("\nData transfer complete.\n");
+
+//     data_parsed = strtok(buffer, "\n");
+
+//     while(data_parsed != NULL) {
+//         data_parsed = strtok(NULL, ",");
+//         url = strBurn(data_parsed);
+
+//         data_parsed = strtok(NULL, ",");
+//         servers = strBurn(data_parsed);
+
+//         if(servers[strlen(servers) - 1] == '\0') break;
+
+//         insertRequest(url, servers);
+
+//         data_parsed = strtok(NULL, "\n");
+//     }
+
+//     free(buffer);
+
+//     return;
+// }
+
 // Fill whitelist with new values
 void updateWhitelist()
 {
-    char *file_name, *buffer, *data_parsed, *url, *servers;
+    FILE *file_ptr;
+    char *buffer, *temp, url[200], servers[20];
+    long int file_size;
+    char *file_name;
 
-    // printf("\nAcquiring access to shared volume...\n");
-
+    // QUARANTINE //
     SDSock_Set(); // Lock for reading from /Whitelist/whitelist.csv
-
-    // printf("\nAccess granted. Reading file...\n");
 
     file_name = "/Whitelist/whitelist.csv";
 
-    buffer = fileRead(file_name);
+    file_ptr = fopen(file_name, "r");
+    if(file_ptr == NULL) err(1, "\nFile not found.\n");
 
-    // printf("\nFinished reading file. Releasing lock...\n");
+    fseek(file_ptr, 0, SEEK_END);
+    file_size = ftell(file_ptr);
+    fseek(file_ptr, 0, SEEK_SET);
 
-    SDSock_Release();
+    buffer = malloc(sizeof(char)*file_size);
 
-    // printf("\nData transfer complete.\n");
-
-    data_parsed = strtok(buffer, ",");
-
-    while(data_parsed != NULL) {
-        url = strBurn(data_parsed);
-
-        data_parsed = strtok(NULL, ",");
-
-        servers = strBurn(data_parsed);
-        if(servers[strlen(servers) - 1] == '\0') break;
-
-        insertRequest(url, servers);
-
-        data_parsed = strtok(NULL, ",");
+    if(fgets(buffer, file_size, file_ptr) == NULL) {
+        printf("\nError dumping file contents to string.\n");
     }
 
+    temp = strtok(buffer, ",");
+    while(temp != NULL) {
+        strcpy(url, temp);
+        temp = strtok(NULL, ",");
+        strcpy(servers, temp);
+        temp = strtok(NULL, ",");
+        insertRequest(url, servers);
+        memset(url, 0, sizeof(url));
+        memset(servers, 0, sizeof(servers));
+    }
+
+    printWhitelist();
+
+    fclose(file_ptr);
     free(buffer);
+
+    SDSock_Release();
+    // QUARANTINE //
 
     return;
 }
