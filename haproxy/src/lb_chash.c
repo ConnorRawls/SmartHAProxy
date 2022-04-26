@@ -15,6 +15,8 @@
  * 2 of the License, or (at your option) any later version.
  *
  */
+#ifndef _HAPROXY_LB_CHASH_C123
+#define _HAPROXY_LB_CHASH_C123
 
 #include <import/eb32tree.h>
 #include <haproxy/api.h>
@@ -118,7 +120,7 @@ static inline void chash_queue_dequeue_srv(struct server *s)
  *
  * The server's lock must be held. The lbprm lock will be used.
  */
-static void chash_set_server_status_down(struct server *srv)
+void chash_set_server_status_down(struct server *srv)
 {
 	struct proxy *p = srv->proxy;
 
@@ -175,7 +177,7 @@ out_update_backend:
  *
  * The server's lock must be held. The lbprm lock will be used.
  */
-static void chash_set_server_status_up(struct server *srv)
+void chash_set_server_status_up(struct server *srv)
 {
 	struct proxy *p = srv->proxy;
 
@@ -515,3 +517,5 @@ int chash_init_server_tree(struct proxy *p)
 	}
 	return 0;
 }
+
+#endif
