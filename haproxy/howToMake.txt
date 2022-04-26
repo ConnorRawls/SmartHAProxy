@@ -1,3 +1,5 @@
 make clean
 make -j $(nproc) TARGET=linux-glibc USE_LUA=1 LUA_INC=/opt/lua-5.4.3/src/ LUA_LIB=/opt/lua-5.4.3/src/
 make install
+
+make clean ; make -j $(nproc) TARGET=linux-glibc USE_LUA=1 LUA_INC=/opt/lua-5.4.3/src/ LUA_LIB=/opt/lua-5.4.3/src/ ; make install

@@ -546,14 +546,17 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 	reqCount.count++;
 
-	if(reqCount.count == 1){
+	// if(reqCount.count == 100){
 
-		updateWhitelist();
+	// 	updateWhitelist();
 
-		printf("\nMic check.\n");
+	// 	printf("\nMic check.\n");
 
-		reqCount.count = 0;
-	}
+	// 	reqCount.count = 0;
+	// }
+
+	updateWhitelist();
+	printWhitelist();
 	
 	url_len = uri_len;
 	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
@@ -568,7 +571,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	servers = allocateSrvSize(url_cpy, servers); // Hidden malloc, careful
 	servers = searchRequest(url_cpy);
 
-	printf("\nURL: %s\nServers: %s\n", url_cpy, servers);
+	// printf("\nURL: %s\nServers: %s\n", url_cpy, servers);
 
 	// Be sure to move this right before the function return
 	free(servers);
