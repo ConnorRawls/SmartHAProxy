@@ -465,20 +465,34 @@ def isfloat(string):
 
 # Write data to file
 def fileWrite(whitelist):
-    print("And we're hanging and we're hanging and we're...")
+    # t = '' # Simplify dict to list object
+    # for url in whitelist.keys():
+    #     t += str(url)
+    #     t += ','
+    #     if whitelist[url] == []:
+    #         t += '0\n'
+    #     else:
+    #         for server in whitelist[url]:
+    #             if server == 'WP-Host':
+    #                 t += '1'
+    #             else:
+    #                 t += str(server[-1])
+    #         t += '\n'
+    # t += '\0'
 
     t = '' # Simplify dict to list object
     for url in whitelist.keys():
         t += str(url)
         t += ','
         if whitelist[url] == []:
-            t += '0\n'
+            t += '0,'
         else:
             for server in whitelist[url]:
-                t += str(server)
-                t += ','
-            t = t[:-1]
-            t += '\n'
+                if server == 'WP-Host':
+                    t += '1'
+                else:
+                    t += str(server[-1])
+            t += ','
     t += '\0'
 
     # Offload data to file
@@ -487,8 +501,6 @@ def fileWrite(whitelist):
         file.truncate(0)
         file.write(t)
     # print("...done.")
-
-    print("...hanging and we're hanging.")
 
 # Socket send
 def sendMessage(conn, message):
