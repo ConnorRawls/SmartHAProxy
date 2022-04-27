@@ -2890,9 +2890,11 @@ int main(int argc, char **argv)
 
 	// Initialize request counter
 	reqCount.count = 0;
+	reqCount.time = clock();
 
 	// Construct whitelist
 	createWhitelist(CAPACITY);
+	updateWhitelist();
 	printf("\nWhitelist initialized.\n");
 
 	////////////////// End edits //////////////////

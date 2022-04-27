@@ -58,11 +58,11 @@
 
 #define TRACE_SOURCE &trace_strm
 
-#define SRVCOUNT 1
+#define SRVCOUNT 7
 
 ///////////////// Begin edits /////////////////
-
 #include <haproxy/whitelist.h>
+#include <time.h>
 
 ReqCount reqCount;
 
@@ -548,6 +548,8 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	const char *url; //pointer to where the url ends
 	char *servers; //list of servers from the whitelist that the request url can use
 	int url_len; //length of url string
+	clock_t t2;
+	double elapsed_time, req_rate;
 
 	px = s->be;
 	if (px->srv_act)
@@ -559,16 +561,27 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		return NULL;
 	}
 
+	t2 = clock() - reqCount.time;
+	elapsed_time = (double)t2 / CLOCK_PER_SECOND;
 	reqCount.count++;
+	req_rate = reqCount.count / elapsed_time;
 
-	// if(reqCount.count == 1000){
-	// 	updateWhitelist();
+	if(reqCount.count == 1000 || !(req_rate >= 30)){
+		updateWhitelist();
 
-	// 	//printf("\nUpdated Whitelist.\n");
+		printf("\nUpdated Whitelist.\n");
 
-	// 	reqCount.count = 0;
-	// }
-	updateWhitelist();
+		reqCount.time = clock()
+		reqCount.count = 0;
+	}
+	else if(reqCount.count == 2000){
+		updateWhitelist();
+
+		printf("\nUpdated Whitelist.\n");
+
+		reqCount.time = clock()
+		reqCount.count = 0;
+	}
 	
 	url_len = uri_len;
 	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
@@ -581,11 +594,22 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 	servers = NULL;
 	servers = searchRequest(url_cpy);
-	strcat(servers, "\0");
+	if(servers != NULL) {strcat(servers, "\0");}
+
+	// Who dis
+	if(servers == NULL) {
+		serverNode = eb32_first(root);
+
+		while(serverNode != NULL){
+			srv = eb32_entry(serverNode, struct tree_occ, node)->server;
+			chash_set_server_status_up(srv);
+			serverNode = eb32_next(serverNode); //go to next node in the tree
+		}
+	}
 
 	// Request we know of and is gucci
-	serverNode = eb32_first(root); //start from left most node
-	if(*servers != '0' && servers != NULL){
+	else if(strcmp(servers, "0") != 0 && servers != NULL){
+		serverNode = eb32_first(root); //start from left most node
 		srv = eb32_entry(serverNode, struct tree_occ, node)->server;
 		for(int delete, count; serverNode != NULL;){ // && count < 7 should not be needed
 			srv = eb32_entry(serverNode, struct tree_occ, node)->server;
@@ -593,9 +617,9 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 				serverId = '1';
 			}
 			else{
-				serverId = srv->id[7];
+				serverId = srv->id[9];
 			}
-			printf("Looping: %c", serverId);
+			// printf("Looping: %c", serverId);
 			delete = 1;
 			count = 0;
 			while(servers[count] != '\0' && count < SRVCOUNT){
@@ -617,23 +641,12 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	}
 
 	// Request we know of and is actin up
-	else if(*servers == '0') {
+	else if(strcmp(servers, "0") == 0) {
 		serverNode = eb32_first(root);
-		srv = eb32_entry(serverNode, struct tree_occ, node)->server;
 
 		while(serverNode != NULL){
+			srv = eb32_entry(serverNode, struct tree_occ, node)->server;
 			chash_set_server_status_down(srv);
-			serverNode = eb32_next(serverNode); //go to next node in the tree
-		}
-	}
-
-	// Who dis
-	else {
-		serverNode = eb32_first(root);
-		srv = eb32_entry(serverNode, struct tree_occ, node)->server;
-
-		while(serverNode != NULL){
-			chash_set_server_status_up(srv);
 			serverNode = eb32_next(serverNode); //go to next node in the tree
 		}
 	}
@@ -645,7 +658,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	// srv = eb32_entry(next, struct tree_occ, node)->server;
 	// eb32_delete(struct eb32_node *eb32)
 	
-	printf("\nURL: %s\nServers: %s\n", url_cpy, servers); // comment this out
+	// printf("\nURL: %s\nServers: %s\n", url_cpy, servers); // comment this out
 	
 	hash = 0;
 	draws = px->lbprm.arg_opt1; // number of draws
@@ -689,7 +702,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	if(curr == NULL){ // comment this part out
 		printf("chosen server was NULL\n");
 	}else{
-		printf("id: %s\n", curr->id);
+		// printf("id: %s\n", curr->id);
 	}
 	////////////////// End edits //////////////////
 	return curr;
