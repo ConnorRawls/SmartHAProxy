@@ -43,7 +43,7 @@ import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
 
 MSGLEN = 1
-SRVCOUNT = 1
+SRVCOUNT = 7
 
 def main():
     with Manager() as m:
@@ -105,6 +105,10 @@ def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
     task_count = 0
     total_response = 0
     error_count = 0
+    possible_srvs = []
+
+    for server in workload.keys():
+        possible_srvs.append(str(server))
 
     # Clear log
     os.system("truncate -s 0 /var/log/haproxy_access.log")
@@ -123,7 +127,7 @@ def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
 
                 # Task instance ID
                 try:
-                    task_id = line[0]
+                    task_id = line[0].replace(' ', '').replace('\n', '')
                     if not isint(task_id):
                         error_count += 1
                         print('\nTask ID is not an integer. Line:\n', line)
@@ -142,7 +146,7 @@ def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
 
                 # URL
                 try:
-                    url = line[1]
+                    url = line[1].replace(' ', '')
                     if url not in time_matrix.keys():
                         url = unknownURL(url, time_matrix, task_id, record)
                         if url == 'UNKNOWN':
@@ -161,8 +165,8 @@ def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
 
                 # Server
                 try:
-                    server = line[2]
-                    if not re.match('^WP-Host[1-7]$', server):
+                    server = line[2].replace(' ', '')
+                    if server not in possible_srvs:
                         server = unknownServer(task_id, record)
                         if server == 'UNKNOWN':
                             error_count += 1
@@ -180,7 +184,7 @@ def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
 
                 # Response time
                 try:
-                    actual_response = line[3]
+                    actual_response = line[3].replace(' ', '').replace('\n', '')
                     if not isfloat(actual_response):
                         if task_id in record.keys():
                             actual_response = total_response / task_count
@@ -328,7 +332,13 @@ def whiteAlg(time_matrix, stdev_matrix, cpu_usage, workload, whitelist, \
             if server in whitelist[task] and \
                 predicted_response[task][server] >= SLO:
                 # Remove it from server's whitelist if it is there
-                print(f"Removing server {server} from URL \"{task}\"'s whitelist.")
+                print(f"\nRemoving server {server} from URL \"{task}\"'s whitelist.")
+                print("*** Stats ***")
+                print(f"Expected execution time: {time_matrix[task]}")
+                print(f"Expected variance: {stdev_matrix[task]}")
+                print(f"CPU usage: {cpu_usage[server]}")
+                print(f"Workload: {workload[server]}")
+                print(f"Predicted response: {predicted_response[task][server]}")
                 whitelist[task].remove(server)
 
             elif server not in whitelist[task] and \
@@ -365,7 +375,7 @@ def GBDT(time_matrix, stdev_matrix, cpu_usage, workload, predicted_response, \
         # Perform ML inference
         output_data = []
         for row in input_data:
-            output_data.append(model.predict([row]))
+            output_data.append(abs(model.predict([row])))
         for (task, row) in zip(predicted_response.keys(), output_data):
             task = predicted_response[task]
             task[server] = row
@@ -401,22 +411,21 @@ def initGlobals(time_matrix, stdev_matrix, workload, cpu_usage, \
 
     for server in range(SRVCOUNT):
         if server == 0:
-            workload['WP-Host'] = 0
+            workload['WP-Host'] = 0.1
             cpu_usage['WP-Host'] = 0
         else:
-            workload['WP-Host' + str(server + 1)] = 0
-            cpu_usage['WP-Host' + str(server + 1)] = 0
+            workload['WP-Host-0' + str(server + 1)] = 0.1
+            cpu_usage['WP-Host-0' + str(server + 1)] = 0
 
     for url in whitelist.keys():
         for server in range(SRVCOUNT):
             if server == 0: whitelist[url].append('WP-Host')
-            else: whitelist[url].append('WP-Host' + str(server + 1))
+            else: whitelist[url].append('WP-Host-0' + str(server + 1))
 
     for task in time_matrix.keys():
         predicted_response[task] = m.dict()
         for server in workload.keys():
-            task = predicted_response[task]
-            task[server] = 0
+            predicted_response[task][server] = 0
 
 # Get latest update to logfile
 def logRead(file):
@@ -429,7 +438,7 @@ def logRead(file):
 
 # Unrecognized URL handler
 def unknownURL(url, time_matrix, task_id, record):
-    for key in time_matrix:
+    for key in time_matrix.keys():
         if key in url:
             return key
 
