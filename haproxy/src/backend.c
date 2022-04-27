@@ -548,7 +548,6 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	const char *url; //pointer to where the url ends
 	char *servers; //list of servers from the whitelist that the request url can use
 	int url_len; //length of url string
-	clock_t t2;
 	double elapsed_time, req_rate;
 
 	px = s->be;
@@ -561,8 +560,9 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		return NULL;
 	}
 
-	t2 = clock() - reqCount.time;
-	elapsed_time = (double)t2 / CLOCK_PER_SECOND;
+	reqCount.time2 = clock();
+	elapsed_time = reqCount.time1 - reqCount.time2;
+	elapsed_time = (double)elapsed_time / CLOCKS_PER_SEC;
 	reqCount.count++;
 	req_rate = reqCount.count / elapsed_time;
 
@@ -571,7 +571,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 		printf("\nUpdated Whitelist.\n");
 
-		reqCount.time = clock()
+		reqCount.time3 = clock();
 		reqCount.count = 0;
 	}
 	else if(reqCount.count == 2000){
@@ -579,7 +579,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 		printf("\nUpdated Whitelist.\n");
 
-		reqCount.time = clock()
+		reqCount.time = clock();
 		reqCount.count = 0;
 	}
 	

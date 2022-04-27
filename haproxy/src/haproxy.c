@@ -2890,7 +2890,9 @@ int main(int argc, char **argv)
 
 	// Initialize request counter
 	reqCount.count = 0;
-	reqCount.time = clock();
+	reqCount.time1 = clock();
+	reqCount.time2 = clock();
+	reqCount.time3 = clock();
 
 	// Construct whitelist
 	createWhitelist(CAPACITY);
