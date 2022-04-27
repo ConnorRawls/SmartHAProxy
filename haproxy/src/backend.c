@@ -548,6 +548,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	const char *url; //pointer to where the url ends
 	char *servers; //list of servers from the whitelist that the request url can use
 	int url_len; //length of url string
+	int loopCount; //Counter used in loops
 	clock_t t2;
 	double elapsed_time, req_rate;
 
@@ -561,8 +562,9 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		return NULL;
 	}
 
-	t2 = clock() - reqCount.time;
-	elapsed_time = (double)t2 / CLOCK_PER_SECOND;
+	reqCount.time2 = clock();
+	elapsed_time = reqCount.time1 - reqCount.time2;
+	elapsed_time = (double)elapsed_time / CLOCKS_PER_SEC;
 	reqCount.count++;
 	req_rate = reqCount.count / elapsed_time;
 
@@ -571,7 +573,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 		printf("\nUpdated Whitelist.\n");
 
-		reqCount.time = clock()
+		reqCount.time3 = clock();
 		reqCount.count = 0;
 	}
 	else if(reqCount.count == 2000){
@@ -579,7 +581,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 		printf("\nUpdated Whitelist.\n");
 
-		reqCount.time = clock()
+		reqCount.time = clock();
 		reqCount.count = 0;
 	}
 	
@@ -599,8 +601,9 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	// Who dis
 	if(servers == NULL) {
 		serverNode = eb32_first(root);
-
-		while(serverNode != NULL){
+		loopCount = 0;
+		while(serverNode != NULL && loopCount < SRVCOUNT){
+			loopCount++;
 			srv = eb32_entry(serverNode, struct tree_occ, node)->server;
 			chash_set_server_status_up(srv);
 			serverNode = eb32_next(serverNode); //go to next node in the tree
@@ -611,7 +614,9 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	else if(strcmp(servers, "0") != 0 && servers != NULL){
 		serverNode = eb32_first(root); //start from left most node
 		srv = eb32_entry(serverNode, struct tree_occ, node)->server;
-		for(int delete, count; serverNode != NULL;){ // && count < 7 should not be needed
+		loopCount = 0;
+		for(int delete, count; serverNode != NULL && loopCount < SRVCOUNT;){
+			loopCount++;
 			srv = eb32_entry(serverNode, struct tree_occ, node)->server;
 			if(strlen(srv->id) == 7) {
 				serverId = '1';
@@ -643,21 +648,15 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	// Request we know of and is actin up
 	else if(strcmp(servers, "0") == 0) {
 		serverNode = eb32_first(root);
-
-		while(serverNode != NULL){
+		loopCount = 0;
+		while(serverNode != NULL && loopCount < SRVCOUNT){
+			loopCount++;
 			srv = eb32_entry(serverNode, struct tree_occ, node)->server;
 			chash_set_server_status_down(srv);
 			serverNode = eb32_next(serverNode); //go to next node in the tree
 		}
 	}
 
-	//These first 2 functions return a eb32node*
-	// next = *eb32_lookup(struct eb_root *root, u32 x);
-	// struct server *srv;
-	// *eb32_insert(struct eb_root *root, struct eb32_node *new);
-	// srv = eb32_entry(next, struct tree_occ, node)->server;
-	// eb32_delete(struct eb32_node *eb32)
-	
 	// printf("\nURL: %s\nServers: %s\n", url_cpy, servers); // comment this out
 	
 	hash = 0;
