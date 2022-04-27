@@ -581,7 +581,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 		printf("\nUpdated Whitelist.\n");
 
-		reqCount.time = clock();
+		reqCount.time1 = clock();
 		reqCount.count = 0;
 	}
 	
