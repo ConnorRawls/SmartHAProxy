@@ -7,6 +7,8 @@
 #ifndef WHITELIST
 #define WHITELIST
 
+#include <time.h>
+
 // Hashed item
 typedef struct Request_T
 {
@@ -17,6 +19,7 @@ typedef struct Request_T
 typedef struct ReqCount_T
 {
     int count;
+    clock_t time;
 } ReqCount;
 
 extern ReqCount reqCount;

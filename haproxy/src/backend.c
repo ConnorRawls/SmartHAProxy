@@ -58,9 +58,11 @@
 
 #define TRACE_SOURCE &trace_strm
 
-///////////////// Begin edits /////////////////
+#define SRVCOUNT 7
 
+///////////////// Begin edits /////////////////
 #include <haproxy/whitelist.h>
+#include <time.h>
 
 ReqCount reqCount;
 
@@ -528,35 +530,58 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 		return map_get_server_hash(px, hash);
 }
 
+	///////////////// Begin edits /////////////////
 /* random value  */
 static struct server *get_server_rnd(struct stream *s, const struct server *avoid, const char *uri, int uri_len)
 {
-	///////////////// Begin edits /////////////////
 	// Below are constructs created by HAProxy. Moved up here to get
 	// the compile warning to shut up.
 	unsigned int hash;
 	struct proxy  *px;
-	struct server *prev, *curr;
+	struct server *prev, *curr, *srv;
 	int draws; // number of draws
+	struct eb32_node *serverNode; //node in the elastic binary tree containing servers
+	struct eb_root *root;
+	char serverId; //number of server
 
 	char *url_cpy; //url extracted from the uri
 	const char *url; //pointer to where the url ends
 	char *servers; //list of servers from the whitelist that the request url can use
 	int url_len; //length of url string
+	clock_t t2;
+	double elapsed_time, req_rate;
 
+	px = s->be;
+	if (px->srv_act)
+		root = &px->lbprm.chash.act;
+	else if (px->srv_bck)
+		root = &px->lbprm.chash.bck;
+	else{
+		printf("root is NULL");
+		return NULL;
+	}
+
+	t2 = clock() - reqCount.time;
+	elapsed_time = (double)t2 / CLOCK_PER_SECOND;
 	reqCount.count++;
+	req_rate = reqCount.count / elapsed_time;
 
-	// if(reqCount.count == 100){
+	if(reqCount.count == 1000 || !(req_rate >= 30)){
+		updateWhitelist();
 
-	// 	updateWhitelist();
+		printf("\nUpdated Whitelist.\n");
 
-	// 	printf("\nMic check.\n");
+		reqCount.time = clock()
+		reqCount.count = 0;
+	}
+	else if(reqCount.count == 2000){
+		updateWhitelist();
 
-	// 	reqCount.count = 0;
-	// }
+		printf("\nUpdated Whitelist.\n");
 
-	updateWhitelist();
-	printWhitelist();
+		reqCount.time = clock()
+		reqCount.count = 0;
+	}
 	
 	url_len = uri_len;
 	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
@@ -568,24 +593,84 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
 
 	servers = NULL;
-	servers = allocateSrvSize(url_cpy, servers); // Hidden malloc, careful
 	servers = searchRequest(url_cpy);
+	if(servers != NULL) {strcat(servers, "\0");}
 
-	// printf("\nURL: %s\nServers: %s\n", url_cpy, servers);
+	// Who dis
+	if(servers == NULL) {
+		serverNode = eb32_first(root);
 
-	// Be sure to move this right before the function return
-	free(servers);
-	free(url_cpy);
+		while(serverNode != NULL){
+			srv = eb32_entry(serverNode, struct tree_occ, node)->server;
+			chash_set_server_status_up(srv);
+			serverNode = eb32_next(serverNode); //go to next node in the tree
+		}
+	}
 
-	////////////////// End edits //////////////////
+	// Request we know of and is gucci
+	else if(strcmp(servers, "0") != 0 && servers != NULL){
+		serverNode = eb32_first(root); //start from left most node
+		srv = eb32_entry(serverNode, struct tree_occ, node)->server;
+		for(int delete, count; serverNode != NULL;){ // && count < 7 should not be needed
+			srv = eb32_entry(serverNode, struct tree_occ, node)->server;
+			if(strlen(srv->id) == 7) {
+				serverId = '1';
+			}
+			else{
+				serverId = srv->id[9];
+			}
+			// printf("Looping: %c", serverId);
+			delete = 1;
+			count = 0;
+			while(servers[count] != '\0' && count < SRVCOUNT){
+				if(serverId == servers[count]){ // if the id is found in the list
+					delete = 0;
+					break;
+				}
+				count++;
+			}
+			if(delete){
+				chash_set_server_status_down(srv);
+			}
+			serverNode = eb32_next(serverNode); //go to next node in the tree
+		}
+		for(int count = 0; servers[count] != '\0' && count < SRVCOUNT;){
+			chash_set_server_status_up(srv);
+			count++;
+		}
+	}
 
+	// Request we know of and is actin up
+	else if(strcmp(servers, "0") == 0) {
+		serverNode = eb32_first(root);
+
+		while(serverNode != NULL){
+			srv = eb32_entry(serverNode, struct tree_occ, node)->server;
+			chash_set_server_status_down(srv);
+			serverNode = eb32_next(serverNode); //go to next node in the tree
+		}
+	}
+
+	//These first 2 functions return a eb32node*
+	// next = *eb32_lookup(struct eb_root *root, u32 x);
+	// struct server *srv;
+	// *eb32_insert(struct eb_root *root, struct eb32_node *new);
+	// srv = eb32_entry(next, struct tree_occ, node)->server;
+	// eb32_delete(struct eb32_node *eb32)
+	
+	// printf("\nURL: %s\nServers: %s\n", url_cpy, servers); // comment this out
+	
 	hash = 0;
-	px = s->be;
 	draws = px->lbprm.arg_opt1; // number of draws
 
 	/* tot_weight appears to mean srv_count */
-	if (px->lbprm.tot_weight == 0)
+	if (px->lbprm.tot_weight == 0){
+		// Be sure to move this right before the function return
+		//printf("total weight is zero, returning null");
+		//free(servers);
+		//free(url_cpy);
 		return NULL;
+	}
 
 	curr = NULL;
 	do {
@@ -601,7 +686,11 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		if (prev && prev != curr &&
 			curr->served * prev->cur_eweight > prev->served * curr->cur_eweight)
 			curr = prev;
-	} while (--draws > 0 && (curr->id[2] == '4' || curr->id[2] == '2'));
+	} while (--draws > 0);
+
+	// Be sure to move this right before the function return
+	//free(servers);
+	//free(url_cpy);
 
 	/* if the selected server is full, pretend we have none so that we reach
 		* the backend's queue instead.
@@ -609,13 +698,13 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	if (curr &&
 		(curr->queue.length || (curr->maxconn && curr->served >= srv_dynamic_maxconn(curr))))
 		curr = NULL;
-
-	if(curr == NULL){
+	
+	if(curr == NULL){ // comment this part out
 		printf("chosen server was NULL\n");
 	}else{
-		printf("id: %s\n", curr->id);
+		// printf("id: %s\n", curr->id);
 	}
-
+	////////////////// End edits //////////////////
 	return curr;
 }
 

@@ -174,8 +174,6 @@ void updateWhitelist()
         memset(servers, 0, sizeof(servers));
     }
 
-    printWhitelist();
-
     fclose(file_ptr);
     free(buffer);
 
