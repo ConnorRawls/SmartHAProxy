@@ -343,7 +343,7 @@ def whiteAlg(time_matrix, stdev_matrix, cpu_usage, workload, whitelist, \
 
             elif server not in whitelist[task] and \
                 predicted_response[task][server] < SLO:
-                print(f"Adding server {server} to URL \"{url}\"'s whitelist.")
+                print(f"Adding server {server} to URL \"{task}\"'s whitelist.")
                 # Add the task to the server's whitelist
                 whitelist[task].append(server)
 
