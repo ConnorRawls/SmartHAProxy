@@ -550,7 +550,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	int url_len; //length of url string
 	int loopCount; //Counter used in loops
 	clock_t t2;
-	double elapsed_time, req_rate;
+	double elapsed_time;
 
 	px = s->be;
 	if (px->srv_act)
@@ -562,26 +562,17 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		return NULL;
 	}
 
-	reqCount.time2 = clock();
-	elapsed_time = reqCount.time1 - reqCount.time2;
+	t2 = clock();
+	elapsed_time = t2 - reqCount.time;
 	elapsed_time = (double)elapsed_time / CLOCKS_PER_SEC;
 	reqCount.count++;
-	req_rate = reqCount.count / elapsed_time;
 
-	if(reqCount.count == 1000 || !(req_rate >= 30)){
+	if(reqCount.count == 10000 || elapsed_time >= 2){
 		updateWhitelist();
 
 		printf("\nUpdated Whitelist.\n");
 
-		reqCount.time3 = clock();
-		reqCount.count = 0;
-	}
-	else if(reqCount.count == 2000){
-		updateWhitelist();
-
-		printf("\nUpdated Whitelist.\n");
-
-		reqCount.time1 = clock();
+		reqCount.time = clock();
 		reqCount.count = 0;
 	}
 	

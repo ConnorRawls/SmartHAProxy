@@ -6,6 +6,7 @@
 #include <netdb.h>
 #include <stdlib.h>
 #include <err.h>
+#include <errno.h>
 
 #include <haproxy/sdsock.h>
 
@@ -62,6 +63,7 @@ void SDSock_Make()
 
 void SDSock_Set()
 {
+	ssize_t bytes;
 	char message[1], server_reply[1];
 
 	// Send 1
@@ -76,9 +78,11 @@ void SDSock_Set()
 
 	// Receive 1
 	// printf("\nWaiting for server...");
-	if(recv(sdsock.sock, server_reply, 1, 0) < 0)
+	bytes = recv(sdsock.sock, server_reply, 1, 0);
+	if(bytes < 0)
 	{
-		puts("\nReceive 1 failed.");
+		fprintf(stderr, "recv: %s (%d)\n", strerror(errno), errno);
+		printf("\nReceive 1 failed. bytes: %ld", bytes);
 		return;
 	}
 	// printf("\nMessage 1 received: %s", server_reply);
@@ -90,6 +94,7 @@ void SDSock_Set()
 
 void SDSock_Release()
 {
+	ssize_t bytes;
 	char message[1], server_reply[1];
 
 	// Send 2
@@ -104,9 +109,11 @@ void SDSock_Release()
 
 	// Receive 2
 	// printf("\nWaiting for server...");
-	if(recv(sdsock.sock, server_reply, 1, 0) < 0)
+	bytes = recv(sdsock.sock, server_reply, 1, 0);
+	if(bytes < 0)
 	{
-		puts("\nReceive 2 failed.");
+		fprintf(stderr, "recv: %s (%d)\n", strerror(errno), errno);
+		printf("\nReceive 2 failed. recv: %ld", bytes);
 		return;
 	}
 	// printf("\nMessage 2 received: %s", server_reply);

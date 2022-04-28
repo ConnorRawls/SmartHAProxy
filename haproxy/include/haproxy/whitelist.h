@@ -19,7 +19,7 @@ typedef struct Request_T
 typedef struct ReqCount_T
 {
     int count;
-    clock_t time1, time2, time3;
+    clock_t time;
 } ReqCount;
 
 extern ReqCount reqCount;
