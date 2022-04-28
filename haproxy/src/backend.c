@@ -58,12 +58,12 @@
 
 #define TRACE_SOURCE &trace_strm
 
-#define SRVCOUNT 7
-
 ///////////////// Begin edits /////////////////
 #include <haproxy/whitelist.h>
 #include <time.h>
 #include <pthread.h>
+
+#define SRVCOUNT 5
 
 ReqCount reqCount;
 Lock check;
@@ -572,11 +572,9 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	reqCount.count++;
 
 	if(reqCount.count == 10000 || elapsed_time >= 2){
-		printf("\nUpdating Whitelist.\n");
+		printf("\nUpdating Whitelist...\n");
 
 		updateWhitelist();
-
-		printf("\nUpdated Whitelist.\n");
 
 		reqCount.time = clock();
 		reqCount.count = 0;
