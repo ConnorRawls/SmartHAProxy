@@ -29,7 +29,6 @@ void SDSock_Make()
 	{
 		printf("Could not create socket");
 	}
-	printf("\nSocket created.");
 
     if ((he = gethostbyname(hostname)) == NULL)
     {
