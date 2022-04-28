@@ -572,7 +572,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	reqCount.count++;
 
 	if(reqCount.count == 10000 || elapsed_time >= 2){
-		printf("\nUpdating Whitelist...\n");
+		printf("\nUpdating Whitelist...");
 
 		updateWhitelist();
 

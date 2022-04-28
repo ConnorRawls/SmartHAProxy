@@ -2888,7 +2888,7 @@ int main(int argc, char **argv)
 
 	// Create sdsock
 	SDSock_Make();
-	printf("\nConnected to Smartdrop.");
+	printf("Connected to Smartdrop.");
 
 	// Initialize request counter
 	reqCount.count = 0;
