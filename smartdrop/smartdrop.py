@@ -130,18 +130,18 @@ def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
                     task_id = line[0].replace(' ', '').replace('\n', '')
                     if not isint(task_id):
                         error_count += 1
-                        print('\nTask ID is not an integer. Line:\n', line)
-                        print('Error count: ', error_count)
+                        # print('\nTask ID is not an integer. Line:\n', line)
+                        # print('Error count: ', error_count)
                         continue
                     if not int(task_id) >= 0:
                         error_count += 1
-                        print('\nTask ID is not positive. Line:\n', line)
-                        print('Error count: ', error_count)
+                        # print('\nTask ID is not positive. Line:\n', line)
+                        # print('Error count: ', error_count)
                         continue
                 except IndexError:
                     error_count += 1
-                    print('\nIndexError at ID value. Line:\n', line)
-                    print('Error count: ', error_count)
+                    # print('\nIndexError at ID value. Line:\n', line)
+                    # print('Error count: ', error_count)
                     continue
 
                 # URL
@@ -151,16 +151,16 @@ def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
                         url = unknownURL(url, time_matrix, task_id, record)
                         if url == 'UNKNOWN':
                             error_count += 1
-                            print('\nUnknown URL. Line:\n', line)
-                            print('Error count: ', error_count)
+                            # print('\nUnknown URL. Line:\n', line)
+                            # print('Error count: ', error_count)
                             continue
                 except IndexError:
                     error_count += 1
-                    print('\nIndexError at URL. Line:\n', line)
-                    print('Error count: ', error_count)
+                    # print('\nIndexError at URL. Line:\n', line)
+                    # print('Error count: ', error_count)
                     url = unknownURL(url, time_matrix, task_id, record)
                     if url == 'UNKNOWN':
-                        print('Could not recover :(')
+                        # print('Could not recover :(')
                         continue
 
                 # Server
@@ -170,16 +170,16 @@ def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
                         server = unknownServer(task_id, record)
                         if server == 'UNKNOWN':
                             error_count += 1
-                            print('\nUnknown server. Line:\n', line)
-                            print('Error count: ', error_count)
+                            # print('\nUnknown server. Line:\n', line)
+                            # print('Error count: ', error_count)
                             continue
                 except IndexError:
                     error_count += 1
-                    print('\nIndexError at server name. Line:\n', line)
-                    print('Error count: ', error_count)
+                    # print('\nIndexError at server name. Line:\n', line)
+                    # print('Error count: ', error_count)
                     server = unknownServer(task_id, record)
                     if server == 'UNKNOWN':
-                        print('Could not recover :(')
+                        # print('Could not recover :(')
                         continue
 
                 # Response time
@@ -190,17 +190,17 @@ def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
                             actual_response = total_response / task_count
                         else:
                             error_count += 1
-                            print('\nUnknown response. Line:\n', line)
-                            print('Error count: ', error_count)
+                            # print('\nUnknown response. Line:\n', line)
+                            # print('Error count: ', error_count)
                             continue
                 except IndexError:
                     error_count += 1
-                    print('IndexError at response value. Line:\n ', line)
-                    print('Error count: ', error_count)
+                    # print('IndexError at response value. Line:\n ', line)
+                    # print('Error count: ', error_count)
                     if task_id in record.keys():
                         actual_response = total_response / task_count
                     else:
-                        print('Could not recover :(')
+                        # print('Could not recover :(')
                         continue
 
                 # Insert task
@@ -216,8 +216,8 @@ def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
                         cpu_lock.release()
                     except KeyError:
                         error_count += 1
-                        print('\nKeyError at inserting task. Line:\n', line)
-                        print('Error count: ', error_count)
+                        # print('\nKeyError at inserting task. Line:\n', line)
+                        # print('Error count: ', error_count)
 
                 # Task completion
                 else:
@@ -233,8 +233,8 @@ def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
                         task_count += 1
                     except KeyError:
                         error_count += 1
-                        print('\nKeyError at task completion. Line:\n', line)
-                        print('Error count: ', error_count)
+                        # print('\nKeyError at task completion. Line:\n', line)
+                        # print('Error count: ', error_count)
 
 # Process 2
 # -----------------------------------------------------------------------------
@@ -332,18 +332,18 @@ def whiteAlg(time_matrix, stdev_matrix, cpu_usage, workload, whitelist, \
             if server in whitelist[task] and \
                 predicted_response[task][server] >= SLO:
                 # Remove it from server's whitelist if it is there
-                print(f"\nRemoving server {server} from URL \"{task}\"'s whitelist.")
-                print("*** Stats ***")
-                print(f"Expected execution time: {time_matrix[task]}")
-                print(f"Expected variance: {stdev_matrix[task]}")
-                print(f"CPU usage: {cpu_usage[server]}")
-                print(f"Workload: {workload[server]}")
-                print(f"Predicted response: {predicted_response[task][server]}")
+                # print(f"\nRemoving server {server} from URL \"{task}\"'s whitelist.")
+                # print("*** Stats ***")
+                # print(f"Expected execution time: {time_matrix[task]}")
+                # print(f"Expected variance: {stdev_matrix[task]}")
+                # print(f"CPU usage: {cpu_usage[server]}")
+                # print(f"Workload: {workload[server]}")
+                # print(f"Predicted response: {predicted_response[task][server]}")
                 whitelist[task].remove(server)
 
             elif server not in whitelist[task] and \
                 predicted_response[task][server] < SLO:
-                print(f"Adding server {server} to URL \"{task}\"'s whitelist.")
+                # print(f"Adding server {server} to URL \"{task}\"'s whitelist.")
                 # Add the task to the server's whitelist
                 whitelist[task].append(server)
 
@@ -493,7 +493,7 @@ def fileWrite(whitelist):
     for url in whitelist.keys():
         t += str(url)
         t += ','
-        if whitelist[url] == []:
+        if not whitelist[url]:
             t += '0,'
         else:
             for server in whitelist[url]:
@@ -502,6 +502,8 @@ def fileWrite(whitelist):
                 else:
                     t += str(server[-1])
             t += ','
+
+    t = t[:-1]
     t += '\0'
 
     # Offload data to file
