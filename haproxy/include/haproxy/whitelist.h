@@ -8,6 +8,14 @@
 #define WHITELIST
 
 #include <time.h>
+#include <pthread.h>
+
+typedef struct Lock_T
+{
+    pthread_mutex_t lock;
+} Lock;
+
+extern Lock check;
 
 // Hashed item
 typedef struct Request_T

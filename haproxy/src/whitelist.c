@@ -83,6 +83,7 @@ void insertRequest(char *url, char *servers)
     else {
         // Scenario 1: Only update server list
         if(strcmp(current->url, url) == 0) {
+            freeRequest(request);
             strcpy(whitelist.requests[index]->servers, servers);
             return;
         }
@@ -90,6 +91,7 @@ void insertRequest(char *url, char *servers)
         // Scenario 2: Collision
         else {
             collision(request);
+            freeRequest(request);
             return;
         }
     }
@@ -141,7 +143,7 @@ void insertRequest(char *url, char *servers)
 void updateWhitelist()
 {
     FILE *file_ptr;
-    char *buffer, *temp, url[200], servers[20];
+    char *buffer, *temp, url[1000], servers[1000];
     long int file_size;
     char *file_name;
 
@@ -153,9 +155,11 @@ void updateWhitelist()
     file_ptr = fopen(file_name, "r");
     if(file_ptr == NULL) err(1, "\nFile not found.\n");
 
+    printf("\nSeeking file size...");
     fseek(file_ptr, 0, SEEK_END);
     file_size = ftell(file_ptr);
     fseek(file_ptr, 0, SEEK_SET);
+    printf("\n...file size: %ld", file_size);
 
     buffer = malloc(sizeof(char)*file_size);
 
@@ -163,6 +167,9 @@ void updateWhitelist()
         printf("\nError dumping file contents to string.\n");
     }
 
+    printf("\nParsing buffer string...");
+    memset(url, 0, sizeof(url));
+    memset(servers, 0, sizeof(servers));
     temp = strtok(buffer, ",");
     while(temp != NULL) {
         strcpy(url, temp);
@@ -173,9 +180,12 @@ void updateWhitelist()
         memset(url, 0, sizeof(url));
         memset(servers, 0, sizeof(servers));
     }
+    printf("\n...buffer string parsed.");
 
     fclose(file_ptr);
     free(buffer);
+    free(temp);
+    printf("\nBuffers/pointers freed.");
 
     SDSock_Release();
     // QUARANTINE //

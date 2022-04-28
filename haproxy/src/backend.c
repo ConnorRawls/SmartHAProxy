@@ -63,8 +63,10 @@
 ///////////////// Begin edits /////////////////
 #include <haproxy/whitelist.h>
 #include <time.h>
+#include <pthread.h>
 
 ReqCount reqCount;
+Lock check;
 
 ////////////////// End edits //////////////////
 
@@ -562,12 +564,16 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		return NULL;
 	}
 
+	pthread_mutex_lock(&check.lock);
+
 	t2 = clock();
 	elapsed_time = t2 - reqCount.time;
 	elapsed_time = (double)elapsed_time / CLOCKS_PER_SEC;
 	reqCount.count++;
 
 	if(reqCount.count == 10000 || elapsed_time >= 2){
+		printf("\nUpdating Whitelist.\n");
+
 		updateWhitelist();
 
 		printf("\nUpdated Whitelist.\n");
@@ -575,6 +581,8 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		reqCount.time = clock();
 		reqCount.count = 0;
 	}
+
+	pthread_mutex_unlock(&check.lock);
 	
 	url_len = uri_len;
 	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
@@ -647,6 +655,8 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 			serverNode = eb32_next(serverNode); //go to next node in the tree
 		}
 	}
+
+	free(url_cpy);
 
 	// printf("\nURL: %s\nServers: %s\n", url_cpy, servers); // comment this out
 	

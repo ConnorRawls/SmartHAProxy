@@ -67,17 +67,17 @@ void SDSock_Set()
 	char message[1], server_reply[1];
 
 	// Send 1
-	// printf("\nSending message 1...");
+	printf("\nSending message 1...");
 	message[0] = '1';
 	if(send(sdsock.sock, message, strlen(message), 0) < 0)
 	{
 		printf("\nMessage send 1 failed.");
 		return;
 	}
-	// printf("\nMessage 1 sent.");
+	printf("\nMessage 1 sent.");
 
 	// Receive 1
-	// printf("\nWaiting for server...");
+	printf("\nWaiting for server...");
 	bytes = recv(sdsock.sock, server_reply, 1, 0);
 	if(bytes < 0)
 	{
@@ -85,7 +85,7 @@ void SDSock_Set()
 		printf("\nReceive 1 failed. bytes: %ld", bytes);
 		return;
 	}
-	// printf("\nMessage 1 received: %s", server_reply);
+	printf("\nMessage 1 received: %s", server_reply);
 
 	// printf("\nReceived clearance.\n");
 
