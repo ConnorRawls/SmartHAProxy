@@ -1,0 +1,5 @@
+>HAProxy
+docker run -it -p 80:80 -v Whitelist:/Whitelist --net smartdrop --name haproxy haproxy:sd
+
+>Smartdrop
+docker run -it --volumes-from haproxy --net smartdrop --name smartdrop smartdrop:latest
