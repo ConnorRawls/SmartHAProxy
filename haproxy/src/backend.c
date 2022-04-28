@@ -64,6 +64,7 @@
 #include <pthread.h>
 
 #define SRVCOUNT 5
+#define DEBUG_PRINTING 1 // 0 - disabled, 1 - enabled
 
 ReqCount reqCount;
 Lock check;
@@ -572,8 +573,9 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	reqCount.count++;
 
 	if(reqCount.count == 10000 || elapsed_time >= 2){
-		printf("\nUpdating Whitelist...\n");
-
+		#if DEBUG_PRINTING
+			printf("\nUpdating Whitelist...\n");
+		#endif
 		updateWhitelist();
 
 		reqCount.time = clock();
@@ -606,15 +608,13 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 			serverNode = eb32_next(serverNode); //go to next node in the tree
 		}
 	}
-
 	// Request we know of and is gucci
 	else if(strcmp(servers, "0") != 0 && servers != NULL){
 		serverNode = eb32_first(root); //start from left most node
-		srv = eb32_entry(serverNode, struct tree_occ, node)->server;
 		loopCount = 0;
-		for(int delete, count; serverNode != NULL && loopCount < SRVCOUNT;){
-			loopCount++;
-			srv = eb32_entry(serverNode, struct tree_occ, node)->server;
+		for(int delete, count; serverNode != NULL && loopCount < SRVCOUNT; loopCount++){ //for each server node in the tree
+			srv = eb32_entry(serverNode, struct tree_occ, node)->server; //get server from node
+			//get server id from its name
 			if(strlen(srv->id) == 7) {
 				serverId = '1';
 			}
@@ -622,26 +622,23 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 				serverId = srv->id[9];
 			}
 			// printf("Looping: %c", serverId);
-			delete = 1;
+			delete = 1; // 1 if node must be set to down, 0 if it must be set to up
 			count = 0;
-			while(servers[count] != '\0' && count < SRVCOUNT){
+			while(servers[count] != '\0' && count < SRVCOUNT){ // for each server in the whitelist
 				if(serverId == servers[count]){ // if the id is found in the list
 					delete = 0;
 					break;
 				}
 				count++;
 			}
-			if(delete){
+			if(delete){ //server id was not in the whitelist
 				chash_set_server_status_down(srv);
+			}else{ // server id was in the whitelist
+				chash_set_server_status_up(srv);
 			}
 			serverNode = eb32_next(serverNode); //go to next node in the tree
 		}
-		for(int count = 0; servers[count] != '\0' && count < SRVCOUNT;){
-			chash_set_server_status_up(srv);
-			count++;
-		}
 	}
-
 	// Request we know of and is actin up
 	else if(strcmp(servers, "0") == 0) {
 		serverNode = eb32_first(root);
@@ -654,19 +651,20 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		}
 	}
 
-	free(url_cpy);
+	#if DEBUG_PRINTING
+		printf("\nIncoming URL: %s\nServers: %s\n", url_cpy, servers);
+	#endif
 
-	// printf("\nURL: %s\nServers: %s\n", url_cpy, servers); // comment this out
+	free(url_cpy);
 	
 	hash = 0;
 	draws = px->lbprm.arg_opt1; // number of draws
 
 	/* tot_weight appears to mean srv_count */
 	if (px->lbprm.tot_weight == 0){
-		// Be sure to move this right before the function return
-		//printf("total weight is zero, returning null");
-		//free(servers);
-		//free(url_cpy);
+		#if DEBUG_PRINTING
+			printf("total weight is zero, returning null");
+		#endif
 		return NULL;
 	}
 
@@ -686,10 +684,6 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 			curr = prev;
 	} while (--draws > 0);
 
-	// Be sure to move this right before the function return
-	//free(servers);
-	//free(url_cpy);
-
 	/* if the selected server is full, pretend we have none so that we reach
 		* the backend's queue instead.
 		*/
@@ -697,11 +691,13 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		(curr->queue.length || (curr->maxconn && curr->served >= srv_dynamic_maxconn(curr))))
 		curr = NULL;
 	
-	if(curr == NULL){ // comment this part out
-		printf("chosen server was NULL\n");
-	}else{
-		// printf("id: %s\n", curr->id);
-	}
+	#if DEBUG_PRINTING
+		if(curr == NULL){
+				printf("chosen server was NULL\n");
+		}else{
+				printf("Chosen server id: %s\n", curr->id);
+		}
+	#endif
 	////////////////// End edits //////////////////
 	return curr;
 }
