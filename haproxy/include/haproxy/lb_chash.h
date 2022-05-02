@@ -29,7 +29,7 @@ struct proxy;
 struct server;
 int chash_init_server_tree(struct proxy *p);
 struct server *chash_get_next_server(struct proxy *p, struct server *srvtoavoid);
-struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const struct server *avoid);
+struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const struct server *avoid, char *whitelist);
 void chash_set_server_status_up(struct server *srv);
 void chash_set_server_status_down(struct server *srv);
 #endif /* _HAPROXY_LB_CHASH_H */
