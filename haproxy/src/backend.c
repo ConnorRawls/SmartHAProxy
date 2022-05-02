@@ -64,7 +64,6 @@
 #include <pthread.h>
 
 #define SRVCOUNT 5
-#define DEBUG_PRINTING 1 // 0 - disabled, 1 - enabled
 
 ReqCount reqCount;
 Lock check;
@@ -178,6 +177,7 @@ void update_backend_weight(struct proxy *px)
 static struct server *get_server_sh(struct proxy *px, const char *addr, int len, const struct server *avoid)
 {
 	unsigned int h, l;
+	char whitelist[] = "1234567";
 
 	if (px->lbprm.tot_weight == 0)
 		return NULL;
@@ -196,7 +196,7 @@ static struct server *get_server_sh(struct proxy *px, const char *addr, int len,
 		h = full_hash(h);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, h, avoid);
+		return chash_get_server_hash(px, h, avoid, whitelist);
 	else
 		return map_get_server_hash(px, h);
 }
@@ -221,6 +221,7 @@ static struct server *get_server_uh(struct proxy *px, char *uri, int uri_len, co
 	int c;
 	int slashes = 0;
 	const char *start, *end;
+	char whitelist[] = "1234567";
 
 	if (px->lbprm.tot_weight == 0)
 		return NULL;
@@ -251,7 +252,7 @@ static struct server *get_server_uh(struct proxy *px, char *uri, int uri_len, co
 		hash = full_hash(hash);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, hash, avoid);
+		return chash_get_server_hash(px, hash, avoid, whitelist);
 	else
 		return map_get_server_hash(px, hash);
 }
@@ -272,6 +273,7 @@ static struct server *get_server_ph(struct proxy *px, const char *uri, int uri_l
 	const char *p;
 	const char *params;
 	int plen;
+	char whitelist[] = "1234567";
 
 	/* when tot_weight is 0 then so is srv_count */
 	if (px->lbprm.tot_weight == 0)
@@ -308,7 +310,7 @@ static struct server *get_server_ph(struct proxy *px, const char *uri, int uri_l
 					hash = full_hash(hash);
 
 				if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-					return chash_get_server_hash(px, hash, avoid);
+					return chash_get_server_hash(px, hash, avoid, whitelist);
 				else
 					return map_get_server_hash(px, hash);
 			}
@@ -337,6 +339,7 @@ static struct server *get_server_ph_post(struct stream *s, const struct server *
 	unsigned int     plen = px->lbprm.arg_len;
 	unsigned long    len;
 	const char      *params, *p, *start, *end;
+	char whitelist[] = "1234567";
 
 	if (px->lbprm.tot_weight == 0)
 		return NULL;
@@ -388,7 +391,7 @@ static struct server *get_server_ph_post(struct stream *s, const struct server *
 					hash = full_hash(hash);
 
 				if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-					return chash_get_server_hash(px, hash, avoid);
+					return chash_get_server_hash(px, hash, avoid, whitelist);
 				else
 					return map_get_server_hash(px, hash);
 			}
@@ -425,6 +428,7 @@ static struct server *get_server_hh(struct stream *s, const struct server *avoid
 	const char *start, *end;
 	struct htx *htx = htxbuf(&s->req.buf);
 	struct http_hdr_ctx ctx = { .blk = NULL };
+	char whitelist[] = "1234567";
 
 	/* tot_weight appears to mean srv_count */
 	if (px->lbprm.tot_weight == 0)
@@ -483,7 +487,7 @@ static struct server *get_server_hh(struct stream *s, const struct server *avoid
 		hash = full_hash(hash);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, hash, avoid);
+		return chash_get_server_hash(px, hash, avoid, whitelist);
 	else
 		return map_get_server_hash(px, hash);
 }
@@ -497,6 +501,7 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 	int              ret;
 	struct sample    smp;
 	int rewind;
+	char whitelist[] = "1234567";
 
 	/* tot_weight appears to mean srv_count */
 	if (px->lbprm.tot_weight == 0)
@@ -528,12 +533,12 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 		hash = full_hash(hash);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, hash, avoid);
+		return chash_get_server_hash(px, hash, avoid, whitelist);
 	else
 		return map_get_server_hash(px, hash);
 }
 
-	///////////////// Begin edits /////////////////
+///////////////// Begin edits /////////////////
 /* random value  */
 static struct server *get_server_rnd(struct stream *s, const struct server *avoid, const char *uri, int uri_len)
 {
@@ -541,29 +546,21 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	// the compile warning to shut up.
 	unsigned int hash;
 	struct proxy  *px;
-	struct server *prev, *curr, *srv;
+	struct server *prev, *curr;
 	int draws; // number of draws
-	struct eb32_node *serverNode; //node in the elastic binary tree containing servers
-	struct eb_root *root;
-	char serverId; //number of server
-
 	char *url_cpy; //url extracted from the uri
 	const char *url; //pointer to where the url ends
 	char *servers; //list of servers from the whitelist that the request url can use
 	int url_len; //length of url string
-	int loopCount; //Counter used in loops
 	clock_t t2;
 	double elapsed_time;
 
+	hash = 0;
 	px = s->be;
-	if (px->srv_act)
-		root = &px->lbprm.chash.act;
-	else if (px->srv_bck)
-		root = &px->lbprm.chash.bck;
-	else{
-		printf("root is NULL");
-		return NULL;
-	}
+	draws = px->lbprm.arg_opt1;
+
+	/* tot_weight appears to mean srv_count */
+	if (px->lbprm.tot_weight == 0) return NULL;
 
 	pthread_mutex_lock(&check.lock);
 
@@ -573,9 +570,8 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	reqCount.count++;
 
 	if(reqCount.count == 10000 || elapsed_time >= 2){
-		#if DEBUG_PRINTING
-			printf("\nUpdating Whitelist...\n");
-		#endif
+		printf("\nUpdating Whitelist...\n");
+
 		updateWhitelist();
 
 		reqCount.time = clock();
@@ -596,65 +592,6 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	servers = NULL;
 	servers = searchRequest(url_cpy);
 	if(servers != NULL) {strcat(servers, "\0");}
-
-	// Who dis
-	if(servers == NULL) {
-		serverNode = eb32_first(root);
-		loopCount = 0;
-		while(serverNode != NULL && loopCount < SRVCOUNT){
-			loopCount++;
-			srv = eb32_entry(serverNode, struct tree_occ, node)->server;
-			chash_set_server_status_up(srv);
-			serverNode = eb32_next(serverNode); //go to next node in the tree
-		}
-	}
-	// Request we know of and is gucci
-	else if(strcmp(servers, "0") != 0 && servers != NULL){
-		serverNode = eb32_first(root); //start from left most node
-		loopCount = 0;
-		for(int delete, count; serverNode != NULL && loopCount < SRVCOUNT; loopCount++){ //for each server node in the tree
-			srv = eb32_entry(serverNode, struct tree_occ, node)->server; //get server from node
-			//get server id from its name
-			if(strlen(srv->id) == 7) {
-				serverId = '1';
-			}
-			else{
-				serverId = srv->id[9];
-			}
-			// printf("Looping: %c", serverId);
-			delete = 1; // 1 if node must be set to down, 0 if it must be set to up
-			count = 0;
-			while(servers[count] != '\0' && count < SRVCOUNT){ // for each server in the whitelist
-				if(serverId == servers[count]){ // if the id is found in the list
-					delete = 0;
-					break;
-				}
-				count++;
-			}
-			if(delete){ //server id was not in the whitelist
-				chash_set_server_status_down(srv);
-			}else{ // server id was in the whitelist
-				chash_set_server_status_up(srv);
-			}
-			serverNode = eb32_next(serverNode); //go to next node in the tree
-		}
-	}
-	// Request we know of and is actin up
-	else if(strcmp(servers, "0") == 0) {
-		serverNode = eb32_first(root);
-		loopCount = 0;
-		while(serverNode != NULL && loopCount < SRVCOUNT){
-			loopCount++;
-			srv = eb32_entry(serverNode, struct tree_occ, node)->server;
-			chash_set_server_status_down(srv);
-			serverNode = eb32_next(serverNode); //go to next node in the tree
-		}
-	}
-
-	#if DEBUG_PRINTING
-		printf("\nIncoming URL: %s\nServers: %s\n", url_cpy, servers);
-	#endif
-
 	free(url_cpy);
 	
 	hash = 0;
@@ -662,9 +599,8 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 	/* tot_weight appears to mean srv_count */
 	if (px->lbprm.tot_weight == 0){
-		#if DEBUG_PRINTING
-			printf("total weight is zero, returning null");
-		#endif
+		// Be sure to move this right before the function return
+		//printf("total weight is zero, returning null");
 		return NULL;
 	}
 
@@ -672,7 +608,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	do {
 		prev = curr;
 		hash = statistical_prng();
-		curr = chash_get_server_hash(px, hash, avoid);
+		curr = chash_get_server_hash(px, hash, avoid, servers);
 		if (!curr)
 			break;
 
@@ -684,6 +620,10 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 			curr = prev;
 	} while (--draws > 0);
 
+	// Be sure to move this right before the function return
+	//free(servers);
+	//free(url_cpy);
+
 	/* if the selected server is full, pretend we have none so that we reach
 		* the backend's queue instead.
 		*/
@@ -691,13 +631,11 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		(curr->queue.length || (curr->maxconn && curr->served >= srv_dynamic_maxconn(curr))))
 		curr = NULL;
 	
-	#if DEBUG_PRINTING
-		if(curr == NULL){
-				printf("chosen server was NULL\n");
-		}else{
-				printf("Chosen server id: %s\n", curr->id);
-		}
-	#endif
+	if(curr == NULL){ // comment this part out
+		printf("chosen server was NULL\n");
+	}else{
+		// printf("id: %s\n", curr->id);
+	}
 	////////////////// End edits //////////////////
 	return curr;
 }
