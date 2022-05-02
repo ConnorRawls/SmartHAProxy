@@ -236,6 +236,14 @@ char *allocateSrvSize(char *url, char *servers)
     return NULL;
 }
 
+int onWhitelist(char *task_wl, char *server_id)
+{
+    char which_id = server_id[strlen(server_id) - 1];
+
+    if(strchr(task_wl, which_id)) return 1;
+    else return 0;
+}
+
 // Display item statistics
 void printRequest(char *url)
 {
