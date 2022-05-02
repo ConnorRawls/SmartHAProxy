@@ -66,6 +66,9 @@ char *searchRequest(char *url);
 // Malloc variable containing request's servers
 char *allocateSrvSize(char *url, char *servers);
 
+// Compare server ID to task's whitelist
+int onWhitelist(char *task_wl, char *server_id);
+
 // Display item statistics
 void printRequest(char *url);
 
