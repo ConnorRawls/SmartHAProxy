@@ -43,7 +43,7 @@ import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
 
 MSGLEN = 1
-SRVCOUNT = 7
+SRVCOUNT = 5
 
 def main():
     with Manager() as m:
@@ -110,8 +110,9 @@ def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
     for server in workload.keys():
         possible_srvs.append(str(server))
 
-    # Clear log
+    # Clear logs
     os.system("truncate -s 0 /var/log/haproxy_access.log")
+    os.system("truncate -s 0 /var/log/apache_access.log")
 
     with open('records.csv', 'a') as record_file:
         record_file.write('task type,expected execution time,expected variance,' + \
