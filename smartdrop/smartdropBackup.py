@@ -1,7 +1,8 @@
 '''
-TODO: 
-Fix detectServers()
-If task_id is found, immediately pull features from record rather than parsing log
+TODO: Fix detectServers()
+
+QUESTIONS: Should whitelist be constantly updating or periodically? (When LB
+asks for it)
 
 -------------------------------------
 Author: Connor Rawls
@@ -14,7 +15,7 @@ task types based upon SLO requirements (1 sec). Communicate this information wit
 client through UNIX sockets.
 
 Three processes run concurrently:
-  -taskEvent
+  -haproxyEvent
   -cpuUsage
   -comms
 Six objects are referenced globally:
@@ -35,7 +36,6 @@ import json
 import time
 import sys
 import itertools
-from datetime import datetime
 from multiprocessing import Process, Manager, Lock
 import libvirt
 import pickle
@@ -43,55 +43,42 @@ import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
 
 MSGLEN = 1
-SRVCOUNT = 7
-
-class Task:
-    def __init__(self, method, url, query, ex_size, size_stdev, ex_time, time_stdev):
-        self.method = method
-        self.url = url
-        self.query = query
-        self.ex_size = ex_size
-        self.size_stdev = size_stdev
-        self.ex_time = ex_time
-        self.time_stdev = time_stdev
+SRVCOUNT = 5
 
 def main():
     with Manager() as m:
-        # Profiled Response Time per task type
-        # (Used for workload calc.)
+        # Expected execution time per task type
         time_matrix = m.dict()
-        time_stdev = m.dict()
-        size_matrix = m.dict()
-        size_stdev = m.dict()
-        # Expected response time of backend servers
-        # (Summation of PRTs)
+        # Expected std. dev. of execution time per task type
+        stdev_matrix = m.dict()
+        # Expected response time of backend servers - task's expected execution
+        # time
         workload = m.dict()
         # CPU utilization stamp at time of instance dispatch
         cpu_usage = m.dict()
-        # Key is task type and value are servers task is allowed to dispatch to
-        whitelist = m.dict()
         # Rows = Task type
-        # Columns = Server
+        # Columns = Predicted response time / server
         predicted_response = m.dict()
+        # Contains URL (key) and servers (value) tasks are allowed to dispatch to
+        whitelist = m.dict()
         # Master Lock TM
         wl_lock = Lock()
         cpu_lock = Lock()
+
         # GBDT model
         model = pickle.load(open('GBDT.sav', 'rb'))
 
-        init(time_matrix, time_stdev, size_matrix, size_stdev, workload, \
-            cpu_usage, predicted_response, whitelist, m)
+        initGlobals(time_matrix, stdev_matrix, workload, cpu_usage, \
+            predicted_response, whitelist, m)
 
         # Multiprocessing mumbo jumbo
-        proc1 = Process(target = taskEvent, args = (time_matrix, workload, \
-            cpu_usage, predicted_response, wl_lock, cpu_lock))
+        proc1 = Process(target = haproxyEvent, args = (time_matrix, stdev_matrix, \
+            workload, cpu_usage, wl_lock, cpu_lock))
         proc2 = Process(target = cpuUsage, args = (cpu_usage, cpu_lock))
-        proc3 = Process(target = comms, args = (time_matrix, time_stdev, \
-            size_matrix, size_stdev, cpu_usage, workload, predicted_response, \
-            whitelist, wl_lock, cpu_lock, model))
+        proc3 = Process(target = comms, args = (time_matrix, stdev_matrix, cpu_usage, \
+            workload, predicted_response, whitelist, wl_lock, cpu_lock, model))
 
-        start_time = datetime.now()
-        print(f"Commencing Smartdrop [{start_time}].")
+        print("Commencing Smartdrop.")
 
         proc1.start()       # Start listening for task events
         proc2.start()       # Start observing hardware metrics
@@ -106,15 +93,15 @@ def main():
 # Process 1
 # -----------------------------------------------------------------------------
 # Monitor task-related events
-def taskEvent(time_matrix, workload, cpu_usage, predicted_response, wl_lock, cpu_lock):
+def haproxyEvent(time_matrix, stdev_matrix, workload, cpu_usage, \
+    wl_lock, cpu_lock):
+    # Instance's actual response time
+    actual_response = ''
+    # Internal records for managing task instances
     # URL, expected execution time, expected std. dev., expected response time,
     # server, CPU usage, actual response
     record = {}
-    actual_time = ''
-    status_key = {'+' : 'new', '>' : 'complete', '-' : 'sent'}
-    methods = ['GET', 'POST']
-    # Query search patterns
-    q_patterns = '\?wc-ajax=add_to_cart|\?wc-ajax=get_refreshed_fragments'
+    # Error protocol variables
     task_count = 0
     total_response = 0
     error_count = 0
@@ -124,92 +111,57 @@ def taskEvent(time_matrix, workload, cpu_usage, predicted_response, wl_lock, cpu
         possible_srvs.append(str(server))
 
     # Clear logs
+    os.system("truncate -s 0 /var/log/haproxy_access.log")
     os.system("truncate -s 0 /var/log/apache_access.log")
 
     with open('records.csv', 'a') as record_file:
-        record_file.write('method,url,query,server,predicted response time,' + \
-            'actual response time\n')
+        record_file.write('task type,expected execution time,expected variance,' + \
+            'expected response time,actual response time')
 
-        with open('/var/log/apache_access.log', 'r') as log_file:
+        with open('/var/log/haproxy_access.log', 'r') as log_file:
             lines = logRead(log_file)
 
             # MAIN LOOP: Parse log file
             for line in lines:
-                line = re.split(',|\s|\|', line)
+                line.replace(' ', '')
+                line = line.split(',')
 
-                # Status
+                # Task instance ID
                 try:
-                    status = status_key[line[0][0].replace(' ', '')]
-                    if status == 'sent': continue
-                except IndexError:
-                    error_count += 1
-                    continue
-                except KeyError:
-                    error_count += 1
-                    continue
-
-                # Task ID
-                try:
-                    task_id = line[0][1:].replace(' ', '')
-                except IndexError:
-                    error_count += 1
-                    continue
-
-                # Method
-                try:
-                    method = line[1].replace.replace(' ', '')
-                    if method not in methods:
-                        method = unknownMethod(task_id,, record)
-                        if method == 'UNKNOWN':
-                            error_count += 1
-                            continue
-                except IndexError:
-                    error_count += 1
-                    continue
-
-                # Query
-                try:
-                    found = False
-                    query = re.search(q_patterns, line[2].replace(' ', ''))
-                    try:
-                        query = query.group()
-                        line[2] = line[2].replace(query, '')
-                    except AttributeError: query = ''
-                    for key, value in time_matrix.items():
-                        if type(key) in [list, tuple, dict] and query in key:
-                            found = True
-                            break
-                    if found == False:
-                        query = unknownQuery(task_id, record)
-                        if query == 'UNKNOWN':
-                            error_count += 1
-                            continue
-                except IndexError:
-                    query = unknownQuery(task_id, record)
-                    if query == 'UNKNOWN':
+                    task_id = line[0].replace(' ', '').replace('\n', '')
+                    if not isint(task_id):
                         error_count += 1
+                        # print('\nTask ID is not an integer. Line:\n', line)
+                        # print('Error count: ', error_count)
                         continue
+                    if not int(task_id) >= 0:
+                        error_count += 1
+                        # print('\nTask ID is not positive. Line:\n', line)
+                        # print('Error count: ', error_count)
+                        continue
+                except IndexError:
+                    error_count += 1
+                    # print('\nIndexError at ID value. Line:\n', line)
+                    # print('Error count: ', error_count)
+                    continue
 
                 # URL
                 try:
-                    found = False
-                    url = line[2].replace(' ', '')
-                    if (query != '' or url == '/wp-profiling/') \
-                        and 'index.php' not in url:
-                        url = url + 'index.php'
-                    for key, value in time_matrix.items():
-                        if type(key) in [list, tuple, dict] and url in key:
-                            found = True
-                            break
-                    if found == False:
-                        url = unknownURL(task_id, record)
+                    url = line[1].replace(' ', '')
+                    if url not in time_matrix.keys():
+                        url = unknownURL(url, time_matrix, task_id, record)
                         if url == 'UNKNOWN':
                             error_count += 1
+                            # print('\nUnknown URL. Line:\n', line)
+                            # print('Error count: ', error_count)
                             continue
                 except IndexError:
-                    url = unknownURL(task_id, record)
-                    if url = 'UNKNOWN':
-                        error_count += 1
+                    error_count += 1
+                    # print('\nIndexError at URL. Line:\n', line)
+                    # print('Error count: ', error_count)
+                    url = unknownURL(url, time_matrix, task_id, record)
+                    if url == 'UNKNOWN':
+                        # print('Could not recover :(')
                         continue
 
                 # Server
@@ -219,11 +171,16 @@ def taskEvent(time_matrix, workload, cpu_usage, predicted_response, wl_lock, cpu
                         server = unknownServer(task_id, record)
                         if server == 'UNKNOWN':
                             error_count += 1
+                            # print('\nUnknown server. Line:\n', line)
+                            # print('Error count: ', error_count)
                             continue
                 except IndexError:
                     error_count += 1
+                    # print('\nIndexError at server name. Line:\n', line)
+                    # print('Error count: ', error_count)
                     server = unknownServer(task_id, record)
                     if server == 'UNKNOWN':
+                        # print('Could not recover :(')
                         continue
 
                 # Response time
@@ -234,12 +191,17 @@ def taskEvent(time_matrix, workload, cpu_usage, predicted_response, wl_lock, cpu
                             actual_response = total_response / task_count
                         else:
                             error_count += 1
+                            # print('\nUnknown response. Line:\n', line)
+                            # print('Error count: ', error_count)
                             continue
                 except IndexError:
                     error_count += 1
+                    # print('IndexError at response value. Line:\n ', line)
+                    # print('Error count: ', error_count)
                     if task_id in record.keys():
                         actual_response = total_response / task_count
                     else:
+                        # print('Could not recover :(')
                         continue
 
                 # Insert task
@@ -255,6 +217,8 @@ def taskEvent(time_matrix, workload, cpu_usage, predicted_response, wl_lock, cpu
                         cpu_lock.release()
                     except KeyError:
                         error_count += 1
+                        # print('\nKeyError at inserting task. Line:\n', line)
+                        # print('Error count: ', error_count)
 
                 # Task completion
                 else:
@@ -270,6 +234,8 @@ def taskEvent(time_matrix, workload, cpu_usage, predicted_response, wl_lock, cpu
                         task_count += 1
                     except KeyError:
                         error_count += 1
+                        # print('\nKeyError at task completion. Line:\n', line)
+                        # print('Error count: ', error_count)
 
 # Process 2
 # -----------------------------------------------------------------------------
@@ -315,8 +281,10 @@ def comms(time_matrix, stdev_matrix, cpu_usage, workload, predicted_response, \
                 # Receive 1
                 # print("Waiting for HAProxy...")
                 message = receiveMessage(conn)
+                # print(f"Message 1 received from HAProxy: {message}")
 
                 # Set locks
+                # print("HAProxy requests wl_lock. Setting...")
                 wl_lock.acquire()
                 cpu_lock.acquire()
 
@@ -332,13 +300,19 @@ def comms(time_matrix, stdev_matrix, cpu_usage, workload, predicted_response, \
                 fileWrite(whitelist)
 
                 # Send 1
+                # print("Sending message 1 to HAProxy...")
                 sendMessage(conn, b'1')
+                # print("Message 1 sent to HAProxy.")
 
                 # Receive 2
+                # print("Waiting for HAProxy...")
                 message = receiveMessage(conn)
+                # print(f"Message 2 received from HAProxy: {message}")
 
                 # Send 2
+                # print("Sending message 2...")
                 sendMessage(conn, b'2')
+                # print("Message 2 sent to HAProxy.\nData transfer complete.")
 
 # Whitelist Algorithm
 # -----------------------------------------------------------------------------
@@ -359,10 +333,18 @@ def whiteAlg(time_matrix, stdev_matrix, cpu_usage, workload, whitelist, \
             if server in whitelist[task] and \
                 predicted_response[task][server] >= SLO:
                 # Remove it from server's whitelist if it is there
+                # print(f"\nRemoving server {server} from URL \"{task}\"'s whitelist.")
+                # print("*** Stats ***")
+                # print(f"Expected execution time: {time_matrix[task]}")
+                # print(f"Expected variance: {stdev_matrix[task]}")
+                # print(f"CPU usage: {cpu_usage[server]}")
+                # print(f"Workload: {workload[server]}")
+                # print(f"Predicted response: {predicted_response[task][server]}")
                 whitelist[task].remove(server)
 
             elif server not in whitelist[task] and \
                 predicted_response[task][server] < SLO:
+                # print(f"Adding server {server} to URL \"{task}\"'s whitelist.")
                 # Add the task to the server's whitelist
                 whitelist[task].append(server)
 
@@ -409,7 +391,7 @@ def detectServers():
     return detect.count('web_servers')
 
 # Construct shared variables
-def init(time_matrix, stdev_matrix, workload, cpu_usage, \
+def initGlobals(time_matrix, stdev_matrix, workload, cpu_usage, \
     predicted_response, whitelist, m):
     # Detect number of backend servers
     # srvCount = detectServers()
@@ -493,6 +475,21 @@ def isfloat(string):
 
 # Write data to file
 def fileWrite(whitelist):
+    # t = '' # Simplify dict to list object
+    # for url in whitelist.keys():
+    #     t += str(url)
+    #     t += ','
+    #     if whitelist[url] == []:
+    #         t += '0\n'
+    #     else:
+    #         for server in whitelist[url]:
+    #             if server == 'WP-Host':
+    #                 t += '1'
+    #             else:
+    #                 t += str(server[-1])
+    #         t += '\n'
+    # t += '\0'
+
     t = '' # Simplify dict to list object
     for url in whitelist.keys():
         t += str(url)
@@ -511,9 +508,11 @@ def fileWrite(whitelist):
     t += '\0'
 
     # Offload data to file
+    # print("Writing to /Whitelist/whitelist.csv...")
     with open("/Whitelist/whitelist.csv", "r+") as file:
         file.truncate(0)
         file.write(t)
+    # print("...done.")
 
 # Socket send
 def sendMessage(conn, message):
@@ -536,9 +535,13 @@ def receiveMessage(conn):
 
         if chunk == b'': raise RuntimeError("Socket connection broken.")
 
+        # print(f"New chunk has arrived. Size: {len(chunk)}")
+
         chunks.append(chunk)
 
         bytes_received = bytes_received + len(chunk)
+
+        # print(f"bytes_received: {bytes_received}")
 
     return b''.join(chunks)
 
