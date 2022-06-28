@@ -20,7 +20,9 @@ extern Lock check;
 // Hashed item
 typedef struct Request_T
 {
+    char *method;
     char *url;
+    char *query;
     char *servers;
 } Request;
 

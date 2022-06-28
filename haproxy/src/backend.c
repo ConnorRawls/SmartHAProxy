@@ -540,7 +540,7 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 
 ///////////////// Begin edits /////////////////
 /* random value  */
-static struct server *get_server_rnd(struct stream *s, const struct server *avoid, const char *uri, int uri_len)
+static struct server *get_server_rnd(struct stream *s, const struct server *avoid, int method, const char *uri, int uri_len)
 {
 	// Below are constructs created by HAProxy. Moved up here to get
 	// the compile warning to shut up.
@@ -765,8 +765,10 @@ int assign_server(struct stream *s)
 				if ((s->be->lbprm.algo & BE_LB_PARM) == BE_LB_RR_RANDOM)
 				{
 					struct ist uri;
+					int method;
 					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
-					srv = get_server_rnd(s, prev_srv, uri.ptr, uri.len);
+					method = s->txn->meth
+					srv = get_server_rnd(s, prev_srv, method, uri.ptr, uri.len);
 				}
 				else
 					srv = map_get_server_rr(s->be, prev_srv);
