@@ -22,7 +22,7 @@ Six objects are referenced globally:
   -stdev_matrix
   -workload
   -cpu_usage
-  -predicted_response
+  -predicted_time
   -whitelist
 '''
 
@@ -45,7 +45,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 MSGLEN = 1
 SRVCOUNT = 7
 
-class Task:
+class TaskType:
     def __init__(self, method, url, query, ex_size, size_stdev, ex_time, time_stdev):
         self.method = method
         self.url = url
@@ -54,6 +54,28 @@ class Task:
         self.size_stdev = size_stdev
         self.ex_time = ex_time
         self.time_stdev = time_stdev
+
+class Instance:
+    def __init__(self, method, url, query, ex_size, size_stdev, ex_time, \
+        time_stdev, server, workload, predicted_time, cpu_usage):
+        self.method = method
+        self.url = url
+        self.query = query
+        self.ex_size = ex_size
+        self.size_stdev = size_stdev
+        self.ex_time = ex_time
+        self.time_stdev = time_stdev
+        self.server = server
+        self.workload = workload
+        self.predicted_time
+        self.cpu_usage = cpu_usage
+
+    def toList():
+        list_str = (f'{self.method},{self.url},{self.query},{self.ex_size},'
+                    f'{self.size_stdev},{self.ex_time},{self.time_stdev},'
+                    f'{self.server},{self.workload},{self.predicted_time},'
+                    f'{self.cpu_usage}')
+        return list_str
 
 def main():
     with Manager() as m:
@@ -72,23 +94,24 @@ def main():
         whitelist = m.dict()
         # Rows = Task type
         # Columns = Server
-        predicted_response = m.dict()
+        predicted_time = m.dict()
         # Master Lock TM
         wl_lock = Lock()
+        pt_lock = Lock()
         cpu_lock = Lock()
         # GBDT model
         model = pickle.load(open('GBDT.sav', 'rb'))
 
         init(time_matrix, time_stdev, size_matrix, size_stdev, workload, \
-            cpu_usage, predicted_response, whitelist, m)
+            cpu_usage, predicted_time, whitelist, m)
 
         # Multiprocessing mumbo jumbo
         proc1 = Process(target = taskEvent, args = (time_matrix, workload, \
-            cpu_usage, predicted_response, wl_lock, cpu_lock))
+            cpu_usage, predicted_time, wl_lock, pt_lock, cpu_lock))
         proc2 = Process(target = cpuUsage, args = (cpu_usage, cpu_lock))
         proc3 = Process(target = comms, args = (time_matrix, time_stdev, \
-            size_matrix, size_stdev, cpu_usage, workload, predicted_response, \
-            whitelist, wl_lock, cpu_lock, model))
+            size_matrix, size_stdev, cpu_usage, workload, predicted_time, \
+            whitelist, wl_lock, pt_lock, cpu_lock, model))
 
         start_time = datetime.now()
         print(f"Commencing Smartdrop [{start_time}].")
@@ -106,22 +129,14 @@ def main():
 # Process 1
 # -----------------------------------------------------------------------------
 # Monitor task-related events
-def taskEvent(time_matrix, workload, cpu_usage, predicted_response, wl_lock, cpu_lock):
-    # URL, expected execution time, expected std. dev., expected response time,
-    # server, CPU usage, actual response
+def taskEvent(time_matrix, workload, cpu_usage, predicted_time, wl_lock, pt_lock, \
+    cpu_lock):
+    method, query, url, server = None
     record = {}
-    actual_time = ''
     status_key = {'+' : 'new', '>' : 'complete', '-' : 'sent'}
-    methods = ['GET', 'POST']
-    # Query search patterns
-    q_patterns = '\?wc-ajax=add_to_cart|\?wc-ajax=get_refreshed_fragments'
     task_count = 0
     total_response = 0
     error_count = 0
-    possible_srvs = []
-
-    for server in workload.keys():
-        possible_srvs.append(str(server))
 
     # Clear logs
     os.system("truncate -s 0 /var/log/apache_access.log")
@@ -136,6 +151,8 @@ def taskEvent(time_matrix, workload, cpu_usage, predicted_response, wl_lock, cpu
             # MAIN LOOP: Parse log file
             for line in lines:
                 line = re.split(',|\s|\|', line)
+                method, query, url, server, error = None
+                new_instance = True
 
                 # Status
                 try:
@@ -151,107 +168,46 @@ def taskEvent(time_matrix, workload, cpu_usage, predicted_response, wl_lock, cpu
                 # Task ID
                 try:
                     task_id = line[0][1:].replace(' ', '')
-                except IndexError:
-                    error_count += 1
-                    continue
-
-                # Method
-                try:
-                    method = line[1].replace.replace(' ', '')
-                    if method not in methods:
-                        method = unknownMethod(task_id,, record)
-                        if method == 'UNKNOWN':
+                    if task_id in record:
+                        method = record[task_id].method
+                        url = record[task_id].url
+                        query = record[task_id].query
+                        server = record[task_id].server
+                        new_instance = False
+                    else:
+                        method, query, url, server, error = parseLine(line, \
+                            time_matrix)
+                        if error == True:
                             error_count += 1
                             continue
                 except IndexError:
                     error_count += 1
-                    continue
-
-                # Query
-                try:
-                    found = False
-                    query = re.search(q_patterns, line[2].replace(' ', ''))
-                    try:
-                        query = query.group()
-                        line[2] = line[2].replace(query, '')
-                    except AttributeError: query = ''
-                    for key, value in time_matrix.items():
-                        if type(key) in [list, tuple, dict] and query in key:
-                            found = True
-                            break
-                    if found == False:
-                        query = unknownQuery(task_id, record)
-                        if query == 'UNKNOWN':
-                            error_count += 1
-                            continue
-                except IndexError:
-                    query = unknownQuery(task_id, record)
-                    if query == 'UNKNOWN':
-                        error_count += 1
-                        continue
-
-                # URL
-                try:
-                    found = False
-                    url = line[2].replace(' ', '')
-                    if (query != '' or url == '/wp-profiling/') \
-                        and 'index.php' not in url:
-                        url = url + 'index.php'
-                    for key, value in time_matrix.items():
-                        if type(key) in [list, tuple, dict] and url in key:
-                            found = True
-                            break
-                    if found == False:
-                        url = unknownURL(task_id, record)
-                        if url == 'UNKNOWN':
-                            error_count += 1
-                            continue
-                except IndexError:
-                    url = unknownURL(task_id, record)
-                    if url = 'UNKNOWN':
-                        error_count += 1
-                        continue
-
-                # Server
-                try:
-                    server = line[2].replace(' ', '')
-                    if server not in possible_srvs:
-                        server = unknownServer(task_id, record)
-                        if server == 'UNKNOWN':
-                            error_count += 1
-                            continue
-                except IndexError:
-                    error_count += 1
-                    server = unknownServer(task_id, record)
-                    if server == 'UNKNOWN':
-                        continue
+                    continue                
 
                 # Response time
-                try:
-                    actual_response = line[3].replace(' ', '').replace('\n', '')
-                    if not isfloat(actual_response):
-                        if task_id in record.keys():
-                            actual_response = total_response / task_count
-                        else:
-                            error_count += 1
-                            continue
-                except IndexError:
-                    error_count += 1
-                    if task_id in record.keys():
-                        actual_response = total_response / task_count
-                    else:
+                if not new_instance:
+                    try:
+                        actual_time = line[3].replace(' ', '')
+                        try: float(actual_time)
+                        except ValueError:
+                            actual_time = 'NULL'
+                    except IndexError:
+                        error_count += 1
                         continue
 
                 # Insert task
-                if '-' in str(actual_response):
+                if status == 'new':
                     try:
+                        key = [method,url,query]
+                        task_type = profile_matrix[key]
                         wl_lock.acquire()
-                        workload[server] += time_matrix[url]
-                        wl_lock.release()
+                        workload[server] += task_type.ex_time
                         cpu_lock.acquire()
-                        record[task_id] = url + ',' + str(time_matrix[url]) + ',' + \
-                            str(stdev_matrix[url]) + ',' + str(workload) + \
-                            ',' + str(server) + ',' + str(cpu_usage[server].value) + ','
+                        record[task_id] = Instance(method, url, query, task.ex_size, \
+                            task.size_stdev, task.ex_time, task.time_stdev, server, \
+                            workload[server].value, predicted_time[][], \
+                            cpu_usage[server].value)
+                        wl_lock.release()                        
                         cpu_lock.release()
                     except KeyError:
                         error_count += 1
@@ -259,12 +215,14 @@ def taskEvent(time_matrix, workload, cpu_usage, predicted_response, wl_lock, cpu
                 # Task completion
                 else:
                     try:
-                        if not task_id in record.keys(): continue
+                        key = [method,url,query]
+                        task_type = profile_matrix[key]
                         wl_lock.acquire()
-                        workload[server] -= time_matrix[url]
+                        workload[server] -= task_type.ex_time
                         wl_lock.release()
-                        record[task_id] += str(float(actual_response) / 1e6)
-                        record_file.write(record[task_id] + '\n')
+                        # *** WHAT ARE THE UNITS BEING LOGGED ***                       
+                        record_file.write(record[task_id].toList() + \
+                            f',{actual_response}\n')
                         del record[task_id]
                         total_response += int(actual_response)
                         task_count += 1
@@ -295,8 +253,8 @@ def cpuUsage(cpu_usage, cpu_lock):
 # Process 3
 # -----------------------------------------------------------------------------
 # Send whitelist to load balancer
-def comms(time_matrix, stdev_matrix, cpu_usage, workload, predicted_response, \
-    whitelist, wl_lock, cpu_lock, model):
+def comms(time_matrix, stdev_matrix, cpu_usage, workload, predicted_time, \
+    whitelist, wl_lock, pt_lock, cpu_lock, model):
     HOST = 'smartdrop'
     PORT = 8080
 
@@ -322,7 +280,7 @@ def comms(time_matrix, stdev_matrix, cpu_usage, workload, predicted_response, \
 
                 # Calculate whitelist
                 whiteAlg(time_matrix, stdev_matrix, cpu_usage, workload, \
-                    whitelist, predicted_response, model)
+                    whitelist, predicted_time, model)
 
                 # Release locks
                 wl_lock.release()
@@ -344,32 +302,32 @@ def comms(time_matrix, stdev_matrix, cpu_usage, workload, predicted_response, \
 # -----------------------------------------------------------------------------
 # Calculate task whitelists
 def whiteAlg(time_matrix, stdev_matrix, cpu_usage, workload, whitelist, \
-        predicted_response, model):
+        predicted_time, model):
     # Service Level Objective = 1 second
     SLO = 1
 
-    GBDT(time_matrix, stdev_matrix, cpu_usage, workload, predicted_response, \
+    GBDT(time_matrix, stdev_matrix, cpu_usage, workload, predicted_time, \
         model)
 
     # Iterate for all tasks
-    for task in predicted_response.keys():
+    for task in predicted_time.keys():
         # Iterate for all servers
-        for server in predicted_response[task].keys():
+        for server in predicted_time[task].keys():
             # If server can't satisfy task's deadline
             if server in whitelist[task] and \
-                predicted_response[task][server] >= SLO:
+                predicted_time[task][server] >= SLO:
                 # Remove it from server's whitelist if it is there
                 whitelist[task].remove(server)
 
             elif server not in whitelist[task] and \
-                predicted_response[task][server] < SLO:
+                predicted_time[task][server] < SLO:
                 # Add the task to the server's whitelist
                 whitelist[task].append(server)
 
 # Gradient Boosted Decision Tree
 # -----------------------------------------------------------------------------
 # Predict task types' response time on each server
-def GBDT(time_matrix, stdev_matrix, cpu_usage, workload, predicted_response, \
+def GBDT(time_matrix, stdev_matrix, cpu_usage, workload, predicted_time, \
     model):
     # N channel metric matrix
     # N = Number of servers
@@ -395,8 +353,8 @@ def GBDT(time_matrix, stdev_matrix, cpu_usage, workload, predicted_response, \
         output_data = []
         for row in input_data:
             output_data.append(abs(model.predict([row])))
-        for (task, row) in zip(predicted_response.keys(), output_data):
-            task = predicted_response[task]
+        for (task, row) in zip(predicted_time.keys(), output_data):
+            task = predicted_time[task]
             task[server] = row
 
 # Utilities
@@ -408,9 +366,78 @@ def detectServers():
         shell = True, stdout = subprocess.PIPE).stdout.decode('utf-8')
     return detect.count('web_servers')
 
+def parseLine(line, time_matrix):
+    methods = ['GET', 'POST']
+    # Query search patterns
+    q_patterns = '\?wc-ajax=add_to_cart|\?wc-ajax=get_refreshed_fragments'
+    method, query, url, server, error = None
+
+    # Method
+    try:
+        method = line[1].replace.replace(' ', '')
+        if method not in methods:
+            error = True
+            return method, query, url, server, error
+    except IndexError:
+        error = True
+        return method, query, url, server, error
+
+    # Query
+    try:
+        found = False
+        query = re.search(q_patterns, line[2].replace(' ', ''))
+        try:
+            query = query.group()
+            line[2] = line[2].replace(query, '')
+        except AttributeError: query = ''
+        for key, value in time_matrix.items():
+            if type(key) in [list, tuple, dict] and query in key:
+                found = True
+                break
+        if found == False:
+            error = True
+            return method, query, url, server, error
+    except IndexError:
+        error = True
+        return method, query, url, server, error
+
+    # URL
+    try:
+        found = False
+        url = line[2].replace(' ', '')
+        if (query != '' or url == '/wp-profiling/') \
+            and 'index.php' not in url:
+            url = url + 'index.php'
+        for key, value in time_matrix.items():
+            if type(key) in [list, tuple, dict] and url in key:
+                found = True
+                break
+        if found == False:
+            error = True
+            return method, query, url, server, error
+    except IndexError:
+        error = True
+        return method, query, url, server, error
+
+    # Server
+    try:
+        server = line[-1][-1].replace(' ', '').replace('\n', '')
+        try: int(server)
+        except ValueError:
+            error = True
+            return method, query, url, server, error
+    except IndexError:
+        error = True
+        return method, query, url, server, error
+    except KeyError:
+        error = True
+        return method, query, url, server, error
+
+    return method, query, url, server, error
+
 # Construct shared variables
 def init(time_matrix, stdev_matrix, workload, cpu_usage, \
-    predicted_response, whitelist, m):
+    predicted_time, whitelist, m):
     # Detect number of backend servers
     # srvCount = detectServers()
     # if srvCount < 1:
@@ -442,9 +469,9 @@ def init(time_matrix, stdev_matrix, workload, cpu_usage, \
             else: whitelist[url].append('WP-Host-0' + str(server + 1))
 
     for task in time_matrix.keys():
-        predicted_response[task] = m.dict()
+        predicted_time[task] = m.dict()
         for server in workload.keys():
-            predicted_response[task][server] = 0
+            predicted_time[task][server] = 0
 
 # Get latest update to logfile
 def logRead(file):
@@ -454,42 +481,6 @@ def logRead(file):
         line = file.readline()
         if not line: continue
         yield line
-
-# Unrecognized URL handler
-def unknownURL(url, time_matrix, task_id, record):
-    for key in time_matrix.keys():
-        if key in url:
-            return key
-
-    if task_id in record.keys():
-        buffer = record[task_id].split(',')
-        return buffer[0]
-
-    return 'UNKNOWN'
-
-# Unknown server handler
-def unknownServer(task_id, record):
-    if task_id in record.keys():
-        buffer = record[task_id].split(',')
-        return buffer[4]
-
-    return 'UNKNOWN'
-
-# Is variable integer?
-def isint(string):
-    try:
-        int(string)
-        return True
-    except ValueError:
-        return False
-
-# Is variable float?
-def isfloat(string):
-    try:
-        float(string)
-        return True
-    except ValueError:
-        return False
 
 # Write data to file
 def fileWrite(whitelist):
