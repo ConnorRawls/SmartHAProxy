@@ -79,39 +79,33 @@ class Instance:
 
 def main():
     with Manager() as m:
-        # Profiled Response Time per task type
-        # (Used for workload calc.)
-        time_matrix = m.dict()
-        time_stdev = m.dict()
-        size_matrix = m.dict()
-        size_stdev = m.dict()
+        # Profiled information per task type
+        profile_matrix = {}
         # Expected response time of backend servers
         # (Summation of PRTs)
         workload = m.dict()
         # CPU utilization stamp at time of instance dispatch
         cpu_usage = m.dict()
-        # Key is task type and value are servers task is allowed to dispatch to
-        whitelist = m.dict()
         # Rows = Task type
         # Columns = Server
         predicted_time = m.dict()
+        # Key is task type and value are servers task is allowed to dispatch to
+        whitelist = {}
         # Master Lock TM
-        wl_lock = Lock()
-        pt_lock = Lock()
-        cpu_lock = Lock()
+        wl_lock = Lock()    # Workload
+        pt_lock = Lock()    # Predicted Time
+        cpu_lock = Lock()   # CPU Usage
         # GBDT model
         model = pickle.load(open('GBDT.sav', 'rb'))
 
-        init(time_matrix, time_stdev, size_matrix, size_stdev, workload, \
-            cpu_usage, predicted_time, whitelist, m)
+        init(profile_matrix, workload, cpu_usage, predicted_time, whitelist, m)
 
         # Multiprocessing mumbo jumbo
-        proc1 = Process(target = taskEvent, args = (time_matrix, workload, \
+        proc1 = Process(target = taskEvent, args = (profile_matrix, workload, \
             cpu_usage, predicted_time, wl_lock, pt_lock, cpu_lock))
         proc2 = Process(target = cpuUsage, args = (cpu_usage, cpu_lock))
-        proc3 = Process(target = comms, args = (time_matrix, time_stdev, \
-            size_matrix, size_stdev, cpu_usage, workload, predicted_time, \
-            whitelist, wl_lock, pt_lock, cpu_lock, model))
+        proc3 = Process(target = comms, args = (profile_matrix, workload, \
+            cpu_usage, predicted_time, whitelist, wl_lock, pt_lock, cpu_lock, model))
 
         start_time = datetime.now()
         print(f"Commencing Smartdrop [{start_time}].")
@@ -129,8 +123,8 @@ def main():
 # Process 1
 # -----------------------------------------------------------------------------
 # Monitor task-related events
-def taskEvent(time_matrix, workload, cpu_usage, predicted_time, wl_lock, pt_lock, \
-    cpu_lock):
+def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock, 
+    pt_lock, cpu_lock):
     method, query, url, server = None
     record = {}
     status_key = {'+' : 'new', '>' : 'complete', '-' : 'sent'}
@@ -203,10 +197,11 @@ def taskEvent(time_matrix, workload, cpu_usage, predicted_time, wl_lock, pt_lock
                         wl_lock.acquire()
                         workload[server] += task_type.ex_time
                         cpu_lock.acquire()
+                        # Do we need to use workload.value & cpu_usage.value?
                         record[task_id] = Instance(method, url, query, task.ex_size, \
                             task.size_stdev, task.ex_time, task.time_stdev, server, \
-                            workload[server].value, predicted_time[][], \
-                            cpu_usage[server].value)
+                            workload[server], predicted_time[key][server], \
+                            cpu_usage[server])
                         wl_lock.release()                        
                         cpu_lock.release()
                     except KeyError:
@@ -236,7 +231,9 @@ def cpuUsage(cpu_usage, cpu_lock):
     conn = libvirt.openReadOnly("qemu+ssh://root@hpcccloud1.cmix.louisiana.edu/system")
     while True:
         for server in cpu_usage.keys():
-            domain = conn.lookupByName(server)
+            if server == '1': srv_name = 'WP-Host'
+            else: srv_name = f'WP-Host-0{server}'
+            domain = conn.lookupByName(srv_name)
 
             time1 = time.time()
             clock1 = int(domain.info()[4])
@@ -253,8 +250,8 @@ def cpuUsage(cpu_usage, cpu_lock):
 # Process 3
 # -----------------------------------------------------------------------------
 # Send whitelist to load balancer
-def comms(time_matrix, stdev_matrix, cpu_usage, workload, predicted_time, \
-    whitelist, wl_lock, pt_lock, cpu_lock, model):
+def comms(profile_matrix, workload, cpu_usage, predicted_time, whitelist,
+    wl_lock, pt_lock, cpu_lock, model):
     HOST = 'smartdrop'
     PORT = 8080
 
@@ -279,8 +276,8 @@ def comms(time_matrix, stdev_matrix, cpu_usage, workload, predicted_time, \
                 cpu_lock.acquire()
 
                 # Calculate whitelist
-                whiteAlg(time_matrix, stdev_matrix, cpu_usage, workload, \
-                    whitelist, predicted_time, model)
+                whiteAlg(profile_matrix, cpu_usage, workload, predicted_time, \
+                    model, whitelist)
 
                 # Release locks
                 wl_lock.release()
@@ -301,13 +298,11 @@ def comms(time_matrix, stdev_matrix, cpu_usage, workload, predicted_time, \
 # Whitelist Algorithm
 # -----------------------------------------------------------------------------
 # Calculate task whitelists
-def whiteAlg(time_matrix, stdev_matrix, cpu_usage, workload, whitelist, \
-        predicted_time, model):
+def whiteAlg(profile_matrix, cpu_usage, workload, predicted_time, model, whitelist):
     # Service Level Objective = 1 second
     SLO = 1
 
-    GBDT(time_matrix, stdev_matrix, cpu_usage, workload, predicted_time, \
-        model)
+    GBDT(profile_matrix, cpu_usage, workload, predicted_time, model)
 
     # Iterate for all tasks
     for task in predicted_time.keys():
@@ -327,35 +322,48 @@ def whiteAlg(time_matrix, stdev_matrix, cpu_usage, workload, whitelist, \
 # Gradient Boosted Decision Tree
 # -----------------------------------------------------------------------------
 # Predict task types' response time on each server
-def GBDT(time_matrix, stdev_matrix, cpu_usage, workload, predicted_time, \
-    model):
-    # N channel metric matrix
-    # N = Number of servers
+def GBDT(profile_matrix, cpu_usage, workload, predicted_time, model):
+    # N channel metric matrix, where N = Number of servers
     for server in cpu_usage.keys():
-        # Convert static metrics into list format
+        # Convert task features into list format
+        method_buff = []
+        url_buff = []
+        query_buff = []
+        size_buff = []
+        size_stdev_buff = []
         time_buff = []
-        stdev_buff = []
-        for task in time_matrix.keys():
-            time_buff.append(time_matrix[task])
-            stdev_buff.append(time_matrix[task])
+        time_stdev_buff = []
+        for task_key in profile_matrix:
+            task = profile_matrix[task_key]
+            method_buff.append(task.method)
+            url_buff.append(task.url)
+            query_buff.append(task.query)
+            size_buff.append(task.ex_size)
+            size_stdev_buff.append(task.size_stdev)
+            time_buff.append(task.ex_time)
+            time_stdev_buff.append(task.time_stdev)
 
-        # Convert CPU and workload metrics into list format
+        # Convert CPU and workload into list format
         cpu_buff = []
         wl_buff = []
-        for _ in range(len(time_buff)):
+        # Remove this line when we know for sure -->
+        # for _ in range(len(time_buff)):
+        for _ in profile_matrix:
             cpu_buff.append(cpu_usage[server])
             wl_buff.append(workload[server])
 
         # Use each metric as a column in matrix
-        input_data = np.column_stack((time_buff, stdev_buff, cpu_buff, wl_buff))
+        input_data = np.column_stack((method_buff, url_buff, query_buff, \
+            size_buff, size_stdev_buff, time_buff, time_stdev_buff, wl_buff, \
+            cpu_buff))
 
         # Perform ML inference
         output_data = []
+        # Each row is a task type
         for row in input_data:
             output_data.append(abs(model.predict([row])))
-        for (task, row) in zip(predicted_time.keys(), output_data):
-            task = predicted_time[task]
-            task[server] = row
+        for (task, time_on_server) in zip(predicted_time.keys(), output_data):
+            predicted_time[task][server] = time_on_server
 
 # Utilities
 # -----------------------------------------------------------------------------
@@ -436,39 +444,37 @@ def parseLine(line, time_matrix):
     return method, query, url, server, error
 
 # Construct shared variables
-def init(time_matrix, stdev_matrix, workload, cpu_usage, \
-    predicted_time, whitelist, m):
+def init(profile_matrix, workload, cpu_usage, predicted_time, whitelist, m):
     # Detect number of backend servers
     # srvCount = detectServers()
     # if srvCount < 1:
     #    sys.exit('\nInvalid server count. Are your servers running?')
 
-    with open('requests.csv', 'r') as file:
+    with open('tasks.csv', 'r') as file:
         reader = csv.reader(file)
 
         # Skip header
         next(reader)
 
-        for url, time, stdev in reader:
-            # Convert from microseconds to seconds
-            time_matrix[url] = float(time) / 1e6
-            stdev_matrix[url] = float(stdev) / 1e6
-            whitelist[url] = m.list()
+        # Profile Matrix and Whitelist
+        for url, query, method, ex_size, size_stdev, ex_time, 
+            time_stdev in reader:
+            key = [method,url,query]
+            profile_matrix[key] = TaskType(method, url, query, ex_size, \
+                size_stdev, ex_time, time_stdev)
+            whitelist[key] = m.list()
 
+    # Workload and CPU Usage
     for server in range(SRVCOUNT):
-        if server == 0:
-            workload['WP-Host'] = 0.1
-            cpu_usage['WP-Host'] = 0
-        else:
-            workload['WP-Host-0' + str(server + 1)] = 0.1
-            cpu_usage['WP-Host-0' + str(server + 1)] = 0
+        workload[f'{server + 1}'] = 0.1
+        cpu_usage[f'{server + 1}'] = 0.
 
-    for url in whitelist.keys():
+    # Whitelist cont.
+    for task in whitelist:
         for server in range(SRVCOUNT):
-            if server == 0: whitelist[url].append('WP-Host')
-            else: whitelist[url].append('WP-Host-0' + str(server + 1))
+            whitelist[task].append(f'{server + 1}')
 
-    for task in time_matrix.keys():
+    for task in profile_matrix:
         predicted_time[task] = m.dict()
         for server in workload.keys():
             predicted_time[task][server] = 0
@@ -485,17 +491,14 @@ def logRead(file):
 # Write data to file
 def fileWrite(whitelist):
     t = '' # Simplify dict to list object
-    for url in whitelist.keys():
-        t += str(url)
+    for task in whitelist:
+        t += str(task)
         t += ','
-        if not whitelist[url]:
+        if not whitelist[task]:
             t += '0,'
         else:
-            for server in whitelist[url]:
-                if server == 'WP-Host':
-                    t += '1'
-                else:
-                    t += str(server[-1])
+            for server in whitelist[task]:
+                    t += server
             t += ','
 
     t = t[:-1]
