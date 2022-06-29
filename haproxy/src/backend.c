@@ -552,6 +552,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	const char *url; //pointer to where the url ends
 	char *servers; //list of servers from the whitelist that the request url can use
 	int url_len; //length of url string
+	char *method_name;
 	clock_t t2;
 	double elapsed_time;
 
@@ -592,7 +593,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
 
 	servers = NULL;
-	servers = searchRequest(url_cpy);
+	servers = searchRequest(method_name, url_cpy, query);
 	if(servers != NULL) {strcat(servers, "\0");}
 	free(url_cpy);
 	

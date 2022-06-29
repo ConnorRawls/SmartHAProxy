@@ -46,7 +46,7 @@ typedef struct Whitelist_T
 extern Whitelist whitelist;
 
 // Hashing algorithm
-int hashRequest(char *method, char *url, char *query);
+int hashRequest(char *key);
 
 // Construct whitelist
 void createWhitelist(int size);

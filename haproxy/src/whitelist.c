@@ -153,11 +153,8 @@ void updateWhitelist()
 }
 
 // Find request's whitelist in table
-char *searchRequest(char *method, char *url, char *query)
+char *searchRequest(char *key)
 {
-    char key[MAX_LINE];
-    strcat(strcat(strcat(key, method), url), query);
-
     int index = hashRequest(key);
 
     // Search table for url
