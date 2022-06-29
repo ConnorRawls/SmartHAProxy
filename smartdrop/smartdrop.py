@@ -269,7 +269,6 @@ def comms(profile_matrix, workload, cpu_usage, predicted_time, whitelist,
             # Main loop
             while True:
                 # Receive 1
-                # print("Waiting for HAProxy...")
                 message = receiveMessage(conn)
 
                 # Set locks
