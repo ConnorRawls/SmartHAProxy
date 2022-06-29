@@ -39,6 +39,7 @@ from datetime import datetime
 from multiprocessing import Process, Manager, Lock
 import libvirt
 import pickle
+import pandas as pd
 import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
 
@@ -125,7 +126,7 @@ def main():
 # Monitor task-related events
 def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock, 
     pt_lock, cpu_lock):
-    method, query, url, server = None
+    method = query = url = server = None
     record = {}
     status_key = {'+' : 'new', '>' : 'complete', '-' : 'sent'}
     task_count = 0
@@ -192,7 +193,7 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                 # Insert task
                 if status == 'new':
                     try:
-                        key = [method,url,query]
+                        key = f'{method},{url},{query}'
                         task_type = profile_matrix[key]
                         wl_lock.acquire()
                         workload[server] += task_type.ex_time
@@ -210,7 +211,7 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                 # Task completion
                 else:
                     try:
-                        key = [method,url,query]
+                        key = f'{method},{url},{query}'
                         task_type = profile_matrix[key]
                         wl_lock.acquire()
                         workload[server] -= task_type.ex_time
@@ -352,16 +353,25 @@ def GBDT(profile_matrix, cpu_usage, workload, predicted_time, model):
             cpu_buff.append(cpu_usage[server])
             wl_buff.append(workload[server])
 
+        df = pd.DataFrame(list(zip(method_buff, url_buff, query_buff, size_buff, \
+            size_stdev_buff, time_buff, time_stdev_buff, wl_buff, cpu_buff)), \
+            columns = ['Method', 'URL', 'Query', 'Size', 'SizeStdev', 'Time', \
+            'TimeStdev', 'Workload', 'CPU'])
+        df = pd.get_dummies(df, columns = ['Method', 'URL', 'Query'], sparse = True)
+        df = df.drop(columns = ['Query_'])
+
         # Use each metric as a column in matrix
-        input_data = np.column_stack((method_buff, url_buff, query_buff, \
-            size_buff, size_stdev_buff, time_buff, time_stdev_buff, wl_buff, \
-            cpu_buff))
+        input_data = df.to_numpy()
+        # input_data = np.column_stack((method_buff, url_buff, query_buff, \
+        #     size_buff, size_stdev_buff, time_buff, time_stdev_buff, wl_buff, \
+        #     cpu_buff))
 
         # Perform ML inference
         output_data = []
         # Each row is a task type
         for row in input_data:
             output_data.append(abs(model.predict([row])))
+        # *** Are they in order?
         for (task, time_on_server) in zip(predicted_time.keys(), output_data):
             predicted_time[task][server] = time_on_server
 
@@ -457,12 +467,12 @@ def init(profile_matrix, workload, cpu_usage, predicted_time, whitelist, m):
         next(reader)
 
         # Profile Matrix and Whitelist
-        for url, query, method, ex_size, size_stdev, ex_time, 
+        for url, query, method, ex_size, size_stdev, ex_time, \
             time_stdev in reader:
-            key = [method,url,query]
+            key = f'{method},{url},{query}'
             profile_matrix[key] = TaskType(method, url, query, ex_size, \
                 size_stdev, ex_time, time_stdev)
-            whitelist[key] = m.list()
+            whitelist[key] = []
 
     # Workload and CPU Usage
     for server in range(SRVCOUNT):
