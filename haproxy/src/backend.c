@@ -581,6 +581,8 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	pthread_mutex_unlock(&check.lock);
 	
 	url_len = uri_len;
+	printf("\nURI: %s\n", uri);
+	printf("\nMethod: %d\n", method);
 	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
 		url_len = url-uri;
 	}
@@ -767,7 +769,7 @@ int assign_server(struct stream *s)
 					struct ist uri;
 					int method;
 					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
-					method = s->txn->meth
+					method = s->txn->meth;
 					srv = get_server_rnd(s, prev_srv, method, uri.ptr, uri.len);
 				}
 				else

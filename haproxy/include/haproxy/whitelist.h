@@ -20,6 +20,7 @@ extern Lock check;
 // Hashed item
 typedef struct Request_T
 {
+    char *key;
     char *method;
     char *url;
     char *query;
@@ -45,34 +46,28 @@ typedef struct Whitelist_T
 extern Whitelist whitelist;
 
 // Hashing algorithm
-int hashRequest(char *url);
+int hashRequest(char *method, char *url, char *query);
 
 // Construct whitelist
 void createWhitelist(int size);
 
 // Create request item in whitelist
-Request *createRequest(char *url, char *servers);
+Request *createRequest(char *method, char *url, char *query, char *servers);
 
 // Insert request into whitelist
-void insertRequest(char *url, char *servers);
+void insertRequest(char *method, char *url, char *query, char *servers);
 
 // Fill whitelist with new values
 void updateWhitelist();
 
-// Remove unneeded chars from string
-char *strBurn(char *srvrply_parted);
-
 // Find request's whitelist in table
-char *searchRequest(char *url);
-
-// Malloc variable containing request's servers
-char *allocateSrvSize(char *url, char *servers);
+char *searchRequest(char *method, char *url, char *query);
 
 // Compare server ID to task's whitelist
 int onWhitelist(char *task_wl, char *server_id);
 
 // Display item statistics
-void printRequest(char *url);
+void printRequest(char *method, char *url, char *query);
 
 // Display contents of hash table
 void printWhitelist();
