@@ -504,14 +504,11 @@ def fileWrite(whitelist):
         t += str(task)
         t += ','
         if not whitelist[task]:
-            t += '0,'
+            t += '0\n'
         else:
             for server in whitelist[task]:
                     t += server
-            t += ','
-
-    t = t[:-1]
-    t += '\0'
+            t += '\n'
 
     # Offload data to file
     with open("/Whitelist/whitelist.csv", "r+") as file:
