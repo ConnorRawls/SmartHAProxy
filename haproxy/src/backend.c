@@ -553,6 +553,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	char *servers; //list of servers from the whitelist that the request url can use
 	int url_len; //length of url string
 	char *method_name;
+	char *query;
 	clock_t t2;
 	double elapsed_time;
 
@@ -563,6 +564,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	/* tot_weight appears to mean srv_count */
 	if (px->lbprm.tot_weight == 0) return NULL;
 
+	// Update Whitelist
 	pthread_mutex_lock(&check.lock);
 
 	t2 = clock();
@@ -580,17 +582,25 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	}
 
 	pthread_mutex_unlock(&check.lock);
+
+	// Method *** CHECK METHOD VALUES
+	switch (method) {
+      case 1: return "GET";
+      case 2: return "POST";
+	}
 	
+	// URL
 	url_len = uri_len;
-	printf("\nURI: %s\n", uri);
-	printf("\nMethod: %d\n", method);
 	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
-		url_len = url-uri;
+		url_len = url - uri;
 	}
 
 	url_cpy = malloc(sizeof(char) * (uri_len + 1));
 	strncpy(url_cpy, uri, url_len);
 	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
+	printf("\n%s\n", url_cpy);
+
+	// Query
 
 	servers = NULL;
 	servers = searchRequest(method_name, url_cpy, query);

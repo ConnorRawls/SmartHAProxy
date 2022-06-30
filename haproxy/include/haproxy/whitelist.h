@@ -61,7 +61,7 @@ void insertRequest(char *method, char *url, char *query, char *servers);
 void updateWhitelist();
 
 // Find request's whitelist in table
-char *searchRequest(char *method, char *url, char *query);
+char *searchRequest(char *key);
 
 // Compare server ID to task's whitelist
 int onWhitelist(char *task_wl, char *server_id);
