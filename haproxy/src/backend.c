@@ -555,7 +555,9 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	int url_len; //length of url string
 	int qry_len;
 	char *method_name;
-	char *query;
+	int method_length;
+	char *key;
+	int key_len;
 	clock_t t2;
 	double elapsed_time;
 
@@ -587,8 +589,22 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 	// Method *** CHECK METHOD VALUES
 	switch (method) {
-      case 1: return "GET";
-      case 2: return "POST";
+		case 1:
+			method_length = sizeof("GET") + 1;
+			method_name = malloc(sizeof(char) * method_length);
+			strncpy(method_name, "GET", method_length);
+			method_name[method_length] = '\0';
+			break;
+		case 2:
+			method_length = sizeof("POST") + 1;
+			method_name = malloc(sizeof(char) * method_length);
+			strncpy(method_name, "POST", method_length);
+			method_name[method_length] = '\0';
+			break;
+		default:
+			method_length = 0;
+			method_name = NULL;
+			break;
 	}
 	
 	// URL + Query
@@ -597,7 +613,6 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
 		url_len = url - uri;
 		qry_len = uri_len - url_len;
-
 		qry_cpy = malloc(sizeof(char) * (qry_len + 1));
 		strncpy(qry_cpy, url, qry_len);
 		qry_cpy[qry_len] = '\0';
@@ -609,8 +624,13 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	strncpy(url_cpy, uri, url_len);
 	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
 	
+	// Key = Method + URL + Query
+	key_len = url_len + qry_len + method_length;
+	key = malloc(sizeof(char) * key_len);
+	strcat(strcat(strcat(key, method_name), url_cpy), qry_cpy);
+
 	servers = NULL;
-	servers = searchRequest(method_name, url_cpy, query);
+	servers = searchRequest(key);
 	if(servers != NULL) {strcat(servers, "\0");}
 	free(url_cpy);
 	

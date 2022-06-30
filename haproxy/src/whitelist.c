@@ -43,9 +43,10 @@ void createWhitelist(int size)
 Request *createRequest(char* method, char *url, char *query, char *servers)
 {
     char key[MAX_LINE];
-    strcat(strcat(strcat(key, method), url), query);
+    Request *request;
 
-    Request *request = (Request*)malloc(sizeof(Request));
+    strcat(strcat(strcat(key, method), url), query);
+    request = (Request*)malloc(sizeof(Request));
 
     request->key = (char*)malloc(strlen(key) + 1);
     request->method = (char*)malloc(strlen(method) + 1);
@@ -67,16 +68,18 @@ void insertRequest(char* method, char *url, char* query, char *servers)
 {
     char key[MAX_LINE];
     int index;
+    Request *request;
+    Request *current;
 
     // Create item
-    Request *request = createRequest(method, url, query, servers);
+    request = createRequest(method, url, query, servers);
 
     // Compute index based on hashing algorithm
     strcat(strcat(strcat(key, method), url), query);
     index = hashRequest(key);
 
     // Check if index is occupied by comparing urls
-    Request* current = whitelist.requests[index];
+    current = whitelist.requests[index];
 
     // If not
     if(current == NULL) {
@@ -120,12 +123,11 @@ void updateWhitelist()
     char query[MAX_COLUMN];
     char servers[MAX_COLUMN];
     char *tkn;
-    int row_count;
 
     // QUARANTINE //
     SDSock_Set(); // Lock for reading from /Whitelist/whitelist.csv
 
-    file = fopen("whitelist.csv", "r");
+    file = fopen("/Whitelist/whitelist.csv", "r");
     if(file == NULL) err(1, "\nFile not found.\n");
 
     while(feof(file) != true) {
@@ -140,6 +142,7 @@ void updateWhitelist()
             strcpy(query, tkn);
             tkn = strtok(NULL, ",");
             strcpy(servers, tkn);
+
             // Adjust whitelist entry
             insertRequest(method, url, query, servers);
         }
@@ -180,9 +183,9 @@ int onWhitelist(char *task_wl, char *server_id)
 void printRequest(char *method, char *url, char *query)
 {
     char key[MAX_LINE];
-    strcat(strcat(strcat(key, method), url), query);
-
     char *servers;
+
+    strcat(strcat(strcat(key, method), url), query);
 
     if((servers = searchRequest(key)) == NULL) {
         printf("Key: \"%s\" does not exist.\n", key);
