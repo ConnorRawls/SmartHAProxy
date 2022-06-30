@@ -549,9 +549,11 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	struct server *prev, *curr;
 	int draws; // number of draws
 	char *url_cpy; //url extracted from the uri
+	char *qry_cpy;
 	const char *url; //pointer to where the url ends
 	char *servers; //list of servers from the whitelist that the request url can use
 	int url_len; //length of url string
+	int qry_len;
 	char *method_name;
 	char *query;
 	clock_t t2;
@@ -589,19 +591,24 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
       case 2: return "POST";
 	}
 	
-	// URL
+	// URL + Query
 	url_len = uri_len;
+	qry_len = uri_len;
 	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
 		url_len = url - uri;
+		qry_len = uri_len - url_len;
+
+		qry_cpy = malloc(sizeof(char) * (qry_len + 1));
+		strncpy(qry_cpy, url, qry_len);
+		qry_cpy[qry_len] = '\0';
+	} else {
+		qry_cpy = NULL;
 	}
 
 	url_cpy = malloc(sizeof(char) * (uri_len + 1));
 	strncpy(url_cpy, uri, url_len);
 	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
-	printf("\n%s\n", url_cpy);
-
-	// Query
-
+	
 	servers = NULL;
 	servers = searchRequest(method_name, url_cpy, query);
 	if(servers != NULL) {strcat(servers, "\0");}
