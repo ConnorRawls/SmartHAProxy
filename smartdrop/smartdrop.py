@@ -357,7 +357,7 @@ def GBDT(profile_matrix, cpu_usage, workload, predicted_time, model):
             columns = ['Method', 'URL', 'Query', 'Size', 'SizeStdev', 'Time', \
             'TimeStdev', 'Workload', 'CPU'])
         df = pd.get_dummies(df, columns = ['Method', 'URL', 'Query'], sparse = True)
-        df = df.drop(columns = ['Query_'])
+        df = df.drop(columns = ['Query_NULL'])
 
         # Use each metric as a column in matrix
         input_data = df.to_numpy()
@@ -406,7 +406,7 @@ def parseLine(line, time_matrix):
         try:
             query = query.group()
             line[2] = line[2].replace(query, '')
-        except AttributeError: query = ''
+        except AttributeError: query = 'NULL'
         for key, value in time_matrix.items():
             if type(key) in [list, tuple, dict] and query in key:
                 found = True
@@ -468,6 +468,7 @@ def init(profile_matrix, workload, cpu_usage, predicted_time, whitelist, m):
         # Profile Matrix and Whitelist
         for url, query, method, ex_size, size_stdev, ex_time, \
             time_stdev in reader:
+            if query == '': query = 'NULL'
             key = f'{method},{url},{query}'
             profile_matrix[key] = TaskType(method, url, query, ex_size, \
                 size_stdev, ex_time, time_stdev)
