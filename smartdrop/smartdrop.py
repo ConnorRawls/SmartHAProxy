@@ -299,8 +299,8 @@ def comms(profile_matrix, workload, cpu_usage, predicted_time, whitelist,
 # -----------------------------------------------------------------------------
 # Calculate task whitelists
 def whiteAlg(profile_matrix, cpu_usage, workload, predicted_time, model, whitelist):
-    # Service Level Objective = 1 second
-    SLO = 1
+    # Service Level Objective = 1 second = 1,000,000 microseconds
+    SLO = 1e6
 
     GBDT(profile_matrix, cpu_usage, workload, predicted_time, model)
 
@@ -313,6 +313,8 @@ def whiteAlg(profile_matrix, cpu_usage, workload, predicted_time, model, whiteli
                 predicted_time[task][server] >= SLO:
                 # Remove it from server's whitelist if it is there
                 whitelist[task].remove(server)
+                print(f"Removing server {server} from task {task}"
+                    f" (PRT: {predicted_time[task][server]})")
 
             elif server not in whitelist[task] and \
                 predicted_time[task][server] < SLO:
@@ -347,7 +349,6 @@ def GBDT(profile_matrix, cpu_usage, workload, predicted_time, model):
         cpu_buff = []
         wl_buff = []
         # Remove this line when we know for sure -->
-        # for _ in range(len(time_buff)):
         for _ in profile_matrix:
             cpu_buff.append(cpu_usage[server])
             wl_buff.append(workload[server])
@@ -356,14 +357,12 @@ def GBDT(profile_matrix, cpu_usage, workload, predicted_time, model):
             size_stdev_buff, time_buff, time_stdev_buff, wl_buff, cpu_buff)), \
             columns = ['Method', 'URL', 'Query', 'Size', 'SizeStdev', 'Time', \
             'TimeStdev', 'Workload', 'CPU'])
+        df = df.replace('NULL', '')
         df = pd.get_dummies(df, columns = ['Method', 'URL', 'Query'], sparse = True)
-        df = df.drop(columns = ['Query_NULL'])
+        df = df.drop(columns = ['Query_'])
 
         # Use each metric as a column in matrix
         input_data = df.to_numpy()
-        # input_data = np.column_stack((method_buff, url_buff, query_buff, \
-        #     size_buff, size_stdev_buff, time_buff, time_stdev_buff, wl_buff, \
-        #     cpu_buff))
 
         # Perform ML inference
         output_data = []
@@ -536,6 +535,7 @@ def receiveMessage(conn):
         chunk = conn.recv(min(MSGLEN - bytes_received, 2048))
 
         if chunk == b'': raise RuntimeError("Socket connection broken.")
+        # if chunk == b'': return b''.join(chunks)
 
         chunks.append(chunk)
 
