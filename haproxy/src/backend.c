@@ -595,7 +595,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 			strncpy(method_name, "GET", method_length);
 			method_name[method_length] = '\0';
 			break;
-		case 2:
+		case 3:
 			method_length = sizeof("POST") + 1;
 			method_name = malloc(sizeof(char) * method_length);
 			strncpy(method_name, "POST", method_length);
@@ -606,6 +606,10 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 			method_name = NULL;
 			break;
 	}
+
+	// ***
+	printf("\nMethod Key: %d", method);
+	printf("\nMethod: %s", method_name);
 	
 	// URL + Query
 	url_len = uri_len;
@@ -623,16 +627,29 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	url_cpy = malloc(sizeof(char) * (uri_len + 1));
 	strncpy(url_cpy, uri, url_len);
 	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
+
+	// ***
+	printf("\nURL: %s", url_cpy);
+	printf("\nQuery: %s", qry_cpy);
 	
 	// Key = Method + URL + Query
 	key_len = url_len + qry_len + method_length;
 	key = malloc(sizeof(char) * key_len);
 	strcat(strcat(strcat(key, method_name), url_cpy), qry_cpy);
 
+	// ***
+	printf("\nKey: %s", key);
+
 	servers = NULL;
 	servers = searchRequest(key);
 	if(servers != NULL) {strcat(servers, "\0");}
 	free(url_cpy);
+
+	// ***
+	printf("\nServers: %s", servers);
+
+	// ***
+	// printWhitelist();
 	
 	hash = 0;
 	draws = px->lbprm.arg_opt1; // number of draws
@@ -676,6 +693,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	}else{
 		// printf("id: %s\n", curr->id);
 	}
+
 	////////////////// End edits //////////////////
 	return curr;
 }

@@ -42,10 +42,25 @@ void createWhitelist(int size)
 // Create request item in whitelist
 Request *createRequest(char* method, char *url, char *query, char *servers)
 {
-    char key[MAX_LINE];
+    // char key[MAX_LINE];
+    int mth_len;
+    int url_len;
+    int qry_len;
+    int key_len;
+    char *key;
     Request *request;
 
+    mth_len = stringLength(method);
+    url_len = stringLength(url);
+    qry_len = stringLength(qry);
+    key_len = mth_len + url_len + qry_len;
+
+    key = malloc(sizeof(char) * key_len);
     strcat(strcat(strcat(key, method), url), query);
+    // strcat(key, method);
+    // strcat(key, url);
+    // strcat(key, query);
+
     request = (Request*)malloc(sizeof(Request));
 
     request->key = (char*)malloc(strlen(key) + 1);
@@ -66,7 +81,12 @@ Request *createRequest(char* method, char *url, char *query, char *servers)
 // Insert request into whitelist
 void insertRequest(char* method, char *url, char* query, char *servers)
 {
-    char key[MAX_LINE];
+    // char key[MAX_LINE];
+    int mth_len;
+    int url_len;
+    int qry_len;
+    int key_len;
+    char *key;
     int index;
     Request *request;
     Request *current;
@@ -75,7 +95,16 @@ void insertRequest(char* method, char *url, char* query, char *servers)
     request = createRequest(method, url, query, servers);
 
     // Compute index based on hashing algorithm
+    mth_len = stringLength(method);
+    url_len = stringLength(url);
+    qry_len = stringLength(qry);
+    key_len = ,th_len + url_len + qry_len;
+
+    key = malloc(sizeof(char) * key_len);
     strcat(strcat(strcat(key, method), url), query);
+    // strcat(key, method);
+    // strcat(key, url);
+    // strcat(key, query);
     index = hashRequest(key);
 
     // Check if index is occupied by comparing urls
@@ -124,8 +153,14 @@ void updateWhitelist()
     char servers[MAX_COLUMN];
     char *tkn;
 
+    // ***
+    printf("\nUpdating whitelist.\n");
+
     // QUARANTINE //
     SDSock_Set(); // Lock for reading from /Whitelist/whitelist.csv
+
+    // ***
+    printf("\nSocket set.\n");
 
     file = fopen("/Whitelist/whitelist.csv", "r");
     if(file == NULL) err(1, "\nFile not found.\n");
@@ -143,14 +178,29 @@ void updateWhitelist()
             tkn = strtok(NULL, ",");
             strcpy(servers, tkn);
 
+            // ***
+            printf("\nMethod: %s", method);
+            printf("\nURL: %s", url);
+            printf("\nQuery: %s", query);
+            printf("\nServers: %s", servers);
+
             // Adjust whitelist entry
             insertRequest(method, url, query, servers);
+
+            // ***
+            printRequest(method, url, query);
         }
     }
+
+    // ***
+    printf("\nWhitelist parsed.\n");
 
     fclose(file);
     SDSock_Release();
     // QUARANTINE //
+
+    // ***
+    printf("\nSocket released.\n");
 
     return;
 }
@@ -182,10 +232,24 @@ int onWhitelist(char *task_wl, char *server_id)
 // Display item statistics
 void printRequest(char *method, char *url, char *query)
 {
-    char key[MAX_LINE];
+    // char key[MAX_LINE];
+    int mth_len;
+    int url_len;
+    int qry_len;
+    int key_len;
     char *servers;
+    char *key;
 
+    mth_len = stringLength(method);
+    url_len = stringLength(url);
+    qry_len = stringLength(qry);
+    key_len = mth_len + url_len + qry_len;
+
+    key = malloc(sizeof(char) * key_len);
     strcat(strcat(strcat(key, method), url), query);
+    // strcat(key, method);
+    // strcat(key, url);
+    // strcat(key, query);
 
     if((servers = searchRequest(key)) == NULL) {
         printf("Key: \"%s\" does not exist.\n", key);
