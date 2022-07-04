@@ -63,6 +63,9 @@ void updateWhitelist();
 // Find request's whitelist in table
 char *searchRequest(char *key);
 
+// Return number of elements in string
+int stringLength(char *string);
+
 // Compare server ID to task's whitelist
 int onWhitelist(char *task_wl, char *server_id);
 

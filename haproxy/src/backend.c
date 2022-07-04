@@ -63,7 +63,8 @@
 #include <time.h>
 #include <pthread.h>
 
-#define SRVCOUNT 5
+#define SRVCOUNT 7
+#define MAX_LINE 1024
 
 ReqCount reqCount;
 Lock check;
@@ -540,7 +541,7 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 
 ///////////////// Begin edits /////////////////
 /* random value  */
-static struct server *get_server_rnd(struct stream *s, const struct server *avoid, int method, const char *uri, int uri_len)
+static struct server *get_server_rnd(struct stream *s, const struct server *avoid, int method_key, const char *uri, int uri_len)
 {
 	// Below are constructs created by HAProxy. Moved up here to get
 	// the compile warning to shut up.
@@ -556,10 +557,9 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	int qry_len;
 	char *method_name;
 	int method_length;
-	char *key;
-	int key_len;
 	clock_t t2;
 	double elapsed_time;
+	char key[MAX_LINE] = "";
 
 	hash = 0;
 	px = s->be;
@@ -567,6 +567,9 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 	/* tot_weight appears to mean srv_count */
 	if (px->lbprm.tot_weight == 0) return NULL;
+
+	// ***
+	printf("\n(backend.c) I have received a new task");
 
 	// Update Whitelist
 	pthread_mutex_lock(&check.lock);
@@ -577,9 +580,13 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	reqCount.count++;
 
 	if(reqCount.count == 10000 || elapsed_time >= 2){
-		printf("\nUpdating Whitelist...\n");
+		// ***
+		printf("\n(backend.c) Updating Whitelist...");
 
 		updateWhitelist();
+
+		// ***
+		// printWhitelist();
 
 		reqCount.time = clock();
 		reqCount.count = 0;
@@ -587,8 +594,11 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 	pthread_mutex_unlock(&check.lock);
 
-	// Method *** CHECK METHOD VALUES
-	switch (method) {
+	// ***
+	printf("\n(backend.c) I have made it past the lock");
+
+	// Method
+	switch (method_key) {
 		case 1:
 			method_length = sizeof("GET") + 1;
 			method_name = malloc(sizeof(char) * method_length);
@@ -608,12 +618,10 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	}
 
 	// ***
-	printf("\nMethod Key: %d", method);
-	printf("\nMethod: %s", method_name);
+	printf("\n(backend.c) Method: %s", method_name);
 	
 	// URL + Query
 	url_len = uri_len;
-	qry_len = uri_len;
 	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
 		url_len = url - uri;
 		qry_len = uri_len - url_len;
@@ -621,7 +629,10 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		strncpy(qry_cpy, url, qry_len);
 		qry_cpy[qry_len] = '\0';
 	} else {
-		qry_cpy = NULL;
+		qry_len = sizeof("NULL");
+		qry_cpy = malloc(sizeof(char) * (qry_len + 1));
+		strcpy(qry_cpy, "NULL");
+		qry_cpy[qry_len] = '\0';
 	}
 
 	url_cpy = malloc(sizeof(char) * (uri_len + 1));
@@ -629,27 +640,26 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
 
 	// ***
-	printf("\nURL: %s", url_cpy);
-	printf("\nQuery: %s", qry_cpy);
-	
+	printf("\n(backend.c) URL: %s", url_cpy);
+	printf("\n(backend.c) Query: %s", qry_cpy);
+
 	// Key = Method + URL + Query
-	key_len = url_len + qry_len + method_length;
-	key = malloc(sizeof(char) * key_len);
 	strcat(strcat(strcat(key, method_name), url_cpy), qry_cpy);
 
 	// ***
-	printf("\nKey: %s", key);
+	printf("\n(backend.c) Key: %s", key);
 
 	servers = NULL;
 	servers = searchRequest(key);
 	if(servers != NULL) {strcat(servers, "\0");}
+
+	// ***
+	printf("\n(backend.c) Servers: %s", servers);
+
+	// We're freeeeeee
+	free(method_name);
 	free(url_cpy);
-
-	// ***
-	printf("\nServers: %s", servers);
-
-	// ***
-	// printWhitelist();
+	free(qry_cpy);
 	
 	hash = 0;
 	draws = px->lbprm.arg_opt1; // number of draws
@@ -657,7 +667,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	/* tot_weight appears to mean srv_count */
 	if (px->lbprm.tot_weight == 0){
 		// Be sure to move this right before the function return
-		//printf("total weight is zero, returning null");
+		// printf("total weight is zero, returning null");
 		return NULL;
 	}
 
@@ -689,12 +699,16 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		curr = NULL;
 	
 	if(curr == NULL){ // comment this part out
-		printf("chosen server was NULL\n");
+		printf("(backend.c) Chosen server was NULL\n");
 	}else{
-		// printf("id: %s\n", curr->id);
+		// printf("(backend.c) id: %s\n", curr->id);
 	}
 
 	////////////////// End edits //////////////////
+	// ***
+	if(curr->id == NULL || curr == NULL) printf("\nSelected server is NULL\n");
+	else printf("\nSelected server: %s\n", curr->id);
+
 	return curr;
 }
 
@@ -823,10 +837,10 @@ int assign_server(struct stream *s)
 				if ((s->be->lbprm.algo & BE_LB_PARM) == BE_LB_RR_RANDOM)
 				{
 					struct ist uri;
-					int method;
+					int method_key;
 					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
-					method = s->txn->meth;
-					srv = get_server_rnd(s, prev_srv, method, uri.ptr, uri.len);
+					method_key = s->txn->meth;
+					srv = get_server_rnd(s, prev_srv, method_key, uri.ptr, uri.len);
 				}
 				else
 					srv = map_get_server_rr(s->be, prev_srv);

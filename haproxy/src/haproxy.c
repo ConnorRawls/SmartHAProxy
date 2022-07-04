@@ -2888,7 +2888,7 @@ int main(int argc, char **argv)
 
 	// Create sdsock
 	SDSock_Make();
-	printf("Connected to Smartdrop.");
+	printf("\n- Connected to Smartdrop -");
 
 	// Initialize request counter
 	reqCount.count = 0;
@@ -2901,7 +2901,7 @@ int main(int argc, char **argv)
 	// Construct whitelist
 	createWhitelist(CAPACITY); // CAPACITY = 100
 	updateWhitelist();
-	printf("\nWhitelist initialized.\n");
+	printf("\n- Whitelist initialized -\n\n");
 
 	////////////////// End edits //////////////////
 
