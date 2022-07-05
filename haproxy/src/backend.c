@@ -560,6 +560,10 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	clock_t t2;
 	double elapsed_time;
 	char key[MAX_LINE] = "";
+	char *buffer;
+	char *select_srv;
+	char srv_num;
+	int dispatch_err;
 
 	hash = 0;
 	px = s->be;
@@ -569,7 +573,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	if (px->lbprm.tot_weight == 0) return NULL;
 
 	// ***
-	printf("\n(backend.c) I have received a new task");
+	// printf("\n(backend.c) I have received a new task");
 
 	// Update Whitelist
 	pthread_mutex_lock(&check.lock);
@@ -580,22 +584,16 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	reqCount.count++;
 
 	if(reqCount.count == 10000 || elapsed_time >= 2){
-		// ***
-		printf("\n(backend.c) Updating Whitelist...");
-
 		updateWhitelist();
 
 		// ***
-		// printWhitelist();
+		printWhitelist();
 
 		reqCount.time = clock();
 		reqCount.count = 0;
 	}
 
 	pthread_mutex_unlock(&check.lock);
-
-	// ***
-	printf("\n(backend.c) I have made it past the lock");
 
 	// Method
 	switch (method_key) {
@@ -618,10 +616,11 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	}
 
 	// ***
-	printf("\n(backend.c) Method: %s", method_name);
+	// printf("\n(backend.c) Method: %s", method_name);
 	
 	// URL + Query
 	url_len = uri_len;
+	qry_len = uri_len;
 	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
 		url_len = url - uri;
 		qry_len = uri_len - url_len;
@@ -640,21 +639,31 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
 
 	// ***
-	printf("\n(backend.c) URL: %s", url_cpy);
-	printf("\n(backend.c) Query: %s", qry_cpy);
+	// printf("\n(backend.c) URL before operation: %s", url_cpy);
+
+	if(!strcmp(url_cpy, "/wp-profiling/")) {
+		free(url_cpy);
+		buffer = malloc(sizeof("/wp-profiling/index.php"));
+		strcpy(buffer, "/wp-profiling/index.php");
+		url_cpy = buffer;
+	}
+
+	// ***
+	// printf("\n(backend.c) URL: %s", url_cpy);
+	// printf("\n(backend.c) Query: %s", qry_cpy);
 
 	// Key = Method + URL + Query
 	strcat(strcat(strcat(key, method_name), url_cpy), qry_cpy);
 
 	// ***
-	printf("\n(backend.c) Key: %s", key);
+	// printf("\n(backend.c) Key: %s", key);
 
 	servers = NULL;
 	servers = searchRequest(key);
 	if(servers != NULL) {strcat(servers, "\0");}
 
 	// ***
-	printf("\n(backend.c) Servers: %s", servers);
+	// printf("\n(backend.c) Servers: %s", servers);
 
 	// We're freeeeeee
 	free(method_name);
@@ -687,10 +696,6 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 			curr = prev;
 	} while (--draws > 0);
 
-	// Be sure to move this right before the function return
-	//free(servers);
-	//free(url_cpy);
-
 	/* if the selected server is full, pretend we have none so that we reach
 		* the backend's queue instead.
 		*/
@@ -704,10 +709,27 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		// printf("(backend.c) id: %s\n", curr->id);
 	}
 
-	////////////////// End edits //////////////////
 	// ***
 	if(curr->id == NULL || curr == NULL) printf("\nSelected server is NULL\n");
-	else printf("\nSelected server: %s\n", curr->id);
+	else {
+		dispatch_err = 1;
+		select_srv = malloc(sizeof(char) * strlen(curr->id));
+		strcpy(select_srv, curr->id);
+		srv_num = select_srv[strlen(select_srv)];
+		for(int i = 0; i < strlen(servers); i++) {
+			if(srv_num == servers[i]) {
+				dispatch_err = 0;
+				break;
+			}
+		}
+		if(dispatch_err == 1) {
+			printf("\nSelected server is not on the task's whitelist.");
+			printf("\nTask's whitelist: %s", servers);
+			printf("\nSelected server: %c", srv_num);
+		}
+		free(select_srv);
+	}
+	////////////////// End edits //////////////////
 
 	return curr;
 }
