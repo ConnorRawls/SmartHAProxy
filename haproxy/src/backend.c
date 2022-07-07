@@ -587,7 +587,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		updateWhitelist();
 
 		// ***
-		printWhitelist();
+		// printWhitelist();
 
 		reqCount.time = clock();
 		reqCount.count = 0;
@@ -710,25 +710,25 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	}
 
 	// ***
-	if(curr->id == NULL || curr == NULL) printf("\nSelected server is NULL\n");
-	else {
-		dispatch_err = 1;
-		select_srv = malloc(sizeof(char) * strlen(curr->id));
-		strcpy(select_srv, curr->id);
-		srv_num = select_srv[strlen(select_srv)];
-		for(int i = 0; i < strlen(servers); i++) {
-			if(srv_num == servers[i]) {
-				dispatch_err = 0;
-				break;
-			}
-		}
-		if(dispatch_err == 1) {
-			printf("\nSelected server is not on the task's whitelist.");
-			printf("\nTask's whitelist: %s", servers);
-			printf("\nSelected server: %c", srv_num);
-		}
-		free(select_srv);
-	}
+	// if(curr->id == NULL || curr == NULL) printf("\nSelected server is NULL\n");
+	// else {
+	// 	dispatch_err = 1;
+	// 	select_srv = malloc(sizeof(char) * strlen(curr->id));
+	// 	strcpy(select_srv, curr->id);
+	// 	srv_num = select_srv[strlen(select_srv)];
+	// 	for(int i = 0; i < strlen(servers); i++) {
+	// 		if(srv_num == servers[i]) {
+	// 			dispatch_err = 0;
+	// 			break;
+	// 		}
+	// 	}
+	// 	if(dispatch_err == 1) {
+	// 		printf("\nSelected server is not on the task's whitelist.");
+	// 		printf("\nTask's whitelist: %s", servers);
+	// 		printf("\nSelected server: %c", srv_num);
+	// 	}
+	// 	free(select_srv);
+	// }
 	////////////////// End edits //////////////////
 
 	return curr;
