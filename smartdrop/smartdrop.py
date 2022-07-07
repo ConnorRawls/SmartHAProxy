@@ -18,7 +18,6 @@ Three processes run concurrently:
   -cpuUsage
   -comms
 Six objects are referenced globally:
-  -time_matrix
   -stdev_matrix
   -workload
   -cpu_usage
@@ -171,7 +170,7 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                         new_instance = False
                     else:
                         method, query, url, server, error = parseLine(line, \
-                            time_matrix)
+                            profile_matrix)
                         if error == True:
                             error_count += 1
                             continue
@@ -199,10 +198,10 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                         workload[server] += task_type.ex_time
                         cpu_lock.acquire()
                         # Do we need to use workload.value & cpu_usage.value?
-                        record[task_id] = Instance(method, url, query, task.ex_size, \
-                            task.size_stdev, task.ex_time, task.time_stdev, server, \
+                        record[task_id] = Instance(method, url, query, task_type.ex_size, \
+                            task_type.size_stdev, task_type.ex_time, task_type.time_stdev, server, \
                             workload[server], predicted_time[key][server], \
-                            cpu_usage[server])
+                            cpu_usage[server].value)
                         wl_lock.release()                        
                         cpu_lock.release()
                     except KeyError:
@@ -218,9 +217,9 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                         wl_lock.release()
                         # *** WHAT ARE THE UNITS BEING LOGGED ***                       
                         record_file.write(record[task_id].toList() + \
-                            f',{actual_response}\n')
+                            f',{actual_time}\n')
                         del record[task_id]
-                        total_response += int(actual_response)
+                        total_response += int(actual_time)
                         task_count += 1
                     except KeyError:
                         error_count += 1
@@ -382,7 +381,7 @@ def detectServers():
         shell = True, stdout = subprocess.PIPE).stdout.decode('utf-8')
     return detect.count('web_servers')
 
-def parseLine(line, time_matrix):
+def parseLine(line, profile_matrix):
     methods = ['GET', 'POST']
     # Query search patterns
     q_patterns = '\?wc-ajax=add_to_cart|\?wc-ajax=get_refreshed_fragments'
@@ -406,7 +405,7 @@ def parseLine(line, time_matrix):
             query = query.group()
             line[2] = line[2].replace(query, '')
         except AttributeError: query = 'NULL'
-        for key, value in time_matrix.items():
+        for key, value in profile_matrix.items():
             if type(key) in [list, tuple, dict] and query in key:
                 found = True
                 break
@@ -424,7 +423,7 @@ def parseLine(line, time_matrix):
         if (query != '' or url == '/wp-profiling/') \
             and 'index.php' not in url:
             url = url + 'index.php'
-        for key, value in time_matrix.items():
+        for key, value in profile_matrix.items():
             if type(key) in [list, tuple, dict] and url in key:
                 found = True
                 break
