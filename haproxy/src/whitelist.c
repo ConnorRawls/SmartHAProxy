@@ -529,8 +529,7 @@ void freeWhitelist()
 
 //     for(int i = 0; i < whitelist.size; i++) {
 //         if(whitelist.requests[i]) {
-//             printf("Index: %d, Key: \"%s\", Servers: %s\n", i, \
-//             whitelist.requests[i]->key, whitelist.requests[i]->servers);
+//             printf("Index: %d, Key: \"%s\", Servers: %s\n", i, whitelist.requests[i]->key, whitelist.requests[i]->servers);
 //         }
 //     }
 
