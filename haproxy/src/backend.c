@@ -561,10 +561,10 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	double elapsed_time;
 	char key[MAX_LINE] = "";
 	char *buffer;
-	char *select_srv;
 	char srv_num;
-	int dispatch_err;
+	int impossible;
 
+	impossible = 0;
 	hash = 0;
 	px = s->be;
 	draws = px->lbprm.arg_opt1;
@@ -583,7 +583,16 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	elapsed_time = (double)elapsed_time / CLOCKS_PER_SEC;
 	reqCount.count++;
 
-	if(reqCount.count == 10000 || elapsed_time >= 2){
+	// if(reqCount.count == 10000 || elapsed_time >= 2){
+	// 	updateWhitelist();
+
+	// 	// ***
+	// 	// printWhitelist();
+
+	// 	reqCount.time = clock();
+	// 	reqCount.count = 0;
+	// }
+	if(impossible == 1){
 		updateWhitelist();
 
 		// ***
@@ -710,25 +719,11 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	}
 
 	// ***
-	if(curr == NULL || curr->id == NULL) printf("\nSelected server is NULL\n");
-	else {
-		dispatch_err = 1;
-		select_srv = malloc(sizeof(char) * strlen(curr->id));
-		strcpy(select_srv, curr->id);
-		srv_num = select_srv[strlen(select_srv)];
-		for(int i = 0; i < strlen(servers); i++) {
-			if(srv_num == servers[i]) {
-				dispatch_err = 0;
-				break;
-			}
-		}
-		if(dispatch_err == 1) {
-			printf("\nSelected server is not on the task's whitelist.");
-			printf("\nTask's whitelist: %s", servers);
-			printf("\nSelected server: %c", srv_num);
-		}
-		free(select_srv);
-	}
+	// if(curr == NULL || curr->id == NULL) srv_num = '0';
+	// else srv_num = curr->id[strlen(curr->id) - 1];
+	// if(servers != NULL) logWrite(key, servers, srv_num);
+	// ***
+
 	////////////////// End edits //////////////////
 
 	return curr;
@@ -765,6 +760,11 @@ int assign_server(struct stream *s)
 	struct server *conn_slot;
 	struct server *srv = NULL, *prev_srv;
 	int err;
+
+	// ***
+	clock_t start_time, end_time;
+	double elapsed_time;
+	// ***
 
 	DPRINTF(stderr,"assign_server : s=%p\n",s);
 
@@ -858,11 +858,21 @@ int assign_server(struct stream *s)
 				/* static-rr (map) or random (chash) */
 				if ((s->be->lbprm.algo & BE_LB_PARM) == BE_LB_RR_RANDOM)
 				{
+					// ***
+					start_time = clock();
+					// ***
+
 					struct ist uri;
 					int method_key;
 					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
 					method_key = s->txn->meth;
 					srv = get_server_rnd(s, prev_srv, method_key, uri.ptr, uri.len);
+
+					// ***
+					end_time = clock();
+					elapsed_time = howLong(start_time, end_time);
+					logTime(elapsed_time);
+					// ***
 				}
 				else
 					srv = map_get_server_rr(s->be, prev_srv);
@@ -3350,3 +3360,55 @@ INITCALL1(STG_REGISTER, acl_register_keywords, &acl_kws);
  *  c-basic-offset: 8
  * End:
  */
+
+// - Custom Utilities -
+double howLong(clock_t start, clock_t end)
+{
+	double elapsed_clock, elapsed_time;
+
+	elapsed_clock = end - start;
+	elapsed_time = (double)elapsed_clock / CLOCKS_PER_SEC;
+
+	return elapsed_time;
+}
+void logDispatch(char *task_key, char *servers, char srv_num)
+{
+	FILE *log_file;
+	char *srv_cpy;
+
+	srv_cpy = malloc(strlen(servers));
+	strcpy(srv_cpy, servers);
+	srv_cpy[strlen(srv_cpy) - 1] = '\0';
+
+	log_file = NULL;
+    log_file = fopen("/Smartdrop/logs/dispatch.log", "a");
+    if (log_file == NULL)
+    {
+        printf("Error! can't open log file.");
+		return;
+    }
+
+    fprintf(log_file, "%s,%s,%c\n", task_key, srv_cpy, srv_num);
+    fclose(log_file);
+	free(srv_cpy);
+
+	return;
+}
+
+void logTime(double data)
+{
+	FILE *log_file;
+
+	log_file = NULL;
+    log_file = fopen("/Smartdrop/logs/algorithmTimes.log", "a");
+    if (log_file == NULL)
+    {
+        printf("Error! can't open log file.");
+		return;
+    }
+
+    fprintf(log_file, "%lf\n", data);
+    fclose(log_file);
+
+	return;
+}

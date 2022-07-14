@@ -151,3 +151,8 @@ void set_backend_down(struct proxy *be);
  *  c-basic-offset: 8
  * End:
  */
+
+// - Custom Utilities -
+double howLong(clock_t start, clock_t end);
+void logDispatch(char *task_key, char *servers, char srv_num);
+void logTime(double data);
