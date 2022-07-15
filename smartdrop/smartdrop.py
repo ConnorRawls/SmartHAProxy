@@ -145,7 +145,11 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
             # MAIN LOOP: Parse log file
             for line in lines:
                 line = re.split(',|\s|\|', line)
-                method, query, url, server, error = None
+                method = None # Don't know why we can't method, query, ... = None
+                query = None
+                url = None
+                server = None
+                error = None
                 new_instance = True
 
                 # Status
@@ -385,11 +389,15 @@ def parseLine(line, profile_matrix):
     methods = ['GET', 'POST']
     # Query search patterns
     q_patterns = '\?wc-ajax=add_to_cart|\?wc-ajax=get_refreshed_fragments'
-    method, query, url, server, error = None
+    method = None
+    query = None
+    url = None
+    server = None
+    error = None
 
     # Method
     try:
-        method = line[1].replace.replace(' ', '')
+        method = line[1].replace(' ', '')
         if method not in methods:
             error = True
             return method, query, url, server, error
