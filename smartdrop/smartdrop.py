@@ -150,11 +150,19 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                 url = None
                 server = None
                 error = None
+                status = None
                 new_instance = True
+
+                # ***
+                print("\n")
 
                 # Status
                 try:
                     status = status_key[line[0][0].replace(' ', '')]
+
+                    # ***
+                    print(f'Status parsed: {status}')
+
                     if status == 'sent': continue
                 except IndexError:
                     error_count += 1
@@ -166,15 +174,34 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                 # Task ID
                 try:
                     task_id = line[0][1:].replace(' ', '')
+
+                    # ***
+                    print(f'Task ID parsed: {task_id}')
+
                     if task_id in record:
                         method = record[task_id].method
                         url = record[task_id].url
                         query = record[task_id].query
                         server = record[task_id].server
                         new_instance = False
+
+                        # ***
+                        print('Task ID found in record.')
+
                     else:
                         method, query, url, server, error = parseLine(line, \
                             profile_matrix)
+
+                        # ***
+                        print(
+                            f'Line parsed.'
+                            f'\nMethod: {method}'
+                            f'\nQuery: {query}'
+                            f'\nURL: {url}'
+                            f'\nServer: {server}'
+                            f'\nError: {error}'
+                            )
+
                         if error == True:
                             error_count += 1
                             continue
@@ -184,8 +211,16 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
 
                 # Response time
                 if not new_instance:
+
+                    # ***
+                    print('Not a new instance.')
+
                     try:
                         actual_time = line[3].replace(' ', '')
+
+                        # ***
+                        print(f'Response time parsed: {actual_time}')
+
                         try: float(actual_time)
                         except ValueError:
                             actual_time = 'NULL'
@@ -195,17 +230,26 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
 
                 # Insert task
                 if status == 'new':
+
+                    # ***
+                    print('New status recognized.')
+
                     try:
                         key = f'{method},{url},{query}'
                         task_type = profile_matrix[key]
                         wl_lock.acquire()
-                        workload[server] += task_type.ex_time
+                        workload[server] += float(task_type.ex_time)
                         cpu_lock.acquire()
+
+                        # ***
+                        print(f'Current workload: {workload[server]}')
+                        print(f'Current CPU: {cpu_usage[server]}\n')
+
                         # Do we need to use workload.value & cpu_usage.value?
                         record[task_id] = Instance(method, url, query, task_type.ex_size, \
                             task_type.size_stdev, task_type.ex_time, task_type.time_stdev, server, \
                             workload[server], predicted_time[key][server], \
-                            cpu_usage[server].value)
+                            cpu_usage[server])
                         wl_lock.release()                        
                         cpu_lock.release()
                     except KeyError:
@@ -213,6 +257,10 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
 
                 # Task completion
                 else:
+
+                    # ***
+                    print('Completion status recognized.')
+
                     try:
                         key = f'{method},{url},{query}'
                         task_type = profile_matrix[key]
@@ -303,20 +351,32 @@ def comms(profile_matrix, workload, cpu_usage, predicted_time, whitelist,
 # Calculate task whitelists
 def whiteAlg(profile_matrix, cpu_usage, workload, predicted_time, model, whitelist):
     # Service Level Objective = 1 second = 1,000,000 microseconds
-    SLO = 1e6
+    SLO = 0.5e6
 
     GBDT(profile_matrix, cpu_usage, workload, predicted_time, model)
 
     # Iterate for all tasks
     for task in predicted_time.keys():
+
+        # ***
+        if task == 'POST,/wp-profiling/index.php,?wc-ajax=get_refreshed_fragments':
+            print(f'\n\nTask: {task}')
+
         # Iterate for all servers
         for server in predicted_time[task].keys():
+
+            # ***
+            if task == 'POST,/wp-profiling/index.php,?wc-ajax=get_refreshed_fragments':
+                print(f'{server}: {predicted_time[task][server]}')
+
             # If server can't satisfy task's deadline
             if server in whitelist[task] and \
                 predicted_time[task][server] >= SLO:
                 # Remove it from server's whitelist if it is there
                 whitelist[task].remove(server)
-                print(f"Removing server {server} from task {task}"
+
+                # ***
+                print(f"\n*** Removing server {server} from task {task}"
                     f" (PRT: {predicted_time[task][server]})")
 
             elif server not in whitelist[task] and \
@@ -414,7 +474,7 @@ def parseLine(line, profile_matrix):
             line[2] = line[2].replace(query, '')
         except AttributeError: query = 'NULL'
         for key, value in profile_matrix.items():
-            if type(key) in [list, tuple, dict] and query in key:
+            if query in key:
                 found = True
                 break
         if found == False:
@@ -432,7 +492,7 @@ def parseLine(line, profile_matrix):
             and 'index.php' not in url:
             url = url + 'index.php'
         for key, value in profile_matrix.items():
-            if type(key) in [list, tuple, dict] and url in key:
+            if url in key:
                 found = True
                 break
         if found == False:
@@ -444,7 +504,7 @@ def parseLine(line, profile_matrix):
 
     # Server
     try:
-        server = line[-1][-1].replace(' ', '').replace('\n', '')
+        server = line[-2][-1].replace(' ', '').replace('\n', '')
         try: int(server)
         except ValueError:
             error = True
