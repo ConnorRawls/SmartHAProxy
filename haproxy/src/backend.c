@@ -562,13 +562,10 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	char key[MAX_LINE] = "";
 	char *buffer;
 	char srv_num;
-	int impossible;
 
-	impossible = 0;
 	hash = 0;
 	px = s->be;
 	draws = px->lbprm.arg_opt1;
-
 	/* tot_weight appears to mean srv_count */
 	if (px->lbprm.tot_weight == 0) return NULL;
 
@@ -579,24 +576,12 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	pthread_mutex_lock(&check.lock);
 
 	t2 = clock();
-	elapsed_time = t2 - reqCount.time;
-	elapsed_time = (double)elapsed_time / CLOCKS_PER_SEC;
+	elapsed_time = howLong(reqCount.time, t2);
 	reqCount.count++;
 
-	// if(reqCount.count == 10000 || elapsed_time >= 2){
-	// 	updateWhitelist();
-
-	// 	// ***
-	// 	// printWhitelist();
-
-	// 	reqCount.time = clock();
-	// 	reqCount.count = 0;
-	// }
-	if(impossible == 1){
+	if(reqCount.count == 10000 || elapsed_time >= (double)2){
+		printf("\nUpdating whitelist.\n");
 		updateWhitelist();
-
-		// ***
-		// printWhitelist();
 
 		reqCount.time = clock();
 		reqCount.count = 0;
@@ -679,6 +664,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	free(url_cpy);
 	free(qry_cpy);
 	
+	// Duplicate below, prob delete later
 	hash = 0;
 	draws = px->lbprm.arg_opt1; // number of draws
 
@@ -715,13 +701,15 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	if(curr == NULL){ // comment this part out
 		printf("(backend.c) Chosen server was NULL\n");
 	}else{
+		// ***
 		// printf("(backend.c) id: %s\n", curr->id);
 	}
 
 	// ***
-	// if(curr == NULL || curr->id == NULL) srv_num = '0';
-	// else srv_num = curr->id[strlen(curr->id) - 1];
-	// if(servers != NULL) logWrite(key, servers, srv_num);
+	if(curr == NULL || curr->id == NULL) srv_num = '0';
+	else if(strcmp(curr->id, "WP-Host") == 0) srv_num = '1';
+	else srv_num = curr->id[strlen(curr->id) - 1];
+	if(servers != NULL) logDispatch(key, servers, srv_num);
 	// ***
 
 	////////////////// End edits //////////////////
@@ -762,8 +750,12 @@ int assign_server(struct stream *s)
 	int err;
 
 	// ***
+	struct ist uri;
+	int method_key;
 	clock_t start_time, end_time;
 	double elapsed_time;
+	uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
+	method_key = s->txn->meth;
 	// ***
 
 	DPRINTF(stderr,"assign_server : s=%p\n",s);
@@ -841,7 +833,19 @@ int assign_server(struct stream *s)
 		 */
 		switch (s->be->lbprm.algo & BE_LB_LKUP) {
 		case BE_LB_LKUP_RRTREE:
-			srv = fwrr_get_next_server(s->be, prev_srv);
+
+			// ***
+			start_time = clock();
+			// ***
+
+			srv = fwrr_get_next_server(s->be, prev_srv, method_key, uri.ptr, uri.len);
+
+			// ***
+			end_time = clock();
+			elapsed_time = howLong(start_time, end_time);
+			logTime(elapsed_time);
+			// ***
+			
 			break;
 
 		case BE_LB_LKUP_FSTREE:
@@ -849,7 +853,7 @@ int assign_server(struct stream *s)
 			break;
 
 		case BE_LB_LKUP_LCTREE:
-			srv = fwlc_get_next_server(s->be, prev_srv);
+			srv = fwlc_get_next_server(s->be, prev_srv, method_key, uri.ptr, uri.len);
 			break;
 
 		case BE_LB_LKUP_CHTREE:
@@ -862,10 +866,6 @@ int assign_server(struct stream *s)
 					start_time = clock();
 					// ***
 
-					struct ist uri;
-					int method_key;
-					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
-					method_key = s->txn->meth;
 					srv = get_server_rnd(s, prev_srv, method_key, uri.ptr, uri.len);
 
 					// ***
