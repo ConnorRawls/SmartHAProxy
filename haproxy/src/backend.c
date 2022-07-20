@@ -654,7 +654,14 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 	servers = NULL;
 	servers = searchRequest(key);
-	if(servers != NULL) {strcat(servers, "\0");}
+	if(servers != NULL) strcat(servers, "\0");
+	if(strchr(servers, '0') != NULL) {
+		printf("\nEmpty WL: %s\nReturning NULL.\n", servers);
+		return NULL;
+	}
+
+	// ***
+	if(!strcmp(servers, "1234567")) printf("\nNon-default WL detected.\n");
 
 	// ***
 	// printf("\n(backend.c) Servers: %s", servers);
@@ -710,6 +717,11 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	else if(strcmp(curr->id, "WP-Host") == 0) srv_num = '1';
 	else srv_num = curr->id[strlen(curr->id) - 1];
 	if(servers != NULL) logDispatch(key, servers, srv_num);
+	if(strchr(servers, srv_num) == NULL) {
+		printf("\n*** Incorrect dispatch found.");
+		printf("\nWL: %s", servers);
+		printf("\nDispatch: %c\n", srv_num);
+	}
 	// ***
 
 	////////////////// End edits //////////////////
