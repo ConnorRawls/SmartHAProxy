@@ -28,7 +28,7 @@
 #include <haproxy/server-t.h>
 
 void fwrr_init_server_groups(struct proxy *p);
-struct server *fwrr_get_next_server(struct proxy *p, struct server *srvtoavoid);
+struct server *fwrr_get_next_server(struct proxy *p, struct server *srvtoavoid, int method_key, const char *uri, int uri_len);
 
 #endif /* _HAPROXY_LB_FWRR_H */
 
