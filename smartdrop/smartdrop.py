@@ -34,6 +34,7 @@ import json
 import time
 import sys
 import itertools
+import random
 from datetime import datetime
 from multiprocessing import Process, Manager, Lock
 import libvirt
@@ -42,8 +43,12 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import GradientBoostingRegressor
 
+# Used for remote messaging locks
 MSGLEN = 1
 SRVCOUNT = 7
+# Service Level Objective = 1 second = 1,000,000 (1e6) microseconds
+SLO = .9e6
+CURR_PATH = os.getcwd()
 
 class TaskType:
     def __init__(self, method, url, query, ex_size, size_stdev, ex_time, time_stdev):
@@ -67,10 +72,10 @@ class Instance:
         self.time_stdev = time_stdev
         self.server = server
         self.workload = workload
-        self.predicted_time
+        self.predicted_time = predicted_time
         self.cpu_usage = cpu_usage
 
-    def toList():
+    def toList(self):
         list_str = (f'{self.method},{self.url},{self.query},{self.ex_size},'
                     f'{self.size_stdev},{self.ex_time},{self.time_stdev},'
                     f'{self.server},{self.workload},{self.predicted_time},'
@@ -96,7 +101,14 @@ def main():
         pt_lock = Lock()    # Predicted Time
         cpu_lock = Lock()   # CPU Usage
         # GBDT model
-        model = pickle.load(open('GBDT.sav', 'rb'))
+        model_path = CURR_PATH + '/Model/GBDT_Scaled_Norm.sav'
+        model = pickle.load(open(model_path, 'rb'))
+        # Input scaler
+        x_scaler_path = CURR_PATH + '/Model/xScaler.sav'
+        x_scaler = pickle.load(open(x_scaler_path, 'rb'))
+        # Output scaler
+        y_scaler_path = CURR_PATH + '/Model/yScaler.sav'
+        y_scaler = pickle.load(open(y_scaler_path, 'rb'))
 
         init(profile_matrix, workload, cpu_usage, predicted_time, whitelist, m)
 
@@ -105,7 +117,12 @@ def main():
             cpu_usage, predicted_time, wl_lock, pt_lock, cpu_lock))
         proc2 = Process(target = cpuUsage, args = (cpu_usage, cpu_lock))
         proc3 = Process(target = comms, args = (profile_matrix, workload, \
-            cpu_usage, predicted_time, whitelist, wl_lock, pt_lock, cpu_lock, model))
+            cpu_usage, predicted_time, whitelist, wl_lock, pt_lock, cpu_lock, model, \
+            x_scaler, y_scaler))
+
+        # *** Debugging purposes
+        # proc4 = Process(target = debugPrint, args = (cpu_usage, cpu_lock, \
+        #     predicted_time, pt_lock, workload, wl_lock))
 
         start_time = datetime.now()
         print(f"Commencing Smartdrop [{start_time}].")
@@ -113,12 +130,15 @@ def main():
         proc1.start()       # Start listening for task events
         proc2.start()       # Start observing hardware metrics
         proc3.start()       # Start listening for socket messages
+        # proc4.start() # ***
         proc1.join()
         proc2.join()
         proc3.join()
+        # proc4.join() # ***
         proc1.terminate()   # Stop listening for task events
         proc2.terminate()   # Stop observing hardware metrics
         proc3.terminate()   # Stop listening for socket messages
+        # proc4.terminate() # ***
 
 # Process 1
 # -----------------------------------------------------------------------------
@@ -136,8 +156,10 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
     os.system("truncate -s 0 /var/log/apache_access.log")
 
     with open('records.csv', 'a') as record_file:
-        record_file.write('method,url,query,server,predicted response time,' + \
-            'actual response time\n')
+        record_file.write(
+            'method,url,query,ex_size,size_stdev,ex_time,time_stdev,'
+            'server,workload,predicted_time,cpu_usage,actual_time\n'
+        )
 
         with open('/var/log/apache_access.log', 'r') as log_file:
             lines = logRead(log_file)
@@ -153,15 +175,15 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                 status = None
                 new_instance = True
 
-                # ***
-                print("\n")
+                # # ***
+                # print("\n")
 
                 # Status
                 try:
                     status = status_key[line[0][0].replace(' ', '')]
 
-                    # ***
-                    print(f'Status parsed: {status}')
+                    # # ***
+                    # print(f'Status parsed: {status}')
 
                     if status == 'sent': continue
                 except IndexError:
@@ -175,8 +197,8 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                 try:
                     task_id = line[0][1:].replace(' ', '')
 
-                    # ***
-                    print(f'Task ID parsed: {task_id}')
+                    # # ***
+                    # print(f'Task ID parsed: {task_id}')
 
                     if task_id in record:
                         method = record[task_id].method
@@ -185,22 +207,22 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                         server = record[task_id].server
                         new_instance = False
 
-                        # ***
-                        print('Task ID found in record.')
+                        # # ***
+                        # print('Task ID found in record.')
 
                     else:
                         method, query, url, server, error = parseLine(line, \
                             profile_matrix)
 
-                        # ***
-                        print(
-                            f'Line parsed.'
-                            f'\nMethod: {method}'
-                            f'\nQuery: {query}'
-                            f'\nURL: {url}'
-                            f'\nServer: {server}'
-                            f'\nError: {error}'
-                            )
+                        # # ***
+                        # print(
+                        #     f'Line parsed.'
+                        #     f'\nMethod: {method}'
+                        #     f'\nQuery: {query}'
+                        #     f'\nURL: {url}'
+                        #     f'\nServer: {server}'
+                        #     f'\nError: {error}'
+                        #     )
 
                         if error == True:
                             error_count += 1
@@ -212,14 +234,14 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                 # Response time
                 if not new_instance:
 
-                    # ***
-                    print('Not a new instance.')
+                    # # ***
+                    # print('Not a new instance.')
 
                     try:
                         actual_time = line[3].replace(' ', '')
 
-                        # ***
-                        print(f'Response time parsed: {actual_time}')
+                        # # ***
+                        # print(f'Response time parsed: {actual_time}')
 
                         try: float(actual_time)
                         except ValueError:
@@ -231,8 +253,8 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                 # Insert task
                 if status == 'new':
 
-                    # ***
-                    print('New status recognized.')
+                    # # ***
+                    # print('New status recognized.')
 
                     try:
                         key = f'{method},{url},{query}'
@@ -241,11 +263,10 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                         workload[server] += float(task_type.ex_time)
                         cpu_lock.acquire()
 
-                        # ***
-                        print(f'Current workload: {workload[server]}')
-                        print(f'Current CPU: {cpu_usage[server]}\n')
+                        # # ***
+                        # print(f'Current workload: {workload[server]}')
+                        # print(f'Current CPU: {cpu_usage[server]}\n')
 
-                        # Do we need to use workload.value & cpu_usage.value?
                         record[task_id] = Instance(method, url, query, task_type.ex_size, \
                             task_type.size_stdev, task_type.ex_time, task_type.time_stdev, server, \
                             workload[server], predicted_time[key][server], \
@@ -258,17 +279,18 @@ def taskEvent(profile_matrix, workload, cpu_usage, predicted_time, wl_lock,
                 # Task completion
                 else:
 
-                    # ***
-                    print('Completion status recognized.')
+                    # # ***
+                    # print('Completion status recognized.')
 
                     try:
+                        record_entry = record[task_id].toList()
                         key = f'{method},{url},{query}'
                         task_type = profile_matrix[key]
                         wl_lock.acquire()
-                        workload[server] -= task_type.ex_time
+                        workload[server] -= float(task_type.ex_time)
                         wl_lock.release()
-                        # *** WHAT ARE THE UNITS BEING LOGGED ***                       
-                        record_file.write(record[task_id].toList() + \
+                        # *** WHAT ARE THE UNITS BEING LOGGED? ***                       
+                        record_file.write(record_entry + \
                             f',{actual_time}\n')
                         del record[task_id]
                         total_response += int(actual_time)
@@ -302,8 +324,8 @@ def cpuUsage(cpu_usage, cpu_lock):
 # Process 3
 # -----------------------------------------------------------------------------
 # Send whitelist to load balancer
-def comms(profile_matrix, workload, cpu_usage, predicted_time, whitelist,
-    wl_lock, pt_lock, cpu_lock, model):
+def comms(profile_matrix, workload, cpu_usage, predicted_time, whitelist, \
+    wl_lock, pt_lock, cpu_lock, model, x_scaler, y_scaler):
     HOST = 'smartdrop'
     PORT = 8080
 
@@ -328,7 +350,7 @@ def comms(profile_matrix, workload, cpu_usage, predicted_time, whitelist,
 
                 # Calculate whitelist
                 whiteAlg(profile_matrix, cpu_usage, workload, predicted_time, \
-                    model, whitelist)
+                    model, x_scaler, y_scaler, whitelist)
 
                 # Release locks
                 wl_lock.release()
@@ -349,26 +371,15 @@ def comms(profile_matrix, workload, cpu_usage, predicted_time, whitelist,
 # Whitelist Algorithm
 # -----------------------------------------------------------------------------
 # Calculate task whitelists
-def whiteAlg(profile_matrix, cpu_usage, workload, predicted_time, model, whitelist):
-    # Service Level Objective = 1 second = 1,000,000 microseconds
-    SLO = 0.5e6
-
-    GBDT(profile_matrix, cpu_usage, workload, predicted_time, model)
+def whiteAlg(profile_matrix, cpu_usage, workload, predicted_time, model, x_scaler, \
+    y_scaler, whitelist):
+    GBDT(profile_matrix, cpu_usage, workload, predicted_time, model, x_scaler, \
+        y_scaler)
 
     # Iterate for all tasks
     for task in predicted_time.keys():
-
-        # ***
-        if task == 'POST,/wp-profiling/index.php,?wc-ajax=get_refreshed_fragments':
-            print(f'\n\nTask: {task}')
-
         # Iterate for all servers
         for server in predicted_time[task].keys():
-
-            # ***
-            if task == 'POST,/wp-profiling/index.php,?wc-ajax=get_refreshed_fragments':
-                print(f'{server}: {predicted_time[task][server]}')
-
             # If server can't satisfy task's deadline
             if server in whitelist[task] and \
                 predicted_time[task][server] >= SLO:
@@ -376,8 +387,10 @@ def whiteAlg(profile_matrix, cpu_usage, workload, predicted_time, model, whiteli
                 whitelist[task].remove(server)
 
                 # ***
-                print(f"\n*** Removing server {server} from task {task}"
-                    f" (PRT: {predicted_time[task][server]})")
+                print(
+                    f"\n\n* Removing server {server} from task {task}"
+                    f"\n  (PRT: {predicted_time[task][server]})"
+                    )
 
             elif server not in whitelist[task] and \
                 predicted_time[task][server] < SLO:
@@ -387,7 +400,8 @@ def whiteAlg(profile_matrix, cpu_usage, workload, predicted_time, model, whiteli
 # Gradient Boosted Decision Tree
 # -----------------------------------------------------------------------------
 # Predict task types' response time on each server
-def GBDT(profile_matrix, cpu_usage, workload, predicted_time, model):
+def GBDT(profile_matrix, cpu_usage, workload, predicted_time, model, x_scaler, \
+    y_scaler):
     # N channel metric matrix, where N = Number of servers
     for server in cpu_usage.keys():
         # Convert task features into list format
@@ -431,9 +445,11 @@ def GBDT(profile_matrix, cpu_usage, workload, predicted_time, model):
         output_data = []
         # Each row is a task type
         for row in input_data:
-            output_data.append(abs(model.predict([row])))
+            row = x_scaler.transform(row.reshape(1, -1))
+            output_data.append(abs(model.predict(row)))
         # *** Are they in order?
         for (task, time_on_server) in zip(predicted_time.keys(), output_data):
+            time_on_server = y_scaler.inverse_transform(time_on_server)
             predicted_time[task][server] = time_on_server
 
 # Utilities
@@ -609,6 +625,26 @@ def receiveMessage(conn):
         bytes_received = bytes_received + len(chunk)
 
     return b''.join(chunks)
+
+def debugPrint(cpu_usage, cpu_lock, predicted_time, pt_lock, workload, wl_lock):
+    while True:
+        time.sleep(5)
+        rnd_task = random.choice(list(predicted_time.keys()))
+        cpu_lock.acquire()
+        pt_lock.acquire()
+        wl_lock.acquire()
+
+        print('\n\n- SYSTEM DIAGNOSTICS -')
+        for server in workload.keys():
+            print(f'{server} CPU: {cpu_usage[server]} Workload: {workload[server]}')
+        print('\n- TASK DIAGNOSTICS -')
+        print(f'Randomly selected task: {rnd_task}')
+        for server in predicted_time[rnd_task].keys():
+            print(f'PRT for {server}: {predicted_time[rnd_task][server]}')
+
+        cpu_lock.release()
+        pt_lock.release()
+        wl_lock.release()
 
 if __name__ == '__main__':
     main()
