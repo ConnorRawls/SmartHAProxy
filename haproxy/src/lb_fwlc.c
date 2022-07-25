@@ -421,7 +421,8 @@ struct server *fwlc_get_next_server(struct proxy *p, struct server *srvtoavoid, 
 	strcat(strcat(strcat(key, method_name), url_cpy), qry_cpy);
 	servers = NULL;
 	servers = searchRequest(key);
-	if(servers != NULL) {strcat(servers, "\0");}
+	if(servers != NULL) strcat(servers, "\0");
+	if(strchr(servers, '0') != NULL) return NULL;
 
 	// We're freeeeeee
 	free(method_name);

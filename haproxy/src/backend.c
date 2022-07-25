@@ -579,7 +579,8 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	elapsed_time = howLong(reqCount.time, t2);
 	reqCount.count++;
 
-	if(reqCount.count == 10000 || elapsed_time >= (double)2){
+	// Default 10000t || 2s
+	if(reqCount.count == 10000 || elapsed_time >= (double)5){
 		printf("\nUpdating whitelist.\n");
 		updateWhitelist();
 
@@ -655,13 +656,10 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	servers = NULL;
 	servers = searchRequest(key);
 	if(servers != NULL) strcat(servers, "\0");
-	if(strchr(servers, '0') != NULL) {
-		printf("\nEmpty WL: %s\nReturning NULL.\n", servers);
-		return NULL;
-	}
+	if(strchr(servers, '0') != NULL) return NULL;
 
 	// ***
-	if(!strcmp(servers, "1234567")) printf("\nNon-default WL detected.\n");
+	// if(!strcmp(servers, "1234567")) printf("\nNon-default WL detected.\n");
 
 	// ***
 	// printf("\n(backend.c) Servers: %s", servers);
@@ -705,23 +703,18 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		(curr->queue.length || (curr->maxconn && curr->served >= srv_dynamic_maxconn(curr))))
 		curr = NULL;
 	
-	if(curr == NULL){ // comment this part out
-		printf("(backend.c) Chosen server was NULL\n");
-	}else{
-		// ***
-		// printf("(backend.c) id: %s\n", curr->id);
-	}
+	// if(curr == NULL) printf("(backend.c) Chosen server was NULL\n");
 
 	// ***
 	if(curr == NULL || curr->id == NULL) srv_num = '0';
 	else if(strcmp(curr->id, "WP-Host") == 0) srv_num = '1';
 	else srv_num = curr->id[strlen(curr->id) - 1];
 	if(servers != NULL) logDispatch(key, servers, srv_num);
-	if(strchr(servers, srv_num) == NULL) {
-		printf("\n*** Incorrect dispatch found.");
-		printf("\nWL: %s", servers);
-		printf("\nDispatch: %c\n", srv_num);
-	}
+	// if(strchr(servers, srv_num) == NULL) {
+	// 	printf("\n*** Incorrect dispatch found.");
+	// 	printf("\nWL: %s", servers);
+	// 	printf("\nDispatch: %c\n", srv_num);
+	// }
 	// ***
 
 	////////////////// End edits //////////////////
@@ -875,15 +868,15 @@ int assign_server(struct stream *s)
 				if ((s->be->lbprm.algo & BE_LB_PARM) == BE_LB_RR_RANDOM)
 				{
 					// ***
-					start_time = clock();
+					// start_time = clock();
 					// ***
 
 					srv = get_server_rnd(s, prev_srv, method_key, uri.ptr, uri.len);
 
 					// ***
-					end_time = clock();
-					elapsed_time = howLong(start_time, end_time);
-					logTime(elapsed_time);
+					// end_time = clock();
+					// elapsed_time = howLong(start_time, end_time);
+					// logTime(elapsed_time);
 					// ***
 				}
 				else
