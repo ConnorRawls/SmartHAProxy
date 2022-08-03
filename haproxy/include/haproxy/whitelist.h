@@ -24,6 +24,7 @@ typedef struct Request_T
     char *method;
     char *url;
     char *query;
+    char *content;
     char *servers;
 } Request;
 
@@ -52,10 +53,10 @@ int hashRequest(char *key);
 void createWhitelist(int size);
 
 // Create request item in whitelist
-Request *createRequest(char *method, char *url, char *query, char *servers);
+Request *createRequest(char *method, char *url, char *query, char *content, char *servers);
 
 // Insert request into whitelist
-void insertRequest(char *method, char *url, char *query, char *servers);
+void insertRequest(char *method, char *url, char *query, char *content, char *servers);
 
 // Fill whitelist with new values
 void updateWhitelist();
@@ -70,7 +71,7 @@ int stringLength(char *string);
 int onWhitelist(char *task_wl, char *server_id);
 
 // Display item statistics
-void printRequest(char *method, char *url, char *query);
+void printRequest(char *method, char *url, char *query, char *content);
 
 // Display contents of hash table
 void printWhitelist();

@@ -30,6 +30,7 @@
 #include <haproxy/hash.h>
 #include <haproxy/http.h>
 #include <haproxy/http_ana.h>
+#include <haproxy/http_fetch.h>
 #include <haproxy/http_htx.h>
 #include <haproxy/htx.h>
 #include <haproxy/lb_chash.h>
@@ -541,7 +542,7 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 
 ///////////////// Begin edits /////////////////
 /* random value  */
-static struct server *get_server_rnd(struct stream *s, const struct server *avoid, int method_key, const char *uri, int uri_len)
+static struct server *get_server_rnd(struct stream *s, const struct server *avoid, int method_key, const char *uri, int uri_len, char *content)
 {
 	// Below are constructs created by HAProxy. Moved up here to get
 	// the compile warning to shut up.
@@ -647,27 +648,40 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	// printf("\n(backend.c) URL: %s", url_cpy);
 	// printf("\n(backend.c) Query: %s", qry_cpy);
 
-	// Key = Method + URL + Query
-	strcat(strcat(strcat(key, method_name), url_cpy), qry_cpy);
+	// Content
+
+
+	// Key = Method + URL + Query + Content
+	strcat(strcat(strcat(strcat(key, method_name), url_cpy), qry_cpy), content);
 
 	// ***
-	// printf("\n(backend.c) Key: %s", key);
+	// printf("\n(backend.c) Key: %s\n", key);
+
+	// ***
+	printWhitelist();
 
 	servers = NULL;
 	servers = searchRequest(key);
 	if(servers != NULL) strcat(servers, "\0");
-	if(strchr(servers, '0') != NULL) return NULL;
+	if(strchr(servers, '0') != NULL) {
+
+		// ***
+		// printf("\nReturning NULL.\n");
+
+		return NULL;
+	}
 
 	// ***
 	// if(!strcmp(servers, "1234567")) printf("\nNon-default WL detected.\n");
 
 	// ***
-	// printf("\n(backend.c) Servers: %s", servers);
+	printf("\n(backend.c) Servers: %s\n", servers);
 
 	// We're freeeeeee
 	free(method_name);
 	free(url_cpy);
 	free(qry_cpy);
+	free(content);
 	
 	// Duplicate below, prob delete later
 	hash = 0;
@@ -757,10 +771,19 @@ int assign_server(struct stream *s)
 	// ***
 	struct ist uri;
 	int method_key;
+	char *content;
 	clock_t start_time, end_time;
 	double elapsed_time;
+	struct htx *htx;
+	struct http_hdr_ctx ctx = { .blk = NULL };
+
 	uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
+
 	method_key = s->txn->meth;
+
+	htx = htxbuf(&s->req.buf);
+
+	content = findContent(htx, &ctx);
 	// ***
 
 	DPRINTF(stderr,"assign_server : s=%p\n",s);
@@ -871,7 +894,7 @@ int assign_server(struct stream *s)
 					// start_time = clock();
 					// ***
 
-					srv = get_server_rnd(s, prev_srv, method_key, uri.ptr, uri.len);
+					srv = get_server_rnd(s, prev_srv, method_key, uri.ptr, uri.len, content);
 
 					// ***
 					// end_time = clock();
@@ -3376,6 +3399,7 @@ double howLong(clock_t start, clock_t end)
 
 	return elapsed_time;
 }
+
 void logDispatch(char *task_key, char *servers, char srv_num)
 {
 	FILE *log_file;
@@ -3416,4 +3440,37 @@ void logTime(double data)
     fclose(log_file);
 
 	return;
+}
+
+char *findContent(const struct htx *htx, struct http_hdr_ctx *ctx)
+{
+	struct htx_blk *blk = ctx->blk;
+	struct ist n;
+	char *word_start;
+	int word_ind;
+	char *content;
+
+	for (blk = htx_get_first_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
+		n = htx_get_blk_name(htx, blk);
+		word_start = strstr(n.ptr, "file");
+
+		if(word_start != NULL) {
+			printf("\nHeader found.\n");
+
+			content = malloc(sizeof(char) * 5);
+
+			for(word_ind = 0; word_ind < 8; word_ind++) {
+				if(word_ind >= 4) strncat(content, &word_start[word_ind], 1);
+			}
+
+			ctx->blk   = NULL;
+			ctx->value = ist("");
+			ctx->lws_before = ctx->lws_after = 0;
+			return content;
+		}
+	}
+
+	content = malloc(sizeof("NULL"));
+	strcpy(content, "NULL");
+	return content;
 }

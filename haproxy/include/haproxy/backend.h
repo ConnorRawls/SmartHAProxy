@@ -29,6 +29,11 @@
 #include <haproxy/stream-t.h>
 #include <haproxy/time.h>
 
+#include <haproxy/http.h>
+#include <haproxy/http_fetch.h>
+#include <haproxy/http_htx.h>
+#include <haproxy/htx.h>
+
 int assign_server(struct stream *s);
 int assign_server_address(struct stream *s);
 int assign_server_and_queue(struct stream *s);
@@ -156,3 +161,4 @@ void set_backend_down(struct proxy *be);
 double howLong(clock_t start, clock_t end);
 void logDispatch(char *task_key, char *servers, char srv_num);
 void logTime(double data);
+char *findContent(const struct htx *htx, struct http_hdr_ctx *ctx);

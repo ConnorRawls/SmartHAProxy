@@ -40,12 +40,12 @@ void createWhitelist(int size)
 }
 
 // Create request item in whitelist
-Request *createRequest(char* method, char *url, char *query, char *servers)
+Request *createRequest(char* method, char *url, char *query, char *content, char *servers)
 {
     Request *request;
     char key[MAX_LINE] = "";
 
-    strcat(strcat(strcat(key, method), url), query);
+    strcat(strcat(strcat(strcat(key, method), url), query), content);
 
     request = (Request*)malloc(sizeof(Request));
 
@@ -53,19 +53,21 @@ Request *createRequest(char* method, char *url, char *query, char *servers)
     request->method = (char*)malloc(strlen(method) + 1);
     request->url = (char*)malloc(strlen(url) + 1);
     request->query = (char*)malloc(strlen(query) + 1);
+    request->content = (char*)malloc(strlen(content) + 1);
     request->servers = (char*)malloc(strlen(servers) + 1);
 
     strcpy(request->key, key);
     strcpy(request->method, method);
     strcpy(request->url, url);
     strcpy(request->query, query);
+    strcpy(request->content, content);
     strcpy(request->servers, servers);
 
     return request;
 }
 
 // Insert request into whitelist
-void insertRequest(char* method, char *url, char* query, char *servers)
+void insertRequest(char* method, char *url, char* query, char *content, char *servers)
 {
     int index;
     Request *request;
@@ -73,10 +75,10 @@ void insertRequest(char* method, char *url, char* query, char *servers)
     char key[MAX_LINE] = "";
 
     // Create item
-    request = createRequest(method, url, query, servers);
+    request = createRequest(method, url, query, content, servers);
 
     // Compute index based on hashing algorithm
-    strcat(strcat(strcat(key, method), url), query);
+    strcat(strcat(strcat(strcat(key, method), url), query), content);
 
     index = hashRequest(key);
 
@@ -123,6 +125,7 @@ void updateWhitelist()
     char method[MAX_COLUMN];
     char url[MAX_COLUMN];
     char query[MAX_COLUMN];
+    char content[MAX_COLUMN];
     char servers[MAX_COLUMN];
     char *tkn;
 
@@ -149,6 +152,8 @@ void updateWhitelist()
             tkn = strtok(NULL, ",");
             strcpy(query, tkn);
             tkn = strtok(NULL, ",");
+            strcpy(content, tkn);
+            tkn = strtok(NULL, ",");
             strcpy(servers, tkn);
 
             // ***
@@ -158,7 +163,7 @@ void updateWhitelist()
             // printf("\n(whitelist.c) Servers: %s", servers);
 
             // Adjust whitelist entry
-            insertRequest(method, url, query, servers);
+            insertRequest(method, url, query, content, servers);
 
             // ***
             // printRequest(method, url, query);
@@ -204,12 +209,12 @@ int onWhitelist(char *task_wl, char *server_id)
 }
 
 // Display item statistics
-void printRequest(char *method, char *url, char *query)
+void printRequest(char *method, char *url, char *query, char *content)
 {
     char *servers;
     char key[MAX_LINE] = "";
 
-    strcat(strcat(strcat(key, method), url), query);
+    strcat(strcat(strcat(strcat(key, method), url), query), content);
 
     if((servers = searchRequest(key)) == NULL) {
         printf("(whitelist.c) Key: \"%s\" does not exist.", key);
@@ -250,6 +255,7 @@ void freeRequest(Request *request)
     free(request->method);
     free(request->url);
     free(request->query);
+    free(request->content);
     free(request->servers);
     free(request);
 }
