@@ -581,8 +581,8 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	reqCount.count++;
 
 	// Default 10000t || 2s
-	if(reqCount.count == 10000 || elapsed_time >= (double)5){
-		printf("\nUpdating whitelist.\n");
+	if(reqCount.count == 1000 || elapsed_time >= (double)5){
+		// printf("\nUpdating whitelist.\n");
 		updateWhitelist();
 
 		reqCount.time = clock();
@@ -649,7 +649,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	// printf("\n(backend.c) Query: %s", qry_cpy);
 
 	// Content
-
+	// printf("\n(backend.c) Content: %s", content);
 
 	// Key = Method + URL + Query + Content
 	strcat(strcat(strcat(strcat(key, method_name), url_cpy), qry_cpy), content);
@@ -658,7 +658,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	// printf("\n(backend.c) Key: %s\n", key);
 
 	// ***
-	printWhitelist();
+	// printWhitelist();
 
 	servers = NULL;
 	servers = searchRequest(key);
@@ -675,7 +675,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	// if(!strcmp(servers, "1234567")) printf("\nNon-default WL detected.\n");
 
 	// ***
-	printf("\n(backend.c) Servers: %s\n", servers);
+	// printf("\n(backend.c) Servers: %s\n", servers);
 
 	// We're freeeeeee
 	free(method_name);
@@ -3447,25 +3447,35 @@ char *findContent(const struct htx *htx, struct http_hdr_ctx *ctx)
 	struct htx_blk *blk = ctx->blk;
 	struct ist n;
 	char *word_start;
-	int word_ind;
 	char *content;
+
+	// ***
+	// printf("\nFinding content.\n");
 
 	for (blk = htx_get_first_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
 		n = htx_get_blk_name(htx, blk);
+
 		word_start = strstr(n.ptr, "file");
 
 		if(word_start != NULL) {
-			printf("\nHeader found.\n");
+			// ***
+			// printf("\nHeader found: %s\n", word_start);
 
 			content = malloc(sizeof(char) * 5);
 
-			for(word_ind = 0; word_ind < 8; word_ind++) {
-				if(word_ind >= 4) strncat(content, &word_start[word_ind], 1);
-			}
+			strncpy(content, word_start + 4, 4);
 
+			content[4] = '\0';
+
+			// ***
+			// printf("\nContent copied: %s\n", content);
+			// printf("\nSize of content: %zu\n", strlen(content));
+
+			// What does this stuff do?
 			ctx->blk   = NULL;
 			ctx->value = ist("");
 			ctx->lws_before = ctx->lws_after = 0;
+
 			return content;
 		}
 	}
