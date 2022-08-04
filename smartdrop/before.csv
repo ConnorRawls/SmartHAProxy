@@ -1,0 +1,13 @@
+,Method,URL,Query,Content,Size,SizeStdev,Time,TimeStdev,Workload,CPU
+0,GET,/wp-profiling/index.php/cart/,,None,414.0,0.0,87230.0,0.0,0.0,0.0
+1,POST,/wp-profiling/wp-comments-post.php,,833K,834686.0,0.0,774262.0,0.0,0.0,0.0
+2,GET,/wp-profiling/index.php/2022/07/25/20-images/,,None,384.0,0.0,89930.0,0.0,0.0,0.0
+3,POST,/wp-profiling/wp-comments-post.php,,49K,50486.0,0.0,117354.0,0.0,0.0,0.0
+4,POST,/wp-profiling/wp-comments-post.php,,221K,222110.0,0.0,263890.0,0.0,0.0,0.0
+5,POST,/wp-profiling/wp-comments-post.php,,1.2M,1241030.0,0.0,1217256.0,0.0,0.0,0.0
+6,POST,/wp-profiling/wp-comments-post.php,,5.4M,5368592.0,0.0,6447973.0,0.0,0.0,0.0
+7,GET,/wp-profiling/index.php/2022/07/25/10-images/,,None,384.0,0.0,85667.0,0.0,0.0,0.0
+8,GET,/wp-profiling/index.php,,None,384.0,0.0,120271.0,0.0,0.0,0.0
+9,POST,/wp-profiling/wp-comments-post.php,,1.5M,1461268.0,0.0,1273703.0,0.0,0.0,0.0
+10,POST,/wp-profiling/wp-comments-post.php,,1.9M,1864303.0,0.0,1612140.0,0.0,0.0,0.0
+11,GET,/wp-profiling/index.php/2022/07/25/50/,,None,377.0,0.0,91148.0,0.0,0.0,0.0

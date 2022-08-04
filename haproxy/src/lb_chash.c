@@ -15,6 +15,8 @@
  * 2 of the License, or (at your option) any later version.
  *
  */
+#ifndef _HAPROXY_LB_CHASH_C123
+#define _HAPROXY_LB_CHASH_C123
 
 #include <import/eb32tree.h>
 #include <haproxy/api.h>
@@ -23,6 +25,12 @@
 #include <haproxy/queue.h>
 #include <haproxy/server-t.h>
 #include <haproxy/tools.h>
+
+///////////////// Begin edits /////////////////
+
+#include <haproxy/whitelist.h>
+
+////////////////// End edits //////////////////
 
 /* Return next tree node after <node> which must still be in the tree, or be
  * NULL. Lookup wraps around the end to the beginning. If the next node is the
@@ -118,7 +126,7 @@ static inline void chash_queue_dequeue_srv(struct server *s)
  *
  * The server's lock must be held. The lbprm lock will be used.
  */
-static void chash_set_server_status_down(struct server *srv)
+void chash_set_server_status_down(struct server *srv)
 {
 	struct proxy *p = srv->proxy;
 
@@ -175,7 +183,7 @@ out_update_backend:
  *
  * The server's lock must be held. The lbprm lock will be used.
  */
-static void chash_set_server_status_up(struct server *srv)
+void chash_set_server_status_up(struct server *srv)
 {
 	struct proxy *p = srv->proxy;
 
@@ -319,7 +327,8 @@ int chash_server_is_eligible(struct server *s)
  *
  * The lbprm's lock will be used in R/O mode. The server's lock is not used.
  */
-struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const struct server *avoid)
+///////////////// Begin edits /////////////////
+struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const struct server *avoid, char *whitelist)
 {
 	struct eb32_node *next, *prev;
 	struct server *nsrv, *psrv;
@@ -329,6 +338,7 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const s
 
 	HA_RWLOCK_RDLOCK(LBPRM_LOCK, &p->lbprm.lock);
 
+	// What is this block
 	if (p->srv_act)
 		root = &p->lbprm.chash.act;
 	else if (p->lbprm.fbck) {
@@ -371,7 +381,7 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const s
 	}
 
 	loop = 0;
-	while (nsrv == avoid || (p->lbprm.hash_balance_factor && !chash_server_is_eligible(nsrv))) {
+	while ((nsrv == avoid || (p->lbprm.hash_balance_factor && !chash_server_is_eligible(nsrv))) && onWhitelist(whitelist, nsrv->id) == 0) {
 		next = eb32_next(next);
 		if (!next) {
 			next = eb32_first(root);
@@ -380,6 +390,7 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const s
 		}
 		nsrv = eb32_entry(next, struct tree_occ, node)->server;
 	}
+	////////////////// End edits //////////////////
 
  out:
 	HA_RWLOCK_RDUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
@@ -515,3 +526,5 @@ int chash_init_server_tree(struct proxy *p)
 	}
 	return 0;
 }
+
+#endif

@@ -1,0 +1,4 @@
+method,url,query,content,avg_size,size_stdev,avg_time,time_stdev
+POST,/wp-profiling/wp-comments-post.php,NULL,833K,834686.0,0.0,774262.0,0.0
+POST,/wp-profiling/wp-comments-post.php,NULL,221K,222110.0,0.0,263890.0,0.0
+GET,/wp-profiling/index.php/2022/07/25/10-images/,NULL,None,384.0,0.0,85667.0,0.0

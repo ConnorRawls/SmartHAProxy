@@ -130,7 +130,7 @@ static int __http_find_header(const struct htx *htx, const void *pattern, struct
 	struct htx_blk *blk = ctx->blk;
 	struct ist n, v;
 	enum htx_blk_type type;
-
+	
 	if (blk) {
 		char *p;
 
@@ -179,6 +179,7 @@ static int __http_find_header(const struct htx *htx, const void *pattern, struct
 				goto match;
 
 			n = htx_get_blk_name(htx, blk);
+
 			switch (flags & HTTP_FIND_FL_MATCH_TYPE) {
 			case HTTP_FIND_FL_MATCH_STR:
 				if (!isteqi(n, name))

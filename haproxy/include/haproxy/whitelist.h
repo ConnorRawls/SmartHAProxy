@@ -7,16 +7,31 @@
 #ifndef WHITELIST
 #define WHITELIST
 
+#include <time.h>
+#include <pthread.h>
+
+typedef struct Lock_T
+{
+    pthread_mutex_t lock;
+} Lock;
+
+extern Lock check;
+
 // Hashed item
 typedef struct Request_T
 {
+    char *key;
+    char *method;
     char *url;
+    char *query;
+    char *content;
     char *servers;
 } Request;
 
 typedef struct ReqCount_T
 {
     int count;
+    clock_t time;
 } ReqCount;
 
 extern ReqCount reqCount;
@@ -32,31 +47,31 @@ typedef struct Whitelist_T
 extern Whitelist whitelist;
 
 // Hashing algorithm
-int hashRequest(char *url);
+int hashRequest(char *key);
 
 // Construct whitelist
 void createWhitelist(int size);
 
 // Create request item in whitelist
-Request *createRequest(char *url, char *servers);
+Request *createRequest(char *method, char *url, char *query, char *content, char *servers);
 
 // Insert request into whitelist
-void insertRequest(char *url, char *servers);
+void insertRequest(char *method, char *url, char *query, char *content, char *servers);
 
 // Fill whitelist with new values
 void updateWhitelist();
 
-// Remove unneeded chars from string
-char *strBurn(char *srvrply_parted);
-
 // Find request's whitelist in table
-char *searchRequest(char *url);
+char *searchRequest(char *key);
 
-// Malloc variable containing request's servers
-char *allocateSrvSize(char *url, char *servers);
+// Return number of elements in string
+int stringLength(char *string);
+
+// Compare server ID to task's whitelist
+int onWhitelist(char *task_wl, char *server_id);
 
 // Display item statistics
-void printRequest(char *url);
+void printRequest(char *method, char *url, char *query, char *content);
 
 // Display contents of hash table
 void printWhitelist();

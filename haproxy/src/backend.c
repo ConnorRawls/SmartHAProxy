@@ -30,6 +30,7 @@
 #include <haproxy/hash.h>
 #include <haproxy/http.h>
 #include <haproxy/http_ana.h>
+#include <haproxy/http_fetch.h>
 #include <haproxy/http_htx.h>
 #include <haproxy/htx.h>
 #include <haproxy/lb_chash.h>
@@ -59,10 +60,15 @@
 #define TRACE_SOURCE &trace_strm
 
 ///////////////// Begin edits /////////////////
-
 #include <haproxy/whitelist.h>
+#include <time.h>
+#include <pthread.h>
+
+#define SRVCOUNT 7
+#define MAX_LINE 1024
 
 ReqCount reqCount;
+Lock check;
 
 ////////////////// End edits //////////////////
 
@@ -173,6 +179,7 @@ void update_backend_weight(struct proxy *px)
 static struct server *get_server_sh(struct proxy *px, const char *addr, int len, const struct server *avoid)
 {
 	unsigned int h, l;
+	char whitelist[] = "1234567";
 
 	if (px->lbprm.tot_weight == 0)
 		return NULL;
@@ -191,7 +198,7 @@ static struct server *get_server_sh(struct proxy *px, const char *addr, int len,
 		h = full_hash(h);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, h, avoid);
+		return chash_get_server_hash(px, h, avoid, whitelist);
 	else
 		return map_get_server_hash(px, h);
 }
@@ -216,6 +223,7 @@ static struct server *get_server_uh(struct proxy *px, char *uri, int uri_len, co
 	int c;
 	int slashes = 0;
 	const char *start, *end;
+	char whitelist[] = "1234567";
 
 	if (px->lbprm.tot_weight == 0)
 		return NULL;
@@ -246,7 +254,7 @@ static struct server *get_server_uh(struct proxy *px, char *uri, int uri_len, co
 		hash = full_hash(hash);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, hash, avoid);
+		return chash_get_server_hash(px, hash, avoid, whitelist);
 	else
 		return map_get_server_hash(px, hash);
 }
@@ -267,6 +275,7 @@ static struct server *get_server_ph(struct proxy *px, const char *uri, int uri_l
 	const char *p;
 	const char *params;
 	int plen;
+	char whitelist[] = "1234567";
 
 	/* when tot_weight is 0 then so is srv_count */
 	if (px->lbprm.tot_weight == 0)
@@ -303,7 +312,7 @@ static struct server *get_server_ph(struct proxy *px, const char *uri, int uri_l
 					hash = full_hash(hash);
 
 				if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-					return chash_get_server_hash(px, hash, avoid);
+					return chash_get_server_hash(px, hash, avoid, whitelist);
 				else
 					return map_get_server_hash(px, hash);
 			}
@@ -332,6 +341,7 @@ static struct server *get_server_ph_post(struct stream *s, const struct server *
 	unsigned int     plen = px->lbprm.arg_len;
 	unsigned long    len;
 	const char      *params, *p, *start, *end;
+	char whitelist[] = "1234567";
 
 	if (px->lbprm.tot_weight == 0)
 		return NULL;
@@ -383,7 +393,7 @@ static struct server *get_server_ph_post(struct stream *s, const struct server *
 					hash = full_hash(hash);
 
 				if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-					return chash_get_server_hash(px, hash, avoid);
+					return chash_get_server_hash(px, hash, avoid, whitelist);
 				else
 					return map_get_server_hash(px, hash);
 			}
@@ -420,6 +430,7 @@ static struct server *get_server_hh(struct stream *s, const struct server *avoid
 	const char *start, *end;
 	struct htx *htx = htxbuf(&s->req.buf);
 	struct http_hdr_ctx ctx = { .blk = NULL };
+	char whitelist[] = "1234567";
 
 	/* tot_weight appears to mean srv_count */
 	if (px->lbprm.tot_weight == 0)
@@ -478,7 +489,7 @@ static struct server *get_server_hh(struct stream *s, const struct server *avoid
 		hash = full_hash(hash);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, hash, avoid);
+		return chash_get_server_hash(px, hash, avoid, whitelist);
 	else
 		return map_get_server_hash(px, hash);
 }
@@ -492,6 +503,7 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 	int              ret;
 	struct sample    smp;
 	int rewind;
+	char whitelist[] = "1234567";
 
 	/* tot_weight appears to mean srv_count */
 	if (px->lbprm.tot_weight == 0)
@@ -523,72 +535,170 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 		hash = full_hash(hash);
  hash_done:
 	if ((px->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_CHTREE)
-		return chash_get_server_hash(px, hash, avoid);
+		return chash_get_server_hash(px, hash, avoid, whitelist);
 	else
 		return map_get_server_hash(px, hash);
 }
 
+///////////////// Begin edits /////////////////
 /* random value  */
-static struct server *get_server_rnd(struct stream *s, const struct server *avoid, const char *uri, int uri_len)
+static struct server *get_server_rnd(struct stream *s, const struct server *avoid, int method_key, const char *uri, int uri_len, char *content)
 {
-	///////////////// Begin edits /////////////////
 	// Below are constructs created by HAProxy. Moved up here to get
 	// the compile warning to shut up.
 	unsigned int hash;
 	struct proxy  *px;
 	struct server *prev, *curr;
 	int draws; // number of draws
-
 	char *url_cpy; //url extracted from the uri
+	char *qry_cpy;
 	const char *url; //pointer to where the url ends
 	char *servers; //list of servers from the whitelist that the request url can use
 	int url_len; //length of url string
+	int qry_len;
+	char *method_name;
+	int method_length;
+	clock_t t2;
+	double elapsed_time;
+	char key[MAX_LINE] = "";
+	char *buffer;
+	char srv_num;
 
+	hash = 0;
+	px = s->be;
+	draws = px->lbprm.arg_opt1;
+	/* tot_weight appears to mean srv_count */
+	if (px->lbprm.tot_weight == 0) return NULL;
+
+	// ***
+	// printf("\n(backend.c) I have received a new task");
+
+	// Update Whitelist
+	pthread_mutex_lock(&check.lock);
+
+	t2 = clock();
+	elapsed_time = howLong(reqCount.time, t2);
 	reqCount.count++;
 
-	if(reqCount.count == 1){
-
+	// Default 10000t || 2s
+	if(reqCount.count == 1000 || elapsed_time >= (double)5){
+		// printf("\nUpdating whitelist.\n");
 		updateWhitelist();
 
-		printf("\nMic check.\n");
-
+		reqCount.time = clock();
 		reqCount.count = 0;
 	}
+
+	pthread_mutex_unlock(&check.lock);
+
+	// Method
+	switch (method_key) {
+		case 1:
+			method_length = sizeof("GET") + 1;
+			method_name = malloc(sizeof(char) * method_length);
+			strncpy(method_name, "GET", method_length);
+			method_name[method_length] = '\0';
+			break;
+		case 3:
+			method_length = sizeof("POST") + 1;
+			method_name = malloc(sizeof(char) * method_length);
+			strncpy(method_name, "POST", method_length);
+			method_name[method_length] = '\0';
+			break;
+		default:
+			method_length = 0;
+			method_name = NULL;
+			break;
+	}
+
+	// ***
+	// printf("\n(backend.c) Method: %s", method_name);
 	
+	// URL + Query
 	url_len = uri_len;
+	qry_len = uri_len;
 	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
-		url_len = url-uri;
+		url_len = url - uri;
+		qry_len = uri_len - url_len;
+		qry_cpy = malloc(sizeof(char) * (qry_len + 1));
+		strncpy(qry_cpy, url, qry_len);
+		qry_cpy[qry_len] = '\0';
+	} else {
+		qry_len = sizeof("NULL");
+		qry_cpy = malloc(sizeof(char) * (qry_len + 1));
+		strcpy(qry_cpy, "NULL");
+		qry_cpy[qry_len] = '\0';
 	}
 
 	url_cpy = malloc(sizeof(char) * (uri_len + 1));
 	strncpy(url_cpy, uri, url_len);
 	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
 
+	// ***
+	// printf("\n(backend.c) URL before operation: %s", url_cpy);
+
+	if(!strcmp(url_cpy, "/wp-profiling/")) {
+		free(url_cpy);
+		buffer = malloc(sizeof("/wp-profiling/index.php"));
+		strcpy(buffer, "/wp-profiling/index.php");
+		url_cpy = buffer;
+	}
+
+	// ***
+	// printf("\n(backend.c) URL: %s", url_cpy);
+	// printf("\n(backend.c) Query: %s", qry_cpy);
+
+	// Content
+	// printf("\n(backend.c) Content: %s", content);
+
+	// Key = Method + URL + Query + Content
+	strcat(strcat(strcat(strcat(key, method_name), url_cpy), qry_cpy), content);
+
+	// ***
+	// printf("\n(backend.c) Key: %s\n", key);
+
+	// ***
+	// printWhitelist();
+
 	servers = NULL;
-	servers = allocateSrvSize(url_cpy, servers); // Hidden malloc, careful
-	servers = searchRequest(url_cpy);
+	servers = searchRequest(key);
+	if(servers != NULL) strcat(servers, "\0");
+	if(strchr(servers, '0') != NULL) {
 
-	printf("\nURL: %s\nServers: %s\n", url_cpy, servers);
+		// ***
+		// printf("\nReturning NULL.\n");
 
-	// Be sure to move this right before the function return
-	free(servers);
+		return NULL;
+	}
+
+	// ***
+	// if(!strcmp(servers, "1234567")) printf("\nNon-default WL detected.\n");
+
+	// ***
+	// printf("\n(backend.c) Servers: %s\n", servers);
+
+	// We're freeeeeee
+	free(method_name);
 	free(url_cpy);
-
-	////////////////// End edits //////////////////
-
+	free(qry_cpy);
+	free(content);
+	
+	// Duplicate below, prob delete later
 	hash = 0;
-	px = s->be;
 	draws = px->lbprm.arg_opt1; // number of draws
 
 	/* tot_weight appears to mean srv_count */
-	if (px->lbprm.tot_weight == 0)
+	if (px->lbprm.tot_weight == 0){
+		// Be sure to move this right before the function return
+		// printf("total weight is zero, returning null");
 		return NULL;
+	}
 
 	curr = NULL;
 	do {
 		prev = curr;
 		hash = statistical_prng();
-		curr = chash_get_server_hash(px, hash, avoid);
+		curr = chash_get_server_hash(px, hash, avoid, servers);
 		if (!curr)
 			break;
 
@@ -598,7 +708,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 		if (prev && prev != curr &&
 			curr->served * prev->cur_eweight > prev->served * curr->cur_eweight)
 			curr = prev;
-	} while (--draws > 0 && (curr->id[2] == '4' || curr->id[2] == '2'));
+	} while (--draws > 0);
 
 	/* if the selected server is full, pretend we have none so that we reach
 		* the backend's queue instead.
@@ -606,12 +716,22 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	if (curr &&
 		(curr->queue.length || (curr->maxconn && curr->served >= srv_dynamic_maxconn(curr))))
 		curr = NULL;
+	
+	// if(curr == NULL) printf("(backend.c) Chosen server was NULL\n");
 
-	if(curr == NULL){
-		printf("chosen server was NULL\n");
-	}else{
-		printf("id: %s\n", curr->id);
-	}
+	// ***
+	if(curr == NULL || curr->id == NULL) srv_num = '0';
+	else if(strcmp(curr->id, "WP-Host") == 0) srv_num = '1';
+	else srv_num = curr->id[strlen(curr->id) - 1];
+	if(servers != NULL) logDispatch(key, servers, srv_num);
+	// if(strchr(servers, srv_num) == NULL) {
+	// 	printf("\n*** Incorrect dispatch found.");
+	// 	printf("\nWL: %s", servers);
+	// 	printf("\nDispatch: %c\n", srv_num);
+	// }
+	// ***
+
+	////////////////// End edits //////////////////
 
 	return curr;
 }
@@ -647,6 +767,24 @@ int assign_server(struct stream *s)
 	struct server *conn_slot;
 	struct server *srv = NULL, *prev_srv;
 	int err;
+
+	// ***
+	struct ist uri;
+	int method_key;
+	char *content;
+	clock_t start_time, end_time;
+	double elapsed_time;
+	struct htx *htx;
+	struct http_hdr_ctx ctx = { .blk = NULL };
+
+	uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
+
+	method_key = s->txn->meth;
+
+	htx = htxbuf(&s->req.buf);
+
+	content = findContent(htx, &ctx);
+	// ***
 
 	DPRINTF(stderr,"assign_server : s=%p\n",s);
 
@@ -723,7 +861,19 @@ int assign_server(struct stream *s)
 		 */
 		switch (s->be->lbprm.algo & BE_LB_LKUP) {
 		case BE_LB_LKUP_RRTREE:
-			srv = fwrr_get_next_server(s->be, prev_srv);
+
+			// ***
+			start_time = clock();
+			// ***
+
+			srv = fwrr_get_next_server(s->be, prev_srv, method_key, uri.ptr, uri.len);
+
+			// ***
+			end_time = clock();
+			elapsed_time = howLong(start_time, end_time);
+			logTime(elapsed_time);
+			// ***
+			
 			break;
 
 		case BE_LB_LKUP_FSTREE:
@@ -731,7 +881,7 @@ int assign_server(struct stream *s)
 			break;
 
 		case BE_LB_LKUP_LCTREE:
-			srv = fwlc_get_next_server(s->be, prev_srv);
+			srv = fwlc_get_next_server(s->be, prev_srv, method_key, uri.ptr, uri.len);
 			break;
 
 		case BE_LB_LKUP_CHTREE:
@@ -740,9 +890,17 @@ int assign_server(struct stream *s)
 				/* static-rr (map) or random (chash) */
 				if ((s->be->lbprm.algo & BE_LB_PARM) == BE_LB_RR_RANDOM)
 				{
-					struct ist uri;
-					uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
-					srv = get_server_rnd(s, prev_srv, uri.ptr, uri.len);
+					// ***
+					// start_time = clock();
+					// ***
+
+					srv = get_server_rnd(s, prev_srv, method_key, uri.ptr, uri.len, content);
+
+					// ***
+					// end_time = clock();
+					// elapsed_time = howLong(start_time, end_time);
+					// logTime(elapsed_time);
+					// ***
 				}
 				else
 					srv = map_get_server_rr(s->be, prev_srv);
@@ -3230,3 +3388,99 @@ INITCALL1(STG_REGISTER, acl_register_keywords, &acl_kws);
  *  c-basic-offset: 8
  * End:
  */
+
+// - Custom Utilities -
+double howLong(clock_t start, clock_t end)
+{
+	double elapsed_clock, elapsed_time;
+
+	elapsed_clock = end - start;
+	elapsed_time = (double)elapsed_clock / CLOCKS_PER_SEC;
+
+	return elapsed_time;
+}
+
+void logDispatch(char *task_key, char *servers, char srv_num)
+{
+	FILE *log_file;
+	char *srv_cpy;
+
+	srv_cpy = malloc(strlen(servers));
+	strcpy(srv_cpy, servers);
+	srv_cpy[strlen(srv_cpy) - 1] = '\0';
+
+	log_file = NULL;
+    log_file = fopen("/Smartdrop/logs/dispatch.log", "a");
+    if (log_file == NULL)
+    {
+        printf("Error! can't open log file.");
+		return;
+    }
+
+    fprintf(log_file, "%s,%s,%c\n", task_key, srv_cpy, srv_num);
+    fclose(log_file);
+	free(srv_cpy);
+
+	return;
+}
+
+void logTime(double data)
+{
+	FILE *log_file;
+
+	log_file = NULL;
+    log_file = fopen("/Smartdrop/logs/algorithmTimes.log", "a");
+    if (log_file == NULL)
+    {
+        printf("Error! can't open log file.");
+		return;
+    }
+
+    fprintf(log_file, "%lf\n", data);
+    fclose(log_file);
+
+	return;
+}
+
+char *findContent(const struct htx *htx, struct http_hdr_ctx *ctx)
+{
+	struct htx_blk *blk = ctx->blk;
+	struct ist n;
+	char *word_start;
+	char *content;
+
+	// ***
+	// printf("\nFinding content.\n");
+
+	for (blk = htx_get_first_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
+		n = htx_get_blk_name(htx, blk);
+
+		word_start = strstr(n.ptr, "file");
+
+		if(word_start != NULL) {
+			// ***
+			// printf("\nHeader found: %s\n", word_start);
+
+			content = malloc(sizeof(char) * 5);
+
+			strncpy(content, word_start + 4, 4);
+
+			content[4] = '\0';
+
+			// ***
+			// printf("\nContent copied: %s\n", content);
+			// printf("\nSize of content: %zu\n", strlen(content));
+
+			// What does this stuff do?
+			ctx->blk   = NULL;
+			ctx->value = ist("");
+			ctx->lws_before = ctx->lws_after = 0;
+
+			return content;
+		}
+	}
+
+	content = malloc(sizeof("NULL"));
+	strcpy(content, "NULL");
+	return content;
+}

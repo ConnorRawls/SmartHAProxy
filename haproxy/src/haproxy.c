@@ -143,10 +143,12 @@
 
 #include <haproxy/whitelist.h>
 #include <haproxy/sdsock.h>
+#include <pthread.h>
 
 #define CAPACITY 100 // Number of possible preprofiled requests
 
 ReqCount reqCount;
+Lock check;
 
 ////////////////// End edits //////////////////
 
@@ -2886,14 +2888,20 @@ int main(int argc, char **argv)
 
 	// Create sdsock
 	SDSock_Make();
-	printf("\nConnected to Smartdrop.");
+	printf("\n- Connected to Smartdrop -");
 
 	// Initialize request counter
 	reqCount.count = 0;
+	reqCount.time = clock();
+
+	if(pthread_mutex_init(&check.lock, NULL) != 0) {
+        printf("\nLock init has failed :(\n");
+    }
 
 	// Construct whitelist
-	createWhitelist(CAPACITY);
-	printf("\nWhitelist initialized.");
+	createWhitelist(CAPACITY); // CAPACITY = 100
+	updateWhitelist();
+	printf("\n- Whitelist initialized -\n\n");
 
 	////////////////// End edits //////////////////
 
@@ -3517,6 +3525,7 @@ int main(int argc, char **argv)
 	// Destroy whitelist and sdsock
 	freeWhitelist();
 	SDSock_Destroy();
+	pthread_mutex_destroy(&check.lock);
 
 	////////////////// End edits //////////////////
 

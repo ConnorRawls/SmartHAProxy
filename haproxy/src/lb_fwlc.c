@@ -16,6 +16,19 @@
 #include <haproxy/queue.h>
 #include <haproxy/server-t.h>
 
+///////////////// Begin edits /////////////////
+#include <haproxy/whitelist.h>
+#include <time.h>
+#include <pthread.h>
+
+#define SRVCOUNT 7
+#define MAX_LINE 1024
+
+ReqCount reqCount;
+Lock check;
+
+////////////////// End edits //////////////////
+
 
 /* Remove a server from a tree. It must have previously been dequeued. This
  * function is meant to be called when a server is going down or has its
@@ -312,17 +325,109 @@ void fwlc_init_server_tree(struct proxy *p)
 	}
 }
 
+///////////////// Begin edits /////////////////
+
 /* Return next server from the FWLC tree in backend <p>. If the tree is empty,
  * return NULL. Saturated servers are skipped.
  *
  * The lbprm's lock will be used in R/O mode. The server's lock is not used.
  */
-struct server *fwlc_get_next_server(struct proxy *p, struct server *srvtoavoid)
+struct server *fwlc_get_next_server(struct proxy *p, struct server *srvtoavoid, int method_key, const char *uri, int uri_len)
 {
 	struct server *srv, *avoided;
 	struct eb32_node *node;
+	char *url_cpy; //url extracted from the uri
+	char *qry_cpy;
+	const char *url; //pointer to where the url ends
+	char *servers; //list of servers from the whitelist that the request url can use
+	int url_len; //length of url string
+	int qry_len;
+	char *method_name;
+	int method_length;
+	clock_t t2;
+	double elapsed_time;
+	char key[MAX_LINE] = "";
+	char *buffer;
+	char srv_num;
+	srv_num = 0;
 
 	srv = avoided = NULL;
+
+	// Update Whitelist
+	pthread_mutex_lock(&check.lock);
+
+	t2 = clock();
+	elapsed_time = howLong(reqCount.time, t2);
+	reqCount.count++;
+
+	if(reqCount.count == 10000 || elapsed_time >= (double)2){
+		printf("\nUpdating whitelist.\n");
+		updateWhitelist();
+
+		reqCount.time = clock();
+		reqCount.count = 0;
+	}
+
+	pthread_mutex_unlock(&check.lock);
+
+	// Method
+	switch (method_key) {
+		case 1:
+			method_length = sizeof("GET") + 1;
+			method_name = malloc(sizeof(char) * method_length);
+			strncpy(method_name, "GET", method_length);
+			method_name[method_length] = '\0';
+			break;
+		case 3:
+			method_length = sizeof("POST") + 1;
+			method_name = malloc(sizeof(char) * method_length);
+			strncpy(method_name, "POST", method_length);
+			method_name[method_length] = '\0';
+			break;
+		default:
+			method_length = 0;
+			method_name = NULL;
+			break;
+	}
+
+	// URL + Query
+	url_len = uri_len;
+	qry_len = uri_len;
+	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
+		url_len = url - uri;
+		qry_len = uri_len - url_len;
+		qry_cpy = malloc(sizeof(char) * (qry_len + 1));
+		strncpy(qry_cpy, url, qry_len);
+		qry_cpy[qry_len] = '\0';
+	} else {
+		qry_len = sizeof("NULL");
+		qry_cpy = malloc(sizeof(char) * (qry_len + 1));
+		strcpy(qry_cpy, "NULL");
+		qry_cpy[qry_len] = '\0';
+	}
+
+	url_cpy = malloc(sizeof(char) * (uri_len + 1));
+	strncpy(url_cpy, uri, url_len);
+	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
+
+	if(!strcmp(url_cpy, "/wp-profiling/")) {
+		free(url_cpy);
+		buffer = malloc(sizeof("/wp-profiling/index.php"));
+		strcpy(buffer, "/wp-profiling/index.php");
+		url_cpy = buffer;
+	}
+
+	// Search for task's WL
+	strcat(strcat(strcat(key, method_name), url_cpy), qry_cpy);
+	servers = NULL;
+	servers = searchRequest(key);
+	if(servers != NULL) strcat(servers, "\0");
+	if(strchr(servers, '0') != NULL) return NULL;
+
+	// We're freeeeeee
+	free(method_name);
+	free(url_cpy);
+	free(qry_cpy);
 
 	HA_RWLOCK_RDLOCK(LBPRM_LOCK, &p->lbprm.lock);
 	if (p->srv_act)
@@ -347,8 +452,11 @@ struct server *fwlc_get_next_server(struct proxy *p, struct server *srvtoavoid)
 		struct server *s;
 
 		s = eb32_entry(node, struct server, lb_node);
+		if(s == NULL || s->id == NULL) srv_num = '0';
+		else if(strcmp(s->id, "WP-Host") == 0) srv_num = '1';
+		else srv_num = s->id[strlen(s->id) - 1];
 		if (!s->maxconn || s->served + s->queue.length < srv_dynamic_maxconn(s) + s->maxqueue) {
-			if (s != srvtoavoid) {
+			if (s != srvtoavoid || strchr(servers, srv_num) != NULL) {
 				srv = s;
 				break;
 			}
@@ -361,9 +469,13 @@ struct server *fwlc_get_next_server(struct proxy *p, struct server *srvtoavoid)
 		srv = avoided;
  out:
 	HA_RWLOCK_RDUNLOCK(LBPRM_LOCK, &p->lbprm.lock);
+
+	if(servers != NULL) logDispatch(key, servers, srv_num);
+
 	return srv;
 }
 
+////////////////// End edits //////////////////
 
 /*
  * Local variables:

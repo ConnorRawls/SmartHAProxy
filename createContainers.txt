@@ -1,0 +1,8 @@
+>GBDT-Enhanced HAProxy
+docker run -it -p 80:80 -v Whitelist:/Whitelist --net smartdrop --name haproxy haproxy:sd
+
+>Default Haproxy
+docker run -it -p 80:80 --name haproxy haproxy2.5:sd
+
+>Smartdrop
+docker run -it --volumes-from haproxy --net smartdrop --name smartdrop smartdrop:latest

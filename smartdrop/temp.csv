@@ -1,0 +1,15 @@
+,2
+Size,384.0
+SizeStdev,0.0
+Time,85667.0
+TimeStdev,0.0
+Server,7
+Workload,0.0
+CPU,0.0
+Method_GET,1
+Method_POST,0
+URL_/wp-profiling/index.php/2022/07/25/10-images/,1
+URL_/wp-profiling/wp-comments-post.php,0
+Content_221K,0
+Content_833K,0
+Content_None,1
