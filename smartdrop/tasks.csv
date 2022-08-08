@@ -1,4 +1,25 @@
+<<<<<<< HEAD
 method,url,query,content,avg_size,size_stdev,avg_time,time_stdev
 POST,/wp-profiling/wp-comments-post.php,NULL,833K,834686.0,0.0,774262.0,0.0
 POST,/wp-profiling/wp-comments-post.php,NULL,221K,222110.0,0.0,263890.0,0.0
 GET,/wp-profiling/index.php/2022/07/25/10-images/,NULL,None,384.0,0.0,85667.0,0.0
+=======
+url,query,method,bytes,bytes stdev,service time,service time stdev
+/wp-profiling/index.php/cart/,,GET,428.0,2.016877936358443,109187.23333333334,107896.30323026916
+/wp-profiling/index.php,?wc-ajax=add_to_cart,POST,532.0,0.0,76500.7,9455.721211905951
+/wp-profiling/index.php/checkout/,,GET,433.0,0.0,66481.0,25020.857708774867
+/wp-profiling/index.php/my-account/,,GET,418.0,0.0,88596.4,10248.962788900926
+/wp-profiling/index.php,,GET,322.0,0.0,89278.5,18764.54332851152
+/wp-profiling/index.php/sample-page/,,GET,416.0,0.0,90786.86666666667,19654.316252694203
+/wp-profiling/index.php/shop/,,GET,394.0,0.0,84083.66666666667,9135.896801508656
+/wp-profiling/index.php/product/testproduct01/,,GET,426.0,0.0,107194.33333333333,33412.3586936221
+/wp-profiling/index.php/my-account/lost-password/,,POST,705.0,0.0,86935.16666666667,8609.854094175378
+/wp-profiling/wp-content/plugins/woocommerce/assets/images/placeholder.png,,GET,353.0,0.0,383.96666666666664,51.14110522542665
+/wp-profiling/index.php/2020/11/,,GET,419.0,0.0,90393.13333333333,18864.432385390992
+/wp-profiling/index.php/my-account/lost-password/,,GET,435.0,0.0,90759.9,22369.975700740582
+/wp-profiling/index.php/2021/01/04/nulla-iure-corrupti-nihil-mollitia/,,GET,435.0,0.0,257032.13333333333,12531.490322613154
+/wp-profiling/index.php/category/uncategorized/,,GET,412.0,0.0,93130.4,18159.067894580934
+/wp-profiling/index.php/2020/11/25/hello-world/,,GET,401.0,0.0,264355.73333333334,11640.859643376069
+/wp-profiling/index.php,?wc-ajax=get_refreshed_fragments,POST,485.44736842105266,21.251006168129894,68008.94736842105,40017.32671416853
+/wp-profiling/index.php/cart/,,POST,676.0,0.0,97233.36666666667,29347.10269960085
+>>>>>>> 2106e7a9a24672a80622b8cd5ddbad0a09bae26b
