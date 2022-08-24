@@ -158,7 +158,11 @@ void set_backend_down(struct proxy *be);
  */
 
 // - Custom Utilities -
+char *fetchKey(struct stream *s);
+char *fetchMethod(struct stream *s);
+char *fetchUrlQry(struct stream *s);
+char *fetchContent(struct stream *s);
+char *normal(char *content_buff);
 double howLong(clock_t start, clock_t end);
 void logDispatch(char *task_key, char *servers, char srv_num);
 void logTime(double data);
-char *findContent(const struct htx *htx, struct http_hdr_ctx *ctx);

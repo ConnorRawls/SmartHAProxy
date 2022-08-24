@@ -542,7 +542,7 @@ static struct server *get_server_rch(struct stream *s, const struct server *avoi
 
 ///////////////// Begin edits /////////////////
 /* random value  */
-static struct server *get_server_rnd(struct stream *s, const struct server *avoid, int method_key, const char *uri, int uri_len, char *content)
+static struct server *get_server_rnd(struct stream *s, const struct server *avoid, char *key)
 {
 	// Below are constructs created by HAProxy. Moved up here to get
 	// the compile warning to shut up.
@@ -550,18 +550,10 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	struct proxy  *px;
 	struct server *prev, *curr;
 	int draws; // number of draws
-	char *url_cpy; //url extracted from the uri
-	char *qry_cpy;
-	const char *url; //pointer to where the url ends
+
 	char *servers; //list of servers from the whitelist that the request url can use
-	int url_len; //length of url string
-	int qry_len;
-	char *method_name;
-	int method_length;
 	clock_t t2;
 	double elapsed_time;
-	char key[MAX_LINE] = "";
-	char *buffer;
 	char srv_num;
 
 	hash = 0;
@@ -591,75 +583,6 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 
 	pthread_mutex_unlock(&check.lock);
 
-	// Method
-	switch (method_key) {
-		case 1:
-			method_length = sizeof("GET") + 1;
-			method_name = malloc(sizeof(char) * method_length);
-			strncpy(method_name, "GET", method_length);
-			method_name[method_length] = '\0';
-			break;
-		case 3:
-			method_length = sizeof("POST") + 1;
-			method_name = malloc(sizeof(char) * method_length);
-			strncpy(method_name, "POST", method_length);
-			method_name[method_length] = '\0';
-			break;
-		default:
-			method_length = 0;
-			method_name = NULL;
-			break;
-	}
-
-	// ***
-	// printf("\n(backend.c) Method: %s", method_name);
-	
-	// URL + Query
-	url_len = uri_len;
-	qry_len = uri_len;
-	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
-		url_len = url - uri;
-		qry_len = uri_len - url_len;
-		qry_cpy = malloc(sizeof(char) * (qry_len + 1));
-		strncpy(qry_cpy, url, qry_len);
-		qry_cpy[qry_len] = '\0';
-	} else {
-		qry_len = sizeof("NULL");
-		qry_cpy = malloc(sizeof(char) * (qry_len + 1));
-		strcpy(qry_cpy, "NULL");
-		qry_cpy[qry_len] = '\0';
-	}
-
-	url_cpy = malloc(sizeof(char) * (uri_len + 1));
-	strncpy(url_cpy, uri, url_len);
-	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
-
-	// ***
-	// printf("\n(backend.c) URL before operation: %s", url_cpy);
-
-	if(!strcmp(url_cpy, "/wp-profiling/")) {
-		free(url_cpy);
-		buffer = malloc(sizeof("/wp-profiling/index.php"));
-		strcpy(buffer, "/wp-profiling/index.php");
-		url_cpy = buffer;
-	}
-
-	// ***
-	// printf("\n(backend.c) URL: %s", url_cpy);
-	// printf("\n(backend.c) Query: %s", qry_cpy);
-
-	// Content
-	// printf("\n(backend.c) Content: %s", content);
-
-	// Key = Method + URL + Query + Content
-	strcat(strcat(strcat(strcat(key, method_name), url_cpy), qry_cpy), content);
-
-	// ***
-	// printf("\n(backend.c) Key: %s\n", key);
-
-	// ***
-	// printWhitelist();
-
 	servers = NULL;
 	servers = searchRequest(key);
 	if(servers != NULL) strcat(servers, "\0");
@@ -678,11 +601,8 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	// printf("\n(backend.c) Servers: %s\n", servers);
 
 	// We're freeeeeee
-	free(method_name);
-	free(url_cpy);
-	free(qry_cpy);
-	free(content);
-	
+	free(key);
+
 	// Duplicate below, prob delete later
 	hash = 0;
 	draws = px->lbprm.arg_opt1; // number of draws
@@ -768,23 +688,11 @@ int assign_server(struct stream *s)
 	struct server *srv = NULL, *prev_srv;
 	int err;
 
-	// ***
-	struct ist uri;
-	int method_key;
-	char *content;
-	clock_t start_time, end_time;
-	double elapsed_time;
-	struct htx *htx;
-	struct http_hdr_ctx ctx = { .blk = NULL };
-
-	uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
-
-	method_key = s->txn->meth;
-
-	htx = htxbuf(&s->req.buf);
-
-	content = findContent(htx, &ctx);
-	// ***
+	///////////////// Begin edits /////////////////
+	char *key;
+	key = fetchKey(s);
+	requestCount++;
+	////////////////// End edits //////////////////
 
 	DPRINTF(stderr,"assign_server : s=%p\n",s);
 
@@ -894,7 +802,7 @@ int assign_server(struct stream *s)
 					// start_time = clock();
 					// ***
 
-					srv = get_server_rnd(s, prev_srv, method_key, uri.ptr, uri.len, content);
+					srv = get_server_rnd(s, prev_srv, key);
 
 					// ***
 					// end_time = clock();
@@ -3442,15 +3350,134 @@ void logTime(double data)
 	return;
 }
 
-char *findContent(const struct htx *htx, struct http_hdr_ctx *ctx)
+char *fetchKey(struct stream *s)
 {
-	struct htx_blk *blk = ctx->blk;
-	struct ist n;
-	char *word_start;
-	char *content;
+	int m_len, u_len, c_len;
+	size_t m_size, u_size, c_size;
+	char *method, *url, *content, *key;
+	UrlQry url_qry;
+
+	// Method
+	method = fetchMethod(s);
+	m_len = strlen(method);
+	m_size = m_len * sizeof(char);
 
 	// ***
-	// printf("\nFinding content.\n");
+	printf("\nMethod: %s\n", method);
+
+	// URL
+	url = fetchUrl(s);
+	u_len = strlen(url);
+	u_size = u_len * sizeof(char);
+
+	// ***
+	printf("\nURL: %s\n", url);
+
+	// Content
+	content = fetchContent(s);
+	c_len = strlen(content);
+	c_size = c_len * sizeof(char);
+
+	printf("\nContent: %s\n", content);
+
+	// Concatenate key
+	key = malloc(m_size + u_size + c_size + 1);
+	strcat(strcat(strcat(key, method), url), content);
+	key[strlen(key)] = '\0';
+
+	// ***
+	printf("\nKey: %s\n", key);
+
+	// We're freeeeeee
+	free(method);
+	free(url);
+	free(content);
+
+	return key;
+}
+
+char *fetchMethod(struct stream *s)
+{
+	int method_key;
+	char *method_name;
+	int method_length;
+
+	method_key = s->txn->meth;
+
+	// Method
+	switch (method_key) {
+		case 1:
+			method_length = sizeof("GET") + 1;
+			method_name = malloc(sizeof(char) * method_length);
+			strncpy(method_name, "GET", method_length);
+			method_name[method_length] = '\0';
+			break;
+		case 3:
+			method_length = sizeof("POST") + 1;
+			method_name = malloc(sizeof(char) * method_length);
+			strncpy(method_name, "POST", method_length);
+			method_name[method_length] = '\0';
+			break;
+		default:
+			method_length = 0;
+			method_name = NULL;
+			break;
+	}
+
+	return method_name;
+}
+
+char *fetchUrl(struct stream *s)
+{
+	struct ist uri;
+	const char *uri_ptr;
+	int uri_len, url_len;
+	// Pointer to where the url ends
+	const char *url;
+	char *url_cpy, *buffer;
+	
+	uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
+	
+	uri_ptr = uri.ptr;
+	uri_len = uri.len;
+	url_len = uri_len;
+
+	// If ? is found in the url
+	if((url = memchr(uri_ptr, '?', uri_len)) != NULL){
+		url_len = url - uri_ptr;
+	}
+
+	url_cpy = malloc(sizeof(char) * (uri_len + 1));
+	strncpy(url_cpy, uri_ptr, url_len);
+	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
+
+	if(!strcmp(url_cpy, "/wp-profiling/")) {
+		free(url_cpy);
+		buffer = malloc(sizeof("/wp-profiling/index.php"));
+		strcpy(buffer, "/wp-profiling/index.php");
+		url_cpy = buffer;
+	}
+
+	// ***
+	// printf("\n(backend.c) URL inside fetch: %s", url_cpy);
+
+	return url_cpy;
+}
+
+char *fetchContent(struct stream *s)
+{
+	struct ist n;
+	char *word_start;
+	char *content, *content_buff;
+	struct htx *htx;
+	struct htx_blk *blk;
+	struct http_hdr_ctx *ctx_ptr;
+	struct http_hdr_ctx ctx = { .blk = NULL };
+
+	ctx_ptr = &ctx;
+	blk = ctx_ptr->blk;
+
+	htx = htxbuf(&s->req.buf);
 
 	for (blk = htx_get_first_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
 		n = htx_get_blk_name(htx, blk);
@@ -3458,23 +3485,20 @@ char *findContent(const struct htx *htx, struct http_hdr_ctx *ctx)
 		word_start = strstr(n.ptr, "file");
 
 		if(word_start != NULL) {
-			// ***
-			// printf("\nHeader found: %s\n", word_start);
+			content_buff = malloc(sizeof(char) * 5);
 
-			content = malloc(sizeof(char) * 5);
+			strncpy(content_buff, word_start + 4, 4);
 
-			strncpy(content, word_start + 4, 4);
-
-			content[4] = '\0';
-
-			// ***
-			// printf("\nContent copied: %s\n", content);
-			// printf("\nSize of content: %zu\n", strlen(content));
+			content_buff[4] = '\0';
 
 			// What does this stuff do?
-			ctx->blk   = NULL;
-			ctx->value = ist("");
-			ctx->lws_before = ctx->lws_after = 0;
+			ctx_ptr->blk   = NULL;
+			ctx_ptr->value = ist("");
+			ctx_ptr->lws_before = ctx_ptr->lws_after = 0;
+
+			if(strcmp(content_buff, "None") == 0) return '0';
+
+			content = normal(content_buff);
 
 			return content;
 		}
@@ -3482,5 +3506,75 @@ char *findContent(const struct htx *htx, struct http_hdr_ctx *ctx)
 
 	content = malloc(sizeof("NULL"));
 	strcpy(content, "NULL");
+	return content;
+}
+
+// MESSY
+char *normal(char *content_buff)
+{
+	int i;
+	char *content;
+	char buffer[5];
+
+	switch(content_buff) {
+		case "1.9M" :
+			i = 1900;
+			break;
+		case "49.K" :
+			i = 49;
+			break;
+		case "221K" :
+			i = 221;
+			break;
+		case "833K" :
+			i = 833;
+			break;
+		case "1.2M" :
+			i = 1200;
+			break;
+		case "1.5M" :
+			i = 1500;
+			break;
+		case "2.0M" :
+			i = 2 * 1000;
+			break;
+		case "1.0M" :
+			i = 1000;
+			break;
+		case "898K" :
+			i = 898;
+			break;
+		case "432K" :
+			i = 432;
+			break;
+		case "376K" :
+			i = 376;
+			break;
+		case "116K" :
+			i = 116;
+			break;
+		case "482K" :
+			i = 482;
+			break;
+		case "196K" :
+			i = 196;
+			break;
+		case "110K" :
+			i = 110;
+			break;
+		case "304K" :
+			i = 304;
+			break;
+		case "636K" :
+			i = 636;
+			break;
+		default :
+			i = 0;
+			break;
+	}
+
+	itoa(i, buffer, 10);
+	content = c;
+
 	return content;
 }
