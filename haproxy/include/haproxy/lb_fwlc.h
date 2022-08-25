@@ -27,7 +27,7 @@
 #include <haproxy/proxy-t.h>
 #include <haproxy/server-t.h>
 
-struct server *fwlc_get_next_server(struct proxy *p, struct server *srvtoavoid, int method_key, const char *uri, int uri_len);
+struct server *fwlc_get_next_server(struct proxy *p, struct server *srvtoavoid, char *key);
 void fwlc_init_server_tree(struct proxy *p);
 
 #endif /* _HAPROXY_LB_FWLC_H */

@@ -774,7 +774,7 @@ int assign_server(struct stream *s)
 			start_time = clock();
 			// ***
 
-			srv = fwrr_get_next_server(s->be, prev_srv, method_key, uri.ptr, uri.len);
+			srv = fwrr_get_next_server(s->be, prev_srv, key);
 
 			// ***
 			end_time = clock();
@@ -789,7 +789,7 @@ int assign_server(struct stream *s)
 			break;
 
 		case BE_LB_LKUP_LCTREE:
-			srv = fwlc_get_next_server(s->be, prev_srv, method_key, uri.ptr, uri.len);
+			srv = fwlc_get_next_server(s->be, prev_srv, key);
 			break;
 
 		case BE_LB_LKUP_CHTREE:

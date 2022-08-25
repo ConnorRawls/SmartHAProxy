@@ -522,22 +522,14 @@ static inline void fwrr_update_position(struct fwrr_group *grp, struct server *s
  *
  * The lbprm's lock will be used in R/W mode. The server's lock is not used.
  */
-struct server *fwrr_get_next_server(struct proxy *p, struct server *srvtoavoid, int method_key, const char *uri, int uri_len)
+struct server *fwrr_get_next_server(struct proxy *p, struct server *srvtoavoid, char *key)
 {
 	struct server *srv, *full, *avoided;
 	struct fwrr_group *grp;
 	int switched;
-	char *url_cpy; //url extracted from the uri
-	char *qry_cpy;
-	const char *url; //pointer to where the url ends
 	char *servers; //list of servers from the whitelist that the request url can use
-	int url_len; //length of url string
-	int qry_len;
-	char *method_name;
-	int method_length;
 	clock_t t2;
 	double elapsed_time;
-	char key[MAX_LINE] = "";
 	char *buffer;
 	char srv_num;
 	srv_num = '0';
@@ -559,64 +551,14 @@ struct server *fwrr_get_next_server(struct proxy *p, struct server *srvtoavoid, 
 
 	pthread_mutex_unlock(&check.lock);
 
-	// Method
-	switch (method_key) {
-		case 1:
-			method_length = sizeof("GET") + 1;
-			method_name = malloc(sizeof(char) * method_length);
-			strncpy(method_name, "GET", method_length);
-			method_name[method_length] = '\0';
-			break;
-		case 3:
-			method_length = sizeof("POST") + 1;
-			method_name = malloc(sizeof(char) * method_length);
-			strncpy(method_name, "POST", method_length);
-			method_name[method_length] = '\0';
-			break;
-		default:
-			method_length = 0;
-			method_name = NULL;
-			break;
-	}
-
-	// URL + Query
-	url_len = uri_len;
-	qry_len = uri_len;
-	if((url = memchr(uri, '?', uri_len)) != NULL){ // if ? is found in the url
-		url_len = url - uri;
-		qry_len = uri_len - url_len;
-		qry_cpy = malloc(sizeof(char) * (qry_len + 1));
-		strncpy(qry_cpy, url, qry_len);
-		qry_cpy[qry_len] = '\0';
-	} else {
-		qry_len = sizeof("NULL");
-		qry_cpy = malloc(sizeof(char) * (qry_len + 1));
-		strcpy(qry_cpy, "NULL");
-		qry_cpy[qry_len] = '\0';
-	}
-
-	url_cpy = malloc(sizeof(char) * (uri_len + 1));
-	strncpy(url_cpy, uri, url_len);
-	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
-
-	if(!strcmp(url_cpy, "/wp-profiling/")) {
-		free(url_cpy);
-		buffer = malloc(sizeof("/wp-profiling/index.php"));
-		strcpy(buffer, "/wp-profiling/index.php");
-		url_cpy = buffer;
-	}
-
 	// Look up task's WL
-	strcat(strcat(strcat(key, method_name), url_cpy), qry_cpy);
 	servers = NULL;
 	servers = searchRequest(key);
 	if(servers != NULL) strcat(servers, "\0");
 	if(strchr(servers, '0') != NULL) return NULL;
 
 	// We're freeeeeee
-	free(method_name);
-	free(url_cpy);
-	free(qry_cpy);
+	free(key);
 
 	HA_RWLOCK_WRLOCK(LBPRM_LOCK, &p->lbprm.lock);
 	if (p->srv_act)
