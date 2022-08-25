@@ -3352,10 +3352,9 @@ void logTime(double data)
 
 char *fetchKey(struct stream *s)
 {
-	int m_len, u_len, c_len;
-	size_t m_size, u_size, c_size;
-	char *method, *url, *content, *key;
-	UrlQry url_qry;
+	int m_len;
+	size_t m_size;
+	char *method, *key;
 
 	// Method
 	method = fetchMethod(s);
@@ -3365,24 +3364,9 @@ char *fetchKey(struct stream *s)
 	// ***
 	printf("\nMethod: %s\n", method);
 
-	// URL
-	url = fetchUrl(s);
-	u_len = strlen(url);
-	u_size = u_len * sizeof(char);
-
-	// ***
-	printf("\nURL: %s\n", url);
-
-	// Content
-	content = fetchContent(s);
-	c_len = strlen(content);
-	c_size = c_len * sizeof(char);
-
-	printf("\nContent: %s\n", content);
-
 	// Concatenate key
-	key = malloc(m_size + u_size + c_size + 1);
-	strcat(strcat(strcat(key, method), url), content);
+	key = malloc(m_size + 1);
+	strcat(key, method);
 	key[strlen(key)] = '\0';
 
 	// ***
@@ -3390,191 +3374,6 @@ char *fetchKey(struct stream *s)
 
 	// We're freeeeeee
 	free(method);
-	free(url);
-	free(content);
 
 	return key;
-}
-
-char *fetchMethod(struct stream *s)
-{
-	int method_key;
-	char *method_name;
-	int method_length;
-
-	method_key = s->txn->meth;
-
-	// Method
-	switch (method_key) {
-		case 1:
-			method_length = sizeof("GET") + 1;
-			method_name = malloc(sizeof(char) * method_length);
-			strncpy(method_name, "GET", method_length);
-			method_name[method_length] = '\0';
-			break;
-		case 3:
-			method_length = sizeof("POST") + 1;
-			method_name = malloc(sizeof(char) * method_length);
-			strncpy(method_name, "POST", method_length);
-			method_name[method_length] = '\0';
-			break;
-		default:
-			method_length = 0;
-			method_name = NULL;
-			break;
-	}
-
-	return method_name;
-}
-
-char *fetchUrl(struct stream *s)
-{
-	struct ist uri;
-	const char *uri_ptr;
-	int uri_len, url_len;
-	// Pointer to where the url ends
-	const char *url;
-	char *url_cpy, *buffer;
-	
-	uri = htx_sl_req_uri(http_get_stline(htxbuf(&s->req.buf)));
-	
-	uri_ptr = uri.ptr;
-	uri_len = uri.len;
-	url_len = uri_len;
-
-	// If ? is found in the url
-	if((url = memchr(uri_ptr, '?', uri_len)) != NULL){
-		url_len = url - uri_ptr;
-	}
-
-	url_cpy = malloc(sizeof(char) * (uri_len + 1));
-	strncpy(url_cpy, uri_ptr, url_len);
-	url_cpy[url_len] = '\0'; //adds an ending \0 (null character)
-
-	if(!strcmp(url_cpy, "/wp-profiling/")) {
-		free(url_cpy);
-		buffer = malloc(sizeof("/wp-profiling/index.php"));
-		strcpy(buffer, "/wp-profiling/index.php");
-		url_cpy = buffer;
-	}
-
-	// ***
-	// printf("\n(backend.c) URL inside fetch: %s", url_cpy);
-
-	return url_cpy;
-}
-
-char *fetchContent(struct stream *s)
-{
-	struct ist n;
-	char *word_start;
-	char *content, *content_buff;
-	struct htx *htx;
-	struct htx_blk *blk;
-	struct http_hdr_ctx *ctx_ptr;
-	struct http_hdr_ctx ctx = { .blk = NULL };
-
-	ctx_ptr = &ctx;
-	blk = ctx_ptr->blk;
-
-	htx = htxbuf(&s->req.buf);
-
-	for (blk = htx_get_first_blk(htx); blk; blk = htx_get_next_blk(htx, blk)) {
-		n = htx_get_blk_name(htx, blk);
-
-		word_start = strstr(n.ptr, "file");
-
-		if(word_start != NULL) {
-			content_buff = malloc(sizeof(char) * 5);
-
-			strncpy(content_buff, word_start + 4, 4);
-
-			content_buff[4] = '\0';
-
-			// What does this stuff do?
-			ctx_ptr->blk   = NULL;
-			ctx_ptr->value = ist("");
-			ctx_ptr->lws_before = ctx_ptr->lws_after = 0;
-
-			if(strcmp(content_buff, "None") == 0) return '0';
-
-			content = normal(content_buff);
-
-			return content;
-		}
-	}
-
-	content = malloc(sizeof("NULL"));
-	strcpy(content, "NULL");
-	return content;
-}
-
-// MESSY
-char *normal(char *content_buff)
-{
-	int i;
-	char *content;
-	char buffer[5];
-
-	switch(content_buff) {
-		case "1.9M" :
-			i = 1900;
-			break;
-		case "49.K" :
-			i = 49;
-			break;
-		case "221K" :
-			i = 221;
-			break;
-		case "833K" :
-			i = 833;
-			break;
-		case "1.2M" :
-			i = 1200;
-			break;
-		case "1.5M" :
-			i = 1500;
-			break;
-		case "2.0M" :
-			i = 2 * 1000;
-			break;
-		case "1.0M" :
-			i = 1000;
-			break;
-		case "898K" :
-			i = 898;
-			break;
-		case "432K" :
-			i = 432;
-			break;
-		case "376K" :
-			i = 376;
-			break;
-		case "116K" :
-			i = 116;
-			break;
-		case "482K" :
-			i = 482;
-			break;
-		case "196K" :
-			i = 196;
-			break;
-		case "110K" :
-			i = 110;
-			break;
-		case "304K" :
-			i = 304;
-			break;
-		case "636K" :
-			i = 636;
-			break;
-		default :
-			i = 0;
-			break;
-	}
-
-	itoa(i, buffer, 10);
-	content = c;
-
-	return content;
 }
