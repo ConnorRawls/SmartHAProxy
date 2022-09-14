@@ -554,7 +554,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	char *servers; //list of servers from the whitelist that the request url can use
 	clock_t t2;
 	double elapsed_time;
-	char srv_num;
+	// char srv_num;
 
 	hash = 0;
 	px = s->be;
@@ -563,7 +563,7 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	if (px->lbprm.tot_weight == 0) return NULL;
 
 	// ***
-	// printf("\n(backend.c) I have received a new task");
+	// printf("\n(backend.c) I have received a new task.");
 
 	// Update Whitelist
 	pthread_mutex_lock(&check.lock);
@@ -589,16 +589,19 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	if(strchr(servers, '0') != NULL) {
 
 		// ***
-		// printf("\nReturning NULL.\n");
+		printf("\nReturning NULL.\n");
 
 		return NULL;
 	}
 
 	// ***
-	// if(!strcmp(servers, "1234567")) printf("\nNon-default WL detected.\n");
+	if(!strcmp(servers, "1234567")) {
+		printf("\n(backend.c) Non-default WL detected.\n");
+		printf("\n(backend.c) [%s] Servers: %s\n", key, servers);
+	}
 
 	// ***
-	// printf("\n(backend.c) Servers: %s\n", servers);
+	// printf("\n(backend.c) [%s] Servers: %s\n", key, servers);
 
 	// We're freeeeeee
 	free(key);
@@ -640,10 +643,11 @@ static struct server *get_server_rnd(struct stream *s, const struct server *avoi
 	// if(curr == NULL) printf("(backend.c) Chosen server was NULL\n");
 
 	// ***
-	if(curr == NULL || curr->id == NULL) srv_num = '0';
-	else if(strcmp(curr->id, "WP-Host") == 0) srv_num = '1';
-	else srv_num = curr->id[strlen(curr->id) - 1];
-	if(servers != NULL) logDispatch(key, servers, srv_num);
+	// Investigate WL decisions
+	// if(curr == NULL || curr->id == NULL) srv_num = '0';
+	// else if(strcmp(curr->id, "WP-Host") == 0) srv_num = '1';
+	// else srv_num = curr->id[strlen(curr->id) - 1];
+	// if(servers != NULL) logDispatch(key, servers, srv_num);
 	// if(strchr(servers, srv_num) == NULL) {
 	// 	printf("\n*** Incorrect dispatch found.");
 	// 	printf("\nWL: %s", servers);
@@ -691,7 +695,6 @@ int assign_server(struct stream *s)
 	///////////////// Begin edits /////////////////
 	char *key;
 	key = fetchKey(s);
-	requestCount++;
 	////////////////// End edits //////////////////
 
 	DPRINTF(stderr,"assign_server : s=%p\n",s);
@@ -770,17 +773,17 @@ int assign_server(struct stream *s)
 		switch (s->be->lbprm.algo & BE_LB_LKUP) {
 		case BE_LB_LKUP_RRTREE:
 
-			// ***
-			start_time = clock();
-			// ***
+			// // ***
+			// start_time = clock();
+			// // ***
 
 			srv = fwrr_get_next_server(s->be, prev_srv, key);
 
-			// ***
-			end_time = clock();
-			elapsed_time = howLong(start_time, end_time);
-			logTime(elapsed_time);
-			// ***
+			// // ***
+			// end_time = clock();
+			// elapsed_time = howLong(start_time, end_time);
+			// logTime(elapsed_time);
+			// // ***
 			
 			break;
 
@@ -3352,28 +3355,61 @@ void logTime(double data)
 
 char *fetchKey(struct stream *s)
 {
-	int m_len;
-	size_t m_size;
-	char *method, *key;
+	// int m_len;
+	// size_t m_size;
+	char *method;
+	// char *key;
 
 	// Method
 	method = fetchMethod(s);
-	m_len = strlen(method);
-	m_size = m_len * sizeof(char);
+	// m_len = strlen(method);
+	// m_size = m_len * sizeof(char);
 
 	// ***
-	printf("\nMethod: %s\n", method);
+	// printf("\nMethod: %s\n", method);
 
+	// Just use method as key
 	// Concatenate key
-	key = malloc(m_size + 1);
-	strcat(key, method);
-	key[strlen(key)] = '\0';
+	// key = malloc(m_size + 1);
+	// strcat(key, method);
+	// key[strlen(key)] = '\0';
 
-	// ***
-	printf("\nKey: %s\n", key);
+	// // ***
+	// printf("\nKey: %s\n", key);
 
-	// We're freeeeeee
-	free(method);
+	// // We're freeeeeee
+	// free(method);
 
-	return key;
+	return method;
+}
+
+char *fetchMethod(struct stream *s)
+{
+	int method_key;
+	char *method_name;
+	int method_length;
+
+	method_key = s->txn->meth;
+
+	// Method
+	switch (method_key) {
+		case 1:
+			method_length = sizeof("GET") + 1;
+			method_name = malloc(sizeof(char) * method_length);
+			strncpy(method_name, "GET", method_length);
+			method_name[method_length] = '\0';
+			break;
+		case 3:
+			method_length = sizeof("POST") + 1;
+			method_name = malloc(sizeof(char) * method_length);
+			strncpy(method_name, "POST", method_length);
+			method_name[method_length] = '\0';
+			break;
+		default:
+			method_length = 0;
+			method_name = NULL;
+			break;
+	}
+
+	return method_name;
 }

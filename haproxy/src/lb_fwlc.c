@@ -339,7 +339,6 @@ struct server *fwlc_get_next_server(struct proxy *p, struct server *srvtoavoid, 
 	char *servers; //list of servers from the whitelist that the request url can use
 	clock_t t2;
 	double elapsed_time;
-	char *buffer;
 	char srv_num;
 	srv_num = 0;
 
